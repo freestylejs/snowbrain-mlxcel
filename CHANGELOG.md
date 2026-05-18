@@ -6,8 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [v0.0.28] - 2026-05-19
+
+### Performance
+- **Gemma3n bf16 prefill path.** Materialize full-precision bf16 casts and preserve the Gemma3n language MLP bf16 path; gemma3n-e4b-bf16 decode improves from 11.16 to 38.81 tok/s on M5 Max while output stays coherent (#28).
+- **Qwen3-VL text-only decode.** Fuse Q/K/V into a single `FusedQKVLinear` and add a `forward_text_only` fast path on Attention / DecoderLayer / Model that skips MRoPE position-id computation and visual-state propagation when no image is present. Qwen3-VL-30B-A3B-Instruct-4bit decode 56.00 to 146.29 tok/s (2.61x, 99% of mlx-lm parity); Qwen3-VL-32B-Instruct-4bit decode 18.79 to 27.33 tok/s (1.45x, 94% of mlx-lm parity). Image-in-prompt and DeepStack paths are unchanged (#29).
+- **GatedDeltaNet fast RMSNorm.** Replace the expanded `square` / `mean_axis` / `sqrt` / `divide` / `multiply` Q/K and gated-output RMSNorm graphs in Qwen3.5, Qwen3-Next, and KimiLinear with `mlx::fast::rms_norm` kernel calls via a new shared `scaled_fast_rms_norm_no_weight` helper. qwen3.5-0.8b-4bit decode 425.16 to 535.43 tok/s on M5 Max (+25.9%, 96% of mlx-lm parity); the Qwen3.5 speculative-decoding verify pass is updated alongside prefill / decode so draft / verify dtype agreement is preserved (#30).
+
 ### Fixed
-- Rewrite `mlxcel list` output to drive from the `ModelType` registry — fixes stale count, missing VLM family, missing ~30 model types, and removes broken docs link (#26).
+- Rewrite `mlxcel list` output to drive from the `ModelType` registry: fixes stale count, missing VLM family, missing ~30 model types, and removes broken docs link (#27).
+
+### Docs
+- Refresh README performance snapshot and `docs/benchmarks.md` to match the latest M5 Max sweep.
 
 ## [v0.0.27] - 2026-05-16
 
@@ -632,6 +642,7 @@ Initial public release of mlxcel.
 - GitHub Actions release workflow for macOS ARM64
 - Profile mode for prefill/decode timing analysis
 
+[v0.0.28]: https://github.com/lablup/mlxcel/compare/v0.0.27...v0.0.28
 [v0.0.27]: https://github.com/lablup/mlxcel/compare/v0.0.26...v0.0.27
 [v0.0.26]: https://github.com/lablup/mlxcel/compare/v0.0.25...v0.0.26
 [v0.0.25]: https://github.com/lablup/mlxcel/compare/v0.0.24...v0.0.25

@@ -1,3 +1,33 @@
+mlxcel (0.0.28-1~jammy1) jammy; urgency=medium
+
+  * Perf: Gemma3n bf16 prefill path: materialize full-precision bf16
+    casts and preserve the Gemma3n language MLP bf16 path; decode on
+    gemma3n-e4b-bf16 improves from 11.16 to 38.81 tok/s on M5 Max
+    while output stays coherent (#28)
+  * Perf: Qwen3-VL text-only decode: fuse Q/K/V into a single
+    FusedQKVLinear and add a forward_text_only fast path on Attention,
+    DecoderLayer, and the top-level model that skips MRoPE position-id
+    computation and visual-state propagation when no image is present.
+    Qwen3-VL-30B-A3B-Instruct-4bit decode 56.00 to 146.29 tok/s
+    (2.61x, 99% of mlx-lm parity); Qwen3-VL-32B-Instruct-4bit decode
+    18.79 to 27.33 tok/s (1.45x, 94% of mlx-lm parity). Image-in-prompt
+    and DeepStack paths are unchanged (#29)
+  * Perf: GatedDeltaNet fast RMSNorm: replace the expanded square /
+    mean_axis / sqrt / divide / multiply Q/K and gated-output RMSNorm
+    graphs in Qwen3.5, Qwen3-Next, and KimiLinear with mlx::fast::rms_norm
+    kernel calls via a new shared scaled_fast_rms_norm_no_weight helper.
+    qwen3.5-0.8b-4bit decode 425.16 to 535.43 tok/s on M5 Max (+25.9%,
+    96% of mlx-lm parity); Qwen3.5 speculative-decoding verify pass is
+    updated alongside prefill / decode so draft / verify dtype agreement
+    is preserved (#30)
+  * Fix: Rewrite mlxcel list output to drive from the ModelType
+    registry, fixing stale count, missing VLM family, missing ~30 model
+    types, and removing a broken docs link (#27)
+  * Docs: refresh README performance snapshot and docs/benchmarks.md to
+    match the latest M5 Max sweep
+
+ -- Jeongkyu Shin <inureyes@gmail.com>  Tue, 19 May 2026 04:00:00 +0900
+
 mlxcel (0.0.27-1~jammy1) jammy; urgency=medium
 
   * Feat: Speculative decoding Phase 2 — end-to-end Gemma 4 MTP and
