@@ -411,6 +411,7 @@ pub trait LanguageModel {
     /// amortizes weight-loading bandwidth across the batch.
     ///
     /// Used by: BatchScheduler (server continuous batching)
+    #[allow(clippy::needless_range_loop)]
     fn forward_batched(
         &self,
         input_ids: &MlxArray,
@@ -822,7 +823,7 @@ impl CxxGenerator {
         let n_layers = self.caches.len();
         let requested = crate::cache::turbo::boundary_v_layers_from_env();
         let layer_modes = crate::cache::turbo::resolve_layer_modes(nominal, n_layers, requested);
-        for (cache, mode) in self.caches.iter_mut().zip(layer_modes.into_iter()) {
+        for (cache, mode) in self.caches.iter_mut().zip(layer_modes) {
             cache.mode = mode;
         }
     }
@@ -2096,7 +2097,7 @@ mod tests {
         // n=0 is the very first decode iteration after prefill. Clearing here
         // would discard tensors needed for the pipelined next-step computation.
         let n = 0_usize;
-        assert!(!(n % 256 == 0 && n > 0));
+        assert!(!(n.is_multiple_of(256) && n > 0));
     }
 
     #[test]
@@ -2259,8 +2260,10 @@ mod tests {
         let caller_bias = make_bias(&[(99, -3.0)]);
         let g = CxxGenerator::new(2).with_token_bias(cached);
 
-        let mut caller = SamplingConfig::default();
-        caller.token_bias = caller_bias;
+        let caller = SamplingConfig {
+            token_bias: caller_bias,
+            ..SamplingConfig::default()
+        };
         let composed = g.compose_sampling(&caller);
 
         // Caller's explicit bias is preserved verbatim, cached bias is ignored.
