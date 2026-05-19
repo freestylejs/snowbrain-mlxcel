@@ -75,52 +75,58 @@ Linux/CUDA builds use the `cuda` feature and require the CUDA toolkit plus the s
 
 mlxcel targets near-`mlx-lm` / `mlx-vlm` decode throughput for MLX-format
 checkpoints while keeping a native Rust runtime. In the mlxcel 0.0.28 M5 Max
-128GB benchmark set, text decode averaged **95%** of `mlx-lm` across 67
-comparable pairs (median 97%); **50 / 67** text rows reached at least 90%
-parity, and **16 / 67** matched or exceeded `mlx-lm`. Comparable VLM decode
-averaged **94%** of `mlx-vlm` across 17 pairs (median 95%), with **12 / 17**
-rows at or above 90% parity.
+128GB benchmark set, text decode averaged **97%** of `mlx-lm` across 66
+comparable pairs (median **99%**); **58 / 66** text rows reached at least 90%
+parity, and **24 / 66** matched or exceeded `mlx-lm`. Short-prompt text
+prefill (prompt processing before token generation) is a standout result:
+mlxcel measured **2.70x** the `mlx-lm` median on the same M5 Max host, giving
+substantially faster prompt ingestion while decode stays near reference parity.
+Comparable VLM decode averaged **98%** of `mlx-vlm` across 17 pairs (median
+**98%**), with **13 / 17** rows at or above 90% parity.
 
 Representative decode throughput is shown below in tokens per second. M5 Max
 reference columns are same-host `mlx-lm` or `mlx-vlm` runs; M1 Ultra values are
 included as mlxcel-only capacity references. Absolute results depend on model
 family, quantization, prompt shape, decode length, and hardware. See
+[Benchmark results](docs/benchmark_results/benchmark-report.md) and
 [Benchmarks](docs/benchmarks.md) for methodology and caveats.
 
 | Text model | M1 Ultra mlxcel | M5 Max mlxcel | M5 Max mlx-lm | mlxcel / mlx-lm |
 |------------|----------------:|--------------:|--------------:|----------------:|
-| SmolLM-135M 4bit | 365 tok/s | 919 tok/s | 712 tok/s | 129% |
-| Llama 3.1 8B 4bit | 109 tok/s | 113 tok/s | 117 tok/s | 96% |
-| Qwen2.5 7B 4bit | 113 tok/s | 126 tok/s | 124 tok/s | 102% |
-| Gemma 2B 4bit | 82 tok/s | 214 tok/s | 223 tok/s | 96% |
-| Gemma 3 4B 4bit | 104 tok/s | 145 tok/s | 182 tok/s | 80% |
-| Gemma 4 26B-A4B 4bit | 72 tok/s | 136 tok/s | 141 tok/s | 97% |
-| Qwen3 MoE 30B 4bit | 72 tok/s | 153 tok/s | 147 tok/s | 104% |
-| GLM-4 Flash 4bit | 36 tok/s | 111 tok/s | 108 tok/s | 103% |
-| Nemotron-H 30B 4bit | 90 tok/s | 156 tok/s | 179 tok/s | 87% |
-| Mixtral 8x7B 4bit | 54 tok/s | 63 tok/s | 66 tok/s | 96% |
-| StarCoder2 3B 4bit | 105 tok/s | 215 tok/s | 214 tok/s | 100% |
-| Qwen3.5 0.8B 4bit | 183 tok/s | 535 tok/s | 555 tok/s | 96% |
-| Qwen3-VL 30B-A3B 4bit, text path | 22 tok/s | 146 tok/s | 148 tok/s | 99% |
-| Qwen3-VL 32B 4bit, text path | 18 tok/s | 27 tok/s | 29 tok/s | 94% |
-| GPT-OSS 120B 4bit | 20 tok/s | 113 tok/s | 110 tok/s | 102% |
-| Solar Open 100B 4bit | 14 tok/s | 66 tok/s | 66 tok/s | 99% |
+| SmolLM-135M 4bit | 407 tok/s | 905 tok/s | 712 tok/s | 127% |
+| Llama 3.1 8B 4bit | 107 tok/s | 117 tok/s | 117 tok/s | 99% |
+| Qwen2.5 7B 4bit | 110 tok/s | 126 tok/s | 124 tok/s | 102% |
+| Gemma 2B 4bit | 194 tok/s | 211 tok/s | 223 tok/s | 94% |
+| Gemma 3 4B 4bit | 100 tok/s | 146 tok/s | 182 tok/s | 81% |
+| Gemma 4 26B-A4B 4bit | 73 tok/s | 137 tok/s | 141 tok/s | 97% |
+| Qwen3 MoE 30B 4bit | 71 tok/s | 156 tok/s | 147 tok/s | 106% |
+| GLM-4 Flash 4bit | 47 tok/s | 104 tok/s | 104 tok/s | 100% |
+| Nemotron-H 30B 4bit | 90 tok/s | 177 tok/s | 179 tok/s | 99% |
+| Mixtral 8x7B 4bit | 54 tok/s | 65 tok/s | 66 tok/s | 99% |
+| StarCoder2 3B 4bit | 171 tok/s | 216 tok/s | 215 tok/s | 101% |
+| Qwen3.5 0.8B 4bit | 243 tok/s | 517 tok/s | 545 tok/s | 95% |
+| Qwen3-VL 30B-A3B 4bit, text path | 70 tok/s | 151 tok/s | 147 tok/s | 103% |
+| Qwen3-VL 32B 4bit, text path | 21 tok/s | 28 tok/s | 29 tok/s | 96% |
+| GPT-OSS 120B 4bit | 59 tok/s | 114 tok/s | 110 tok/s | 103% |
+| Solar Open 100B 4bit | 36 tok/s | 65 tok/s | 66 tok/s | 99% |
 
 | VLM model | M1 Ultra mlxcel | M5 Max mlxcel | M5 Max mlx-vlm | mlxcel / mlx-vlm |
 |-----------|----------------:|--------------:|---------------:|-----------------:|
-| LLaVA Interleave Qwen 0.5B bf16 | 262 tok/s | 342 tok/s | 345 tok/s | 99% |
-| Gemma 4 E2B 4bit | 106 tok/s | 216 tok/s | 202 tok/s | 107% |
-| Gemma 4 26B-A4B 4bit | 66 tok/s | 129 tok/s | 137 tok/s | 94% |
-| Phi 3.5 Vision 4bit | 88 tok/s | 121 tok/s | 160 tok/s | 76% |
+| LLaVA Interleave Qwen 0.5B bf16 | 270 tok/s | 344 tok/s | 345 tok/s | 100% |
+| Qwen3.5 0.8B 4bit | 202 tok/s | 472 tok/s | 411 tok/s | 115% |
+| Qwen3.5 35B-A3B 4bit | 71 tok/s | 151 tok/s | 129 tok/s | 117% |
+| Gemma 4 E2B 4bit | 107 tok/s | 210 tok/s | 202 tok/s | 104% |
+| Gemma 4 26B-A4B 4bit | 63 tok/s | 130 tok/s | 137 tok/s | 95% |
+| Molmo2 4B | 59 tok/s | 64 tok/s | 67 tok/s | 95% |
+| Phi 3.5 Vision 4bit | 94 tok/s | 122 tok/s | 160 tok/s | 76% |
 
-The M5 Max sweep covers 98 text model directories plus a separate 98-entry VLM
-prompt pass. Ratio summaries include only rows where both mlxcel and the Python
+The M5 Max sweep covers 98 text model directories and a matching 98-entry VLM
+mode pass. Ratio summaries include only rows where both mlxcel and the Python
 reference produced comparable decode measurements; unsupported checkpoints and
-benchmark-configuration failures are tracked in the benchmark notes. VLM runs
-used a 224x224 benchmark fixture image and should be read separately because
-vision preprocessing, image size, and prompt construction differ by family.
-Re-run the benchmark suite on your target hardware before using these numbers
-for capacity planning.
+benchmark-configuration failures are tracked in the benchmark notes. VLM rows
+should be read separately because vision preprocessing, processor setup, and
+prompt construction differ by family. Re-run the benchmark suite on your target
+hardware before using these numbers for capacity planning.
 
 ## Supported models
 

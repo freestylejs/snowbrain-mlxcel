@@ -1,4 +1,4 @@
-# Benchmark Report - 2026-05-19
+# Apple Silicon Benchmark Report - 2026-05-19
 
 This report summarizes mlxcel performance on Apple Silicon using the
 2026-05-19 benchmark campaign. It covers two 128 GB Apple Silicon systems:
@@ -20,15 +20,27 @@ includes image encoder and projector work.
 
 | Host | Mode | Baseline | Comparable pairs | Prefill median vs baseline | Decode median vs baseline | Decode result |
 |------|------|----------|-----------------:|---------------------------:|--------------------------:|---------------|
-| M5 Max | Text | mlx-lm | 67 | 0.66x | **98%** | 59/67 at >=90% parity |
-| M1 Ultra | Text | mlx-lm | 74 | 0.58x | **96%** | 56/74 at >=90% parity |
-| M5 Max | VLM | mlx-vlm | 17 | 0.63x | **99%** | 14/17 at >=90% parity |
-| M1 Ultra | VLM | mlx-vlm | 17 | 0.93x | **98%** | 11/17 at >=90% parity |
+| M5 Max | Text | mlx-lm | 66 | **2.70x** | **99%** | 58/66 at >=90% parity |
+| M1 Ultra | Text | mlx-lm | 73 | **1.76x** | **97%** | 62/73 at >=90% parity |
+| M5 Max | VLM | mlx-vlm | 17 | 0.63x | **98%** | 13/17 at >=90% parity |
+| M1 Ultra | VLM | mlx-vlm | 17 | **1.33x** | **98%** | 11/17 at >=90% parity |
 
 Ratios above use successful runs only. Baseline rows use exact CSV model
 identifiers and compare mlxcel and the Python stack on the same host. Decode
 parity is the primary comparison point because it measures steady-state
 generation after the KV cache is built.
+
+The mlxcel rows use the `mlxcel-bench-decode` harness: the model is loaded
+once, a warmup pass is run, and then the measured 100-token pass is recorded in
+the same process. This is the benchmark method used for the current Apple
+Silicon results. VLM prefill remains more prompt-shape- and processor-sensitive
+than text prefill, so decode remains the primary VLM comparison.
+
+On M1 Ultra, two Gemma 3 VLM rows (gemma-3-4b-it-4bit, gemma3-4b-4bit) are
+measured with `--warmup-tokens 0` because the prepared 4D attention mask is
+single-use against the first prefill's KV cache offset. The three Gemma 3n VLM
+rows (gemma3n-e2b-4bit, gemma3n-e4b-4bit, gemma3n-e4b-bf16) use the default
+warmup=20 path.
 
 ## Why This Matters
 
@@ -40,7 +52,7 @@ complete in this sweep. With a generated-token threshold of 5 tokens:
 |------|------|---------------------------------------------------------:|----------------------------:|
 | M5 Max | Text | 25 | 66 |
 | M1 Ultra | Text | 22 | 73 |
-| M5 Max | VLM | 12 | 17 |
+| M5 Max | VLM | 11 | 17 |
 | M1 Ultra | VLM | 20 | 17 |
 
 This is the useful public framing: mlxcel is a Rust inference engine with
@@ -56,18 +68,18 @@ host.
 
 | Host | Model | Class | mlxcel prefill | mlxcel decode | mlx-lm decode | vs mlx-lm |
 |------|-------|-------|---------------:|--------------:|--------------:|----------:|
-| M5 Max | smollm-135m-4bit | Small dense | 900.78 | 883.99 | 711.54 | **124%** |
-| M5 Max | qwen2.5-7b-4bit | Dense 7B | 299.05 | 126.63 | 123.59 | **102%** |
-| M5 Max | gpt-oss-120b-4bit | Large MoE | 23.71 | 113.34 | 110.35 | **103%** |
-| M5 Max | solar-open-100b-4bit | Large MoE | 200.85 | 65.59 | 66.30 | 99% |
-| M5 Max | qwen3.5-35b-a3b-4bit | Hybrid MoE | 36.32 | 145.49 | 152.96 | 95% |
-| M5 Max | nemotron-h-30b-4bit | Hybrid SSM/MoE | 31.22 | 171.76 | 178.80 | 96% |
-| M1 Ultra | phi-3.5-moe-4bit | MoE | 9.16 | 76.13 | 69.28 | **110%** |
-| M1 Ultra | minicpm3-4b-4bit | MLA | 87.60 | 79.08 | 73.26 | **108%** |
-| M1 Ultra | qwen2.5-0.5b-4bit | Small dense | 452.68 | 329.45 | 315.48 | **104%** |
-| M1 Ultra | gpt-oss-120b-4bit | Large MoE | 3.79 | 59.62 | 57.58 | **104%** |
-| M1 Ultra | command-r7b-4bit | Dense 7B | 29.10 | 111.42 | 107.75 | **103%** |
-| M1 Ultra | solar-open-100b-4bit | Large MoE | 11.19 | 36.20 | 35.69 | **101%** |
+| M5 Max | smollm-135m-4bit | Small dense | 6058.41 | 905.24 | 711.54 | **127%** |
+| M5 Max | qwen2.5-7b-4bit | Dense 7B | 917.38 | 126.36 | 123.59 | **102%** |
+| M5 Max | gpt-oss-120b-4bit | Large MoE | 334.68 | 114.03 | 110.35 | **103%** |
+| M5 Max | solar-open-100b-4bit | Large MoE | 210.91 | 65.36 | 66.30 | 99% |
+| M5 Max | qwen3.5-35b-a3b-4bit | Hybrid MoE | 480.89 | 151.63 | 152.96 | 99% |
+| M5 Max | nemotron-h-30b-4bit | Hybrid SSM/MoE | 414.31 | 177.18 | 178.80 | 99% |
+| M1 Ultra | phi-3.5-moe-4bit | MoE | 107.87 | 76.24 | 69.28 | **110%** |
+| M1 Ultra | minicpm3-4b-4bit | MLA | 230.24 | 80.24 | 73.26 | **110%** |
+| M1 Ultra | qwen2.5-0.5b-4bit | Small dense | 1094.10 | 355.29 | 315.48 | **113%** |
+| M1 Ultra | gpt-oss-120b-4bit | Large MoE | 161.69 | 58.89 | 57.58 | **102%** |
+| M1 Ultra | command-r7b-4bit | Dense 7B | 92.20 | 110.22 | 107.75 | **102%** |
+| M1 Ultra | solar-open-100b-4bit | Large MoE | 73.74 | 35.88 | 35.69 | **100%** |
 
 The table shows the central performance claim without cross-hardware ranking:
 mlxcel is already close to mlx-lm on the same machine for dense 7B models,
@@ -81,15 +93,15 @@ comparison.
 
 | Host | Model | Class | mlxcel prefill | mlxcel decode | mlx-vlm decode | vs mlx-vlm |
 |------|-------|-------|---------------:|--------------:|---------------:|-----------:|
-| M5 Max | qwen3.5-0.8b-4bit | Hybrid GatedDeltaNet VLM | 463.75 | 477.51 | 410.96 | **116%** |
-| M5 Max | qwen3.5-35b-a3b-4bit | Hybrid MoE VLM | 38.18 | 149.57 | 128.80 | **116%** |
-| M5 Max | gemma-4-e2b-it-4bit | Gemma 4 VLM | 2534.10 | 215.86 | 201.70 | **107%** |
-| M5 Max | molmo2-4b | Molmo2 vision encoder | 1605.72 | 64.35 | 66.80 | 96% |
-| M1 Ultra | llava-interleave-qwen-0.5b-bf16 | SigLIP + Qwen2 | 3334.88 | 263.41 | 225.15 | **117%** |
-| M1 Ultra | aya-vision-8b | SigLIP + Cohere2 | 349.35 | 111.11 | 103.74 | **107%** |
-| M1 Ultra | molmo2-4b | Molmo2 vision encoder | 576.46 | 59.54 | 60.87 | 98% |
-| M1 Ultra | phi-3.5-vision-4bit | CLIP + HD tiling | 793.61 | 92.64 | 92.53 | **100%** |
-| M1 Ultra | pixtral-12b-4bit | Pixtral ViT + Mistral | 442.19 | 60.29 | - | - |
+| M5 Max | qwen3.5-0.8b-4bit | Hybrid GatedDeltaNet VLM | 1983.80 | 471.83 | 410.96 | **115%** |
+| M5 Max | qwen3.5-35b-a3b-4bit | Hybrid MoE VLM | 516.75 | 151.33 | 128.80 | **117%** |
+| M5 Max | gemma-4-e2b-it-4bit | Gemma 4 VLM | 1606.65 | 210.09 | 201.70 | **104%** |
+| M5 Max | molmo2-4b | Molmo2 vision encoder | 3971.34 | 63.60 | 66.80 | 95% |
+| M1 Ultra | llava-interleave-qwen-0.5b-bf16 | SigLIP + Qwen2 | 8589.48 | 269.86 | 225.15 | **120%** |
+| M1 Ultra | aya-vision-8b | SigLIP + Cohere2 | 591.80 | 109.36 | 103.74 | **105%** |
+| M1 Ultra | molmo2-4b | Molmo2 vision encoder | 1011.99 | 59.36 | 60.87 | 98% |
+| M1 Ultra | phi-3.5-vision-4bit | CLIP + HD tiling | 1164.87 | 94.10 | 92.53 | **102%** |
+| M1 Ultra | pixtral-12b-4bit | Pixtral ViT + Mistral | 473.22 | 59.17 | - | - |
 
 The VLM data is most compelling as a coverage and decode-throughput story:
 mlxcel runs many VLM paths in the same benchmark matrix, and its comparable
@@ -97,12 +109,17 @@ decode results sit near mlx-vlm median parity on both Apple Silicon hosts.
 
 ## Where mlxcel Looks Strongest
 
-- **Steady-state decode:** M5 Max text decode is within 2% of mlx-lm median
-  parity and VLM decode is within 1% of mlx-vlm median parity. M1 Ultra shows
-  the same pattern, with 96% text median parity and 98% VLM median parity.
-- **Large MoE practicality:** GPT-OSS 120B reaches 113.34 tok/s on M5 Max and
-  is slightly faster than mlx-lm on the same host in this sweep. Solar-Open
-  100B reaches 65.59 tok/s and is effectively at mlx-lm parity.
+- **Steady-state decode:** M5 Max text decode is within 1% of mlx-lm median
+  parity and VLM decode is within 2% of mlx-vlm median parity. M1 Ultra shows
+  the same pattern, with 97% text median parity and 98% VLM median parity.
+- **Short-prompt text prefill:** mlxcel prefill is 2.70x mlx-lm median on M5
+  Max text and 1.76x mlx-lm median on M1 Ultra text. Representative M5 Max
+  values include gpt-oss-120b at 334.68 tok/s and nemotron-h-30b at
+  414.31 tok/s.
+- **Large MoE practicality:** GPT-OSS 120B reaches 114.03 tok/s on M5 Max and
+  58.89 tok/s on M1 Ultra, both at or slightly above mlx-lm parity on the same
+  host. Solar-Open 100B reaches 65.36 tok/s (M5 Max) / 35.88 tok/s (M1 Ultra),
+  also at mlx-lm parity.
 - **Model coverage:** mlxcel completes many runs where the Python baseline
   fails or is unavailable in the same benchmark matrix. This is especially
   visible for VLM wrappers, Gemma 4 variants, ERNIE, Hunyuan, ExaOne4, and
@@ -130,10 +147,11 @@ decode results sit near mlx-vlm median parity on both Apple Silicon hosts.
 | OS | macOS 26.4 | macOS 26.4 |
 | mlxcel | 0.0.28 | 0.0.28 |
 | MLX pin | `84961223` via mlxcel-core | `84961223` via mlxcel-core |
+| Bench harness | `mlxcel-bench-decode`: one process loads the model, runs a 20-token warmup, then a 100-token measured pass | `mlxcel-bench-decode`: one process loads the model, runs warmup, then a 100-token measured pass |
 | Text prompt | `Hello, how are you today?` | `Hello, how are you today?` |
 | VLM prompt | `What is in this image?` | `What is in this image?` |
-| Max generated tokens | 100 | 100 |
-| Oversize policy | >65 GB skipped for Python baseline | same benchmark campaign policy |
+| Max generated tokens | 100 (measured), 20 (warmup) | 100 (measured) |
+| Oversize policy | >65 GB skipped on both mlxcel and Python baseline | same benchmark campaign policy |
 
 The M5 Max benchmark campaign ran as one continuous campaign across calendar
 midnight. For public reporting it is grouped under 2026-05-19. CSV filenames
