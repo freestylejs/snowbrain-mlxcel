@@ -8,13 +8,32 @@ It points to the concrete control surfaces that must stay consistent. If this re
 - Keep new model additions predictable.
 - Reuse existing control-plane helpers instead of adding new one-off branches.
 - Add tests alongside the integration points that are easiest to regress.
+- Treat `mlx-lm` / `mlx-vlm` as useful references, not as the only acceptable
+  source for a port.
 
 ## Before You Start
 
-1. Identify the upstream reference:
-   - Text models: upstream `mlx-lm` model implementations.
-   - VLMs: upstream `mlx-vlm` model implementations.
-   - If local `references/` checkouts are not present, clone or inspect the upstream repositories separately.
+1. Identify the implementation source you will use for the port. This can be
+   an MLX reference implementation, but it does not have to be one:
+   - `mlx-lm` text model implementations when the family already exists there.
+   - `mlx-vlm` implementations when the family already exists there.
+   - Hugging Face Transformers or an official PyTorch implementation when it is
+     the clearest source of truth for config fields, tensor names, module
+     layout, forward semantics, and processor behavior.
+   - vLLM or SGLang implementations when production inference behavior is the
+     useful reference, especially for KV-cache layout, paged-attention
+     assumptions, MoE routing, rope scaling, speculative paths, or multimodal
+     request preparation.
+   - Vendor model repositories, model cards, conversion scripts, or released
+     inference examples when they are the only public source for architecture
+     quirks.
+   - No complete reference implementation, when you only have a checkpoint,
+     `config.json`, tokenizer/processor files, a paper, or partial vendor
+     notes. This is acceptable, but it should be treated as a reconstruction
+     task with tighter validation checkpoints.
+   - If local `references/` checkouts are not present, clone or inspect the
+     relevant upstream repositories separately. Do not vendor those repositories
+     into this tree.
 2. Decide whether the architecture is:
    - A brand new model family
    - A format alias of an existing family
@@ -30,6 +49,91 @@ It points to the concrete control surfaces that must stay consistent. If this re
 4. Check whether the change also touches shared execution policy:
    - `src/execution/runtime.rs` for device/environment behavior
    - `src/execution/sampling.rs` for user-facing sampling defaults and greedy-vs-sampled assembly
+
+## Choosing and Using Reference Implementations
+
+The goal is not to mechanically translate one Python file into Rust. The goal
+is to identify the model contract that `mlxcel` must implement: config
+normalization, tensor naming, graph topology, cache semantics, prompt or image
+preparation, and generation behavior.
+
+Prefer the reference that is closest to the question you are answering:
+
+- **MLX references (`mlx-lm`, `mlx-vlm`)** are usually the fastest path when
+  they already support the model, because checkpoint loading, quantization
+  conventions, and MLX tensor behavior tend to match `mlxcel` closely.
+- **Hugging Face Transformers or official PyTorch code** is often the
+  architecture source of truth. Use it to confirm module shapes, config field
+  names, activation order, normalization placement, rotary embedding behavior,
+  tied embeddings, and processor/tokenizer conventions.
+- **vLLM and SGLang** are useful production inference references. Use them to
+  understand serving-time details such as KV-cache shape and update policy,
+  paged attention assumptions, MoE expert routing, prefix caching, speculative
+  decode behavior, and multimodal batching constraints. Map those ideas onto
+  existing `mlxcel` cache/runtime abstractions instead of importing their
+  scheduler or CUDA-specific structure directly.
+- **Other PyTorch inference engines or vendor examples** can be the best source
+  for model-specific quirks, especially when the model has not landed in MLX
+  or Transformers yet. Capture the exact commit or release used for validation
+  in the PR description or benchmark notes.
+
+When references disagree, record which behavior is authoritative for the
+checkpoint you are adding. For example, a model card may document the chat
+template, Transformers may define the tensor/module contract, and vLLM may show
+the serving-time cache layout. Keep those responsibilities separate while
+porting.
+
+Do not copy reference-code boundaries blindly:
+
+- Keep route selection in `src/model_metadata.rs` and `src/loading/`.
+- Keep prompt, media, and processor policy in the existing multimodal helpers.
+- Keep serving behavior in the shared execution/server layers.
+- Preserve `mlxcel` naming and test conventions even when the reference uses a
+  different file layout.
+
+## When There Is No Complete Reference
+
+Some model additions start from a checkpoint and metadata rather than a working
+inference implementation. In that case, make the first PR a conservative
+loader/runtime reconstruction rather than a broad family port.
+
+Use all available artifacts as partial references:
+
+- `config.json`, `generation_config.json`, tokenizer files, processor files,
+  and chat templates.
+- SafeTensors key names, tensor shapes, quantization metadata, and tied-weight
+  relationships.
+- Model card notes, architecture diagrams, paper equations, release examples,
+  and conversion scripts.
+- The nearest existing family in `mlxcel`, `mlx-lm`, Transformers, vLLM,
+  SGLang, or another PyTorch inference engine.
+
+Recommended workflow:
+
+1. Inspect the checkpoint first. Build a tensor-name and shape inventory before
+   writing model code, and compare it with the nearest existing family.
+2. Identify the minimum viable path: text-only before VLM, single-device before
+   tensor/pipeline parallelism, greedy decode before advanced sampling behavior.
+3. Add explicit config normalization for every inferred default. Do not hide
+   guessed defaults inside the model constructor.
+4. Keep unsupported variants out of detection until they are validated with a
+   real checkpoint.
+5. Add shape/config tests even before numerical parity is available.
+6. Run a real smoke test and record the prompt, generated token count, and any
+   known limitations in the PR or benchmark notes.
+
+Validation expectations are different without a reference. Exact parity may not
+be possible at first, but the implementation should still prove that:
+
+- all required tensors are consumed or intentionally ignored
+- tensor shapes match the reconstructed graph
+- cache updates advance correctly across prefill and decode
+- generation is stable for at least one real checkpoint
+- failures are explicit for unsupported configs instead of silently falling
+  through to a wrong family
+
+If later a reference implementation appears, add a follow-up comparison against
+that implementation and tighten the tests or benchmark notes accordingly.
 
 ## Text Model Checklist
 
