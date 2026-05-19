@@ -75,14 +75,32 @@ Linux/CUDA builds use the `cuda` feature and require the CUDA toolkit plus the s
 
 mlxcel targets near-`mlx-lm` / `mlx-vlm` decode throughput for MLX-format
 checkpoints while keeping a native Rust runtime. In the mlxcel 0.0.28 M5 Max
-128GB benchmark set, text decode averaged **97%** of `mlx-lm` across 66
-comparable pairs (median **99%**); **58 / 66** text rows reached at least 90%
-parity, and **24 / 66** matched or exceeded `mlx-lm`. Short-prompt text
-prefill (prompt processing before token generation) is a standout result:
-mlxcel measured **2.70x** the `mlx-lm` median on the same M5 Max host, giving
-substantially faster prompt ingestion while decode stays near reference parity.
-Comparable VLM decode averaged **98%** of `mlx-vlm` across 17 pairs (median
-**98%**), with **13 / 17** rows at or above 90% parity.
+128GB benchmark set, the headline result has two parts: faster short-prompt
+text prefill and near-reference decode throughput.
+
+### Prefill: prompt ingestion before the first generated token
+
+Short-prompt text prefill is the standout result. mlxcel measured **2.70x**
+the `mlx-lm` median on M5 Max across 66 comparable text pairs, and **1.76x**
+on M1 Ultra across 73 comparable text pairs. VLM prefill is listed separately
+because image preprocessing, vision encoder, and projector work can be included
+in the prefill path.
+
+| Mode | Baseline | M5 Max pairs | M5 Max median vs baseline | M1 Ultra pairs | M1 Ultra median vs baseline |
+|------|----------|-------------:|--------------------------:|---------------:|----------------------------:|
+| Text | `mlx-lm` | 66 | **2.70x** | 73 | **1.76x** |
+| VLM | `mlx-vlm` | 17 | 0.63x | 17 | **1.33x** |
+
+### Decode: steady-state token generation
+
+Decode stays close to the Python MLX references on the same host. For M5 Max,
+text decode averaged **97%** of `mlx-lm` with a **99%** median, while VLM decode
+averaged **98%** of `mlx-vlm` with a **98%** median.
+
+| Mode | Baseline | Comparable pairs | Average vs baseline | Median vs baseline | >=90% parity | >= baseline | Range |
+|------|----------|-----------------:|--------------------:|-------------------:|-------------:|------------:|------:|
+| Text | `mlx-lm` | 66 | 97% | **99%** | 58 / 66 (88%) | 24 / 66 (36%) | 72%-127% |
+| VLM | `mlx-vlm` | 17 | 98% | **98%** | 13 / 17 (76%) | 5 / 17 (29%) | 76%-118% |
 
 Representative decode throughput is shown below in tokens per second. M5 Max
 reference columns are same-host `mlx-lm` or `mlx-vlm` runs; M1 Ultra values are
