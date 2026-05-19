@@ -22,7 +22,7 @@ includes image encoder and projector work.
 |------|------|----------|-----------------:|---------------------------:|--------------------------:|---------------|
 | M5 Max | Text | mlx-lm | 66 | **2.70x** | **99%** | 58/66 at >=90% parity |
 | M1 Ultra | Text | mlx-lm | 73 | **1.76x** | **97%** | 62/73 at >=90% parity |
-| M5 Max | VLM | mlx-vlm | 17 | 0.63x | **98%** | 13/17 at >=90% parity |
+| M5 Max | VLM | mlx-vlm | 17 | 0.68x | **100%** | 14/17 at >=90% parity |
 | M1 Ultra | VLM | mlx-vlm | 17 | **1.33x** | **98%** | 11/17 at >=90% parity |
 
 Ratios above use successful runs only. Baseline rows use exact CSV model
@@ -36,11 +36,11 @@ the same process. This is the benchmark method used for the current Apple
 Silicon results. VLM prefill remains more prompt-shape- and processor-sensitive
 than text prefill, so decode remains the primary VLM comparison.
 
-On M1 Ultra, two Gemma 3 VLM rows (gemma-3-4b-it-4bit, gemma3-4b-4bit) are
-measured with `--warmup-tokens 0` because the prepared 4D attention mask is
-single-use against the first prefill's KV cache offset. The three Gemma 3n VLM
-rows (gemma3n-e2b-4bit, gemma3n-e4b-4bit, gemma3n-e4b-bf16) use the default
-warmup=20 path.
+Gemma 3 and Gemma 3n VLM rows use the default warmup=20 path where the
+run succeeds. On M5 Max, the Gemma 3 VLM row (gemma3-4b-4bit) succeeds,
+while the three Gemma 3n VLM rows fail on the M5 Max VLM path with a
+broadcast mismatch and are excluded from comparable ratio summaries; the same
+checkpoints pass the M5 Max text-only path.
 
 ## Why This Matters
 
@@ -52,7 +52,7 @@ complete in this sweep. With a generated-token threshold of 5 tokens:
 |------|------|---------------------------------------------------------:|----------------------------:|
 | M5 Max | Text | 25 | 66 |
 | M1 Ultra | Text | 22 | 73 |
-| M5 Max | VLM | 11 | 17 |
+| M5 Max | VLM | 12 | 17 |
 | M1 Ultra | VLM | 20 | 17 |
 
 This is the useful public framing: mlxcel is a Rust inference engine with
@@ -93,10 +93,10 @@ comparison.
 
 | Host | Model | Class | mlxcel prefill | mlxcel decode | mlx-vlm decode | vs mlx-vlm |
 |------|-------|-------|---------------:|--------------:|---------------:|-----------:|
-| M5 Max | qwen3.5-0.8b-4bit | Hybrid GatedDeltaNet VLM | 1983.80 | 471.83 | 410.96 | **115%** |
-| M5 Max | qwen3.5-35b-a3b-4bit | Hybrid MoE VLM | 516.75 | 151.33 | 128.80 | **117%** |
-| M5 Max | gemma-4-e2b-it-4bit | Gemma 4 VLM | 1606.65 | 210.09 | 201.70 | **104%** |
-| M5 Max | molmo2-4b | Molmo2 vision encoder | 3971.34 | 63.60 | 66.80 | 95% |
+| M5 Max | qwen3.5-0.8b-4bit | Hybrid GatedDeltaNet VLM | 1294.94 | 505.94 | 410.96 | **123%** |
+| M5 Max | qwen3.5-35b-a3b-4bit | Hybrid MoE VLM | 355.32 | 151.34 | 128.80 | **117%** |
+| M5 Max | gemma-4-e2b-it-4bit | Gemma 4 VLM | 2787.47 | 217.32 | 201.70 | **108%** |
+| M5 Max | molmo2-4b | Molmo2 vision encoder | 2512.31 | 64.01 | 66.80 | 96% |
 | M1 Ultra | llava-interleave-qwen-0.5b-bf16 | SigLIP + Qwen2 | 8589.48 | 269.86 | 225.15 | **120%** |
 | M1 Ultra | aya-vision-8b | SigLIP + Cohere2 | 591.80 | 109.36 | 103.74 | **105%** |
 | M1 Ultra | molmo2-4b | Molmo2 vision encoder | 1011.99 | 59.36 | 60.87 | 98% |
@@ -110,7 +110,7 @@ decode results sit near mlx-vlm median parity on both Apple Silicon hosts.
 ## Where mlxcel Looks Strongest
 
 - **Steady-state decode:** M5 Max text decode is within 1% of mlx-lm median
-  parity and VLM decode is within 2% of mlx-vlm median parity. M1 Ultra shows
+  parity and VLM decode reaches mlx-vlm median parity. M1 Ultra shows
   the same pattern, with 97% text median parity and 98% VLM median parity.
 - **Short-prompt text prefill:** mlxcel prefill is 2.70x mlx-lm median on M5
   Max text and 1.76x mlx-lm median on M1 Ultra text. Representative M5 Max

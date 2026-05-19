@@ -194,33 +194,36 @@ result reflects text-only response throughput on the VLM code path).
 
 | Model | Test Model | Status | Prefill | Decode | vs M1 Ultra | Notes |
 |-------|------------|--------|---------|--------|-------------|-------|
-| aya-vision-8b | aya-vision-8b | ✅ | 2687.00 | 110.32 | 1.01x | 84 tokens |
-| bunny-llama3-8b | bunny-llama3-8b-4bit | ✅ | 3310.22 | 111.24 | **1.16x** | 37 tokens |
-| gemma3 (4B) | gemma3-4b-4bit | ❌ | - | FAIL | - | FAIL:bench |
-| gemma4 (26B MoE) | gemma-4-26b-a4b-it-4bit | ✅ | 2331.95 | 130.08 | **2.06x** | 23 tokens |
-| gemma4 (31B) | gemma-4-31b-4bit | ✅ | 623.68 | 23.05 | **1.49x** | 5 tokens |
-| gemma4 (31B IT) | gemma-4-31b-it-4bit | ✅ | 648.02 | 26.73 | **1.46x** | 25 tokens |
-| gemma4 (E2B 4bit) | gemma-4-e2b-it-4bit | ✅ | 1606.65 | 210.09 | **1.96x** | 33 tokens |
-| gemma4 (E2B 8bit) | gemma-4-e2b-it-8bit | ✅ | 5700.58 | 131.63 | **1.64x** | 40 tokens |
-| gemma4 (E4B 4bit) | gemma-4-e4b-it-4bit | ✅ | 1000.02 | 129.01 | **1.77x** | 14 tokens |
-| gemma4 (E4B 8bit) | gemma-4-e4b-it-8bit | ✅ | 3080.15 | 76.36 | **1.39x** | 14 tokens |
-| internvl3 (1B) | internvl3-1b | ❌ | - | FAIL | - | FAIL:bench |
-| llama4 (Scout) | llama-4-scout-17b-4bit | ✅ | 336.35 | 47.13 | **1.49x** | 100 tokens |
-| llava-1.5-7b | llava-1.5-7b-4bit | ✅ | 3542.01 | 117.50 | **1.16x** | 100 tokens |
-| llava-interleave | llava-interleave-qwen-0.5b-bf16 | ✅ | 49396.60 | 344.30 | **1.28x** | 36 tokens |
-| llava-next | llava-next-mistral-7b-4bit | ✅ | 3336.55 | 120.91 | **1.15x** | 100 tokens |
-| ministral3 | ministral-3b-4bit | ✅ | 7031.74 | 195.49 | **1.58x** | 100 tokens |
-| mistral-small (3.1 24B) | mistral-small-3.1-24b-4bit | ✅ | 923.49 | 39.63 | **1.33x** | 100 tokens |
-| molmo-7b | molmo-7b | ❌ | - | FAIL | - | FAIL:bench |
-| molmo2 (4B) | molmo2-4b | ✅ | 3971.34 | 63.60 | 1.07x | 46 tokens |
-| paligemma2 (3B 6-bit) | paligemma2-3b-6bit | ✅ | 5440.19 | 82.51 | **1.83x** | 2 tokens |
-| phi-3.5-vision | phi-3.5-vision-4bit | ✅ | 3892.55 | 121.90 | **1.30x** | 19 tokens |
-| pixtral (12B) | pixtral-12b-4bit | ✅ | 2170.58 | 69.67 | **1.18x** | 100 tokens |
-| qwen2-vl (2B) | qwen2-vl-2b-4bit | ⚠️ | 2728.09 | 0 | - | loaded; 0 generated tokens |
+| aya-vision-8b | aya-vision-8b | ✅ | 1616.46 | 112.09 | 1.02x | 84 tokens |
+| bunny-llama3-8b | bunny-llama3-8b-4bit | ✅ | 2851.65 | 112.24 | **1.17x** | 37 tokens |
+| gemma3 (4B) | gemma3-4b-4bit | ✅ | 567.95 | 127.61 | **1.69x** | 16 tokens |
+| gemma3n (E2B 4bit) | gemma3n-e2b-4bit | ❌ | - | FAIL | - | FAIL:bench; broadcast `(1,288,256) vs (1,273,256)` |
+| gemma3n (E4B 4bit) | gemma3n-e4b-4bit | ❌ | - | FAIL | - | FAIL:bench; broadcast `(1,288,256) vs (1,273,256)` |
+| gemma3n (E4B bf16) | gemma3n-e4b-bf16 | ❌ | - | FAIL | - | FAIL:bench; broadcast `(1,288,256) vs (1,273,256)`; bf16→f16 conversion path |
+| gemma4 (26B MoE) | gemma-4-26b-a4b-it-4bit | ✅ | 864.73 | 134.38 | **2.13x** | 30 tokens |
+| gemma4 (31B) | gemma-4-31b-4bit | ✅ | 430.80 | 23.41 | **1.51x** | 5 tokens |
+| gemma4 (31B IT) | gemma-4-31b-it-4bit | ✅ | 445.15 | 27.21 | **1.49x** | 28 tokens |
+| gemma4 (E2B 4bit) | gemma-4-e2b-it-4bit | ✅ | 2787.47 | 217.32 | **2.03x** | 46 tokens |
+| gemma4 (E2B 8bit) | gemma-4-e2b-it-8bit | ✅ | 2674.11 | 133.74 | **1.66x** | 43 tokens |
+| gemma4 (E4B 4bit) | gemma-4-e4b-it-4bit | ✅ | 2064.85 | 134.10 | **1.84x** | 29 tokens |
+| gemma4 (E4B 8bit) | gemma-4-e4b-it-8bit | ✅ | 1911.38 | 76.28 | **1.39x** | 12 tokens |
+| internvl3 (1B) | internvl3-1b | ❌ | - | FAIL | - | FAIL:bench (unsupported architecture) |
+| llama4 (Scout) | llama-4-scout-17b-4bit | ✅ | 398.13 | 48.33 | **1.52x** | 100 tokens |
+| llava-1.5-7b | llava-1.5-7b-4bit | ✅ | 3141.70 | 117.70 | **1.16x** | 100 tokens |
+| llava-interleave | llava-interleave-qwen-0.5b-bf16 | ✅ | 13171.77 | 343.53 | **1.27x** | 36 tokens |
+| llava-next | llava-next-mistral-7b-4bit | ✅ | 2969.90 | 120.38 | **1.14x** | 100 tokens |
+| ministral3 | ministral-3b-4bit | ✅ | 2784.82 | 195.22 | **1.58x** | 100 tokens |
+| mistral-small (3.1 24B) | mistral-small-3.1-24b-4bit | ✅ | 676.13 | 39.62 | **1.33x** | 100 tokens |
+| molmo-7b | molmo-7b | ❌ | - | FAIL | - | FAIL:bench (unsupported architecture) |
+| molmo2 (4B) | molmo2-4b | ✅ | 2512.31 | 64.01 | 1.08x | 46 tokens |
+| paligemma2 (3B 6-bit) | paligemma2-3b-6bit | ✅ | 4294.39 | 80.09 | **1.78x** | 2 tokens |
+| phi-3.5-vision | phi-3.5-vision-4bit | ✅ | 2821.55 | 123.07 | **1.31x** | 19 tokens |
+| pixtral (12B) | pixtral-12b-4bit | ✅ | 1998.87 | 69.71 | **1.18x** | 100 tokens |
+| qwen2-vl (2B) | qwen2-vl-2b-4bit | ⚠️ | 1026.28 | 0 | - | loaded; 0 generated tokens |
 | qwen2.5-vl (3B) | qwen2.5-vl-3b-4bit | ❌ | - | FAIL | - | FAIL:bench |
-| qwen3-vl (2B) | qwen3-vl-2b-4bit | ✅ | 1241.10 | 281.91 | **1.66x** | 100 tokens |
-| qwen3-vl (30B MoE) | qwen3-vl-30b-a3b-4bit | ✅ | 270.52 | 36.27 | **1.37x** | 2 tokens; #719 |
-| qwen3-vl (32B) | qwen3-vl-32b-4bit | ✅ | 119.49 | 19.64 | 1.05x | 100 tokens; #719 |
+| qwen3-vl (2B) | qwen3-vl-2b-4bit | ✅ | 934.98 | 281.37 | **1.65x** | 100 tokens |
+| qwen3-vl (30B MoE) | qwen3-vl-30b-a3b-4bit | ✅ | 260.23 | 36.23 | **1.37x** | 2 tokens; #719 |
+| qwen3-vl (32B) | qwen3-vl-32b-4bit | ✅ | 117.14 | 19.65 | 1.05x | 100 tokens; #719 |
 
 ## Summary Statistics
 
@@ -261,9 +264,9 @@ snapshot.
 ### Aggregate (VLM, models with >=5 generated tokens both sides)
 
 - **Comparable VLM pairs**: 17
-- **mlxcel >= mlx-vlm**: 5 / 17 (29%)
-- **mlxcel >= 90% parity**: 13 / 17 (76%)
-- **Average mlxcel/mlx-vlm**: 98% (median 98%, range 76%-118%)
+- **mlxcel >= mlx-vlm**: 7 / 17 (41%)
+- **mlxcel >= 90% parity**: 14 / 17 (82%)
+- **Average mlxcel/mlx-vlm**: 100% (median 100%, range 77%-123%)
 
 ### Text decode (tok/s)
 
@@ -372,42 +375,43 @@ snapshot.
 
 | Model | mlxcel | mlx-vlm | mlxcel vs mlx-vlm |
 |-------|--------|---------|-------------------|
-| aya-vision-8b | 110.32 | FAIL | - |
-| bunny-llama3-8b-4bit | 111.24 | FAIL | - |
-| gemma-4-26b-a4b-it-4bit | 130.08 | 136.57 | 95% |
-| gemma-4-31b-4bit | 23.05 | 39.85 | - |
-| gemma-4-31b-it-4bit | 26.73 | 30.20 | 89% |
-| gemma-4-e2b-it-4bit | 210.09 | 201.70 | **104%** |
-| gemma-4-e2b-it-8bit | 131.63 | 150.51 | 87% |
-| gemma-4-e4b-it-4bit | 129.01 | 131.24 | 98% |
-| gemma-4-e4b-it-8bit | 76.36 | 90.00 | 85% |
+| aya-vision-8b | 112.09 | FAIL | - |
+| bunny-llama3-8b-4bit | 112.24 | FAIL | - |
+| gemma-4-26b-a4b-it-4bit | 134.38 | 136.57 | 98% |
+| gemma-4-31b-4bit | 23.41 | 39.85 | - |
+| gemma-4-31b-it-4bit | 27.21 | 30.20 | 90% |
+| gemma-4-e2b-it-4bit | 217.32 | 201.70 | **108%** |
+| gemma-4-e2b-it-8bit | 133.74 | 150.51 | 89% |
+| gemma-4-e4b-it-4bit | 134.10 | 131.24 | **102%** |
+| gemma-4-e4b-it-8bit | 76.28 | 90.00 | 85% |
+| gemma3-4b-4bit | 127.61 | FAIL | - |
 | gemma3n-e2b-4bit | FAIL | 124.63 | - |
 | gemma3n-e4b-4bit | FAIL | 93.55 | - |
 | gemma3n-e4b-bf16 | FAIL | 49.88 | - |
 | internvl3-1b | FAIL | 529.33 | - |
-| llama-4-scout-17b-4bit | 47.13 | FAIL | - |
-| llava-1.5-7b-4bit | 117.50 | FAIL | - |
-| llava-interleave-qwen-0.5b-bf16 | 344.30 | 345.08 | 100% |
-| llava-next-mistral-7b-4bit | 120.91 | FAIL | - |
-| ministral-3b-4bit | 195.49 | FAIL | - |
-| mistral-small-3.1-24b-4bit | 39.63 | FAIL | - |
+| llama-4-scout-17b-4bit | 48.33 | FAIL | - |
+| llava-1.5-7b-4bit | 117.70 | FAIL | - |
+| llava-interleave-qwen-0.5b-bf16 | 343.53 | 345.08 | **100%** |
+| llava-next-mistral-7b-4bit | 120.38 | FAIL | - |
+| ministral-3b-4bit | 195.22 | FAIL | - |
+| mistral-small-3.1-24b-4bit | 39.62 | FAIL | - |
 | molmo-7b | FAIL | 56471.65 (anomalous) | - |
-| molmo2-4b | 63.60 | 66.80 | 95% |
-| paligemma2-3b-6bit | 82.51 | 124.55 | - |
-| phi-3.5-vision-4bit | 121.90 | 159.63 | 76% |
-| pixtral-12b-4bit | 69.67 | FAIL | - |
+| molmo2-4b | 64.01 | 66.80 | 96% |
+| paligemma2-3b-6bit | 80.09 | 124.55 | - |
+| phi-3.5-vision-4bit | 123.07 | 159.63 | 77% |
+| pixtral-12b-4bit | 69.71 | FAIL | - |
 | qwen2-vl-2b-4bit | 0.00 | 279.55 | - |
-| qwen3-vl-2b-4bit | 281.91 | FAIL | - |
-| qwen3-vl-30b-a3b-4bit | 36.27 | FAIL | - |
-| qwen3-vl-32b-4bit | 19.64 | FAIL | - |
-| qwen3.5-0.8b-4bit | 471.83 | 410.96 | **115%** |
-| qwen3.5-27b-4bit | 32.54 | 33.44 | 97% |
-| qwen3.5-2b-4bit | 311.82 | 318.14 | 98% |
-| qwen3.5-35b-a3b-4bit | 151.33 | 128.80 | **117%** |
-| qwen3.5-4b-4bit | 162.92 | 166.46 | 98% |
-| qwen3.5-9b-4bit | 102.50 | 102.48 | **100%** |
-| qwen3.5-9b-bf16 | 31.11 | 31.45 | 99% |
-| qwen3.6-35b-a3b-4bit | 146.07 | 123.70 | **118%** |
+| qwen3-vl-2b-4bit | 281.37 | FAIL | - |
+| qwen3-vl-30b-a3b-4bit | 36.23 | FAIL | - |
+| qwen3-vl-32b-4bit | 19.65 | FAIL | - |
+| qwen3.5-0.8b-4bit | 505.94 | 410.96 | **123%** |
+| qwen3.5-27b-4bit | 32.84 | 33.44 | 98% |
+| qwen3.5-2b-4bit | 323.00 | 318.14 | **102%** |
+| qwen3.5-35b-a3b-4bit | 151.34 | 128.80 | **117%** |
+| qwen3.5-4b-4bit | 170.78 | 166.46 | **103%** |
+| qwen3.5-9b-4bit | 102.39 | 102.48 | **100%** |
+| qwen3.5-9b-bf16 | 30.92 | 31.45 | 98% |
+| qwen3.6-35b-a3b-4bit | 147.38 | 123.70 | **119%** |
 
 ### mlx-lm fail categories (text)
 
