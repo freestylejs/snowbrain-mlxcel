@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [v0.0.29] - 2026-05-20
+
+### Added
+- **`mlxcel-bench-decode` same-process benchmark harness.** Loads a model once, runs the warmup pass, resets model and cache state, then runs the measured pass in the same process. This mirrors the Python `stream_generate` timing far more closely than two cold `mlxcel generate` invocations, especially for prefill. `scripts/bench_decode.sh` now drives this binary, and `scripts/bench_mlxlm.py` provides the matching mlx-lm / mlx-vlm baseline sweep (#36).
+
+### Fixed
+- **Model-owned VLM fallback state reset.** Single-row CLI and benchmark generations, which do not carry a `SequenceId`, reused stale fallback caches between runs. A new `LanguageModel::reset_runtime_state()` hook, invoked from `CxxGenerator::reset_with_model`, clears the model-owned fallback slot in lockstep with the generator-owned cache vector for Gemma 3, Gemma 4, Llama 4, and Qwen 3.5 Next (#34).
+- **Gemma 3n VLM padded prefill alignment.** Gemma 3n VLM prefill aborted with a `[broadcast_shapes]` mismatch (for example `(1,288,256)` vs `(1,273,256)`) when the projected per-layer-inputs tensor diverged from the tile-padded token stream. The per-layer tensor is now aligned to the embeddings sequence length (pad with zeros when shorter, slice when longer, leave untouched when equal) before the per-layer blend (#36).
+
+### Docs
+- Reorganize benchmark result reports and refresh the Apple Silicon and M5 Max VLM benchmark tables (#33).
+- Clarify the README benchmark phases, the model surgery advantage, and the Qwen3.5-0.8B-4bit quickstart (#32).
+
 ## [v0.0.28] - 2026-05-19
 
 ### Performance
@@ -642,6 +655,7 @@ Initial public release of mlxcel.
 - GitHub Actions release workflow for macOS ARM64
 - Profile mode for prefill/decode timing analysis
 
+[v0.0.29]: https://github.com/lablup/mlxcel/compare/v0.0.28...v0.0.29
 [v0.0.28]: https://github.com/lablup/mlxcel/compare/v0.0.27...v0.0.28
 [v0.0.27]: https://github.com/lablup/mlxcel/compare/v0.0.26...v0.0.27
 [v0.0.26]: https://github.com/lablup/mlxcel/compare/v0.0.25...v0.0.26

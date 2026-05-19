@@ -1,3 +1,26 @@
+mlxcel (0.0.29-1~jammy1) jammy; urgency=medium
+
+  * Fix: model-owned VLM fallback state reset. Single-row CLI and
+    benchmark generations, which do not carry a SequenceId, reused stale
+    fallback caches between runs. A new
+    LanguageModel::reset_runtime_state() hook, invoked from
+    CxxGenerator::reset_with_model, clears the model-owned fallback slot
+    in lockstep with the generator-owned cache vector for Gemma 3,
+    Gemma 4, Llama 4, and Qwen 3.5 Next (#34)
+  * Fix: Gemma 3n VLM padded prefill alignment. Gemma 3n VLM prefill
+    aborted with a [broadcast_shapes] mismatch when the projected
+    per-layer-inputs tensor diverged from the tile-padded token stream.
+    The per-layer tensor is now aligned to the embeddings sequence length
+    (pad when shorter, slice when longer) before the per-layer blend (#36)
+  * Added: mlxcel-bench-decode same-process benchmark harness that loads a
+    model once and runs the warmup and measured passes in one process,
+    plus the matching bench_mlxlm.py mlx-lm / mlx-vlm baseline sweep (#36)
+  * Docs: reorganize benchmark result reports, refresh Apple Silicon and
+    M5 Max VLM benchmarks, and clarify README benchmark phases and
+    quickstart (#32, #33)
+
+ -- Jeongkyu Shin <inureyes@gmail.com>  Wed, 20 May 2026 04:00:00 +0900
+
 mlxcel (0.0.28-1~jammy1) jammy; urgency=medium
 
   * Perf: Gemma3n bf16 prefill path: materialize full-precision bf16
