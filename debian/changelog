@@ -1,3 +1,35 @@
+mlxcel (0.0.30-1~jammy1) jammy; urgency=medium
+
+  * Added: unified pre-load memory estimator. The new mlxcel inspect
+    subcommand prints a byte-level breakdown of weights, KV cache, and
+    runtime headroom against available unified memory without loading
+    any tensors. --estimate-memory on generate and serve runs the same
+    estimator as a preflight that aborts when the model will not fit,
+    with --force to override and MLXCEL_MEMORY_LIMIT to set a soft cap
+    (#64, #65, #66, #67)
+  * Added: Molmo v1 (molmo-7b) VLM architecture (#41)
+  * Added: InternVL (internvl_chat) VLM architecture (#37)
+  * Perf: reduce Gemma 3n bf16 decode AltUp/MLP graph overhead and
+    improve M5 decode bandwidth with pretransposed weights (#60, #62)
+  * Perf: speed up Phi-3.5 SuScaledRoPE decode, align Gemma dense GeGLU
+    with mlx-lm, and speed up Jamba hybrid decode (#42, #43, #44)
+  * Changed: treat the server --ctx-size as a total context budget shared
+    across request slots, matching llama.cpp semantics (#57)
+  * Fix: validate CLI boolean cache flags and let CLI flags take
+    precedence over environment variables (#70)
+  * Fix: make the prompt cache radix trie iterative to prevent a stack
+    overflow on deep prompts (#63)
+  * Fix: gate the Gemma 3n bf16 fused decode path off the M5 Neural
+    Accelerator (#61)
+  * Fix: append the 90a arch suffix for CUDA Hopper auto-detect and
+    fallback builds (#51)
+  * Fix: harden VLM server image decoding to skip invalid entries (#50)
+  * Fix: expand the Qwen2-VL image placeholder to the grid count (#39)
+  * Docs: refresh M1 Ultra and README decode benchmarks and keep the
+    result tables current-state only (#45, #46, #47, #48, #49)
+
+ -- Jeongkyu Shin <inureyes@gmail.com>  Sat, 23 May 2026 10:28:35 +0900
+
 mlxcel (0.0.29-1~jammy1) jammy; urgency=medium
 
   * Fix: model-owned VLM fallback state reset. Single-row CLI and

@@ -6,8 +6,41 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [v0.0.30] - 2026-05-23
+
+### Added
+- **Unified pre-load memory estimator** (epic #52). `mlxcel inspect` is a new read-only subcommand that prints a byte-level breakdown of model weights, KV cache, and runtime headroom against available unified memory without loading any tensors. `--estimate-memory` on `mlxcel generate` and `mlxcel serve` runs the same estimator as a preflight and aborts when the model will not fit; `--force` (alias `--no-memory-check`) overrides the abort, `MLXCEL_MEMORY_LIMIT=NGB` tightens the available figure to a soft cap, and the runtime headroom factor defaults to `1.20x` (#67).
+- **Exact weight footprint from the safetensors header.** The estimator parses the safetensors header to derive real per-dtype byte counts without materializing tensors (#64).
+- **KV cache memory estimator** with 256-token rounding that matches the runtime's pre-allocation steps (#65).
+- **MLX runtime memory API bindings** that expose the active, peak, and limit byte counters through FFI (#66).
+- **Molmo v1 (molmo-7b) VLM architecture** (#41).
+- **InternVL (internvl_chat) VLM architecture** (#37).
+
 ### Changed
 - **Server parallel context sizing:** `--ctx-size` is now treated as a total context budget shared across active request slots, matching llama.cpp server semantics. `--parallel N --ctx-size C` yields an effective per-slot window of `floor(C / N)`; explicit `--max-batch-size` values share the same budget, `--no-batch` keeps a single full-context slot, `/slots` reports the per-slot window, startup rejects per-slot windows below 512 tokens, and memory preflight uses the same sizing model (#57).
+
+### Performance
+- **Gemma 3n bf16 decode** reduces AltUp/MLP graph overhead (#60) and improves M5 decode bandwidth with pretransposed weights (#62).
+- **Phi-3.5 SuScaledRoPE decode** speedup (#42).
+- **Gemma dense GeGLU** aligned with the mlx-lm reference for faster decode (#43).
+- **Jamba hybrid decode** speedup (#44).
+
+### Fixed
+- **CLI boolean cache flags** are now validated, and CLI flags correctly take precedence over their environment-variable equivalents (#70).
+- **Prompt cache radix trie** is now iterative, preventing a stack overflow on deep prompt prefixes (#63).
+- **Gemma 3n** gates the bf16 fused decode path off the M5 Neural Accelerator so output stays correct on that hardware (#61).
+- **CUDA Hopper builds** append the `90a` architecture suffix for auto-detect and fallback builds (#51).
+- **VLM server image decoding** is hardened to skip invalid entries instead of failing the whole request (#50).
+- **Qwen2-VL image placeholder** is expanded to the full grid count (#39).
+- Tighten memory estimator preflight coverage so the abort path is exercised across `generate` and `serve`.
+
+### Docs
+- Refresh the M1 Ultra and README decode benchmark figures for the Molmo / Phi-3.5 / Gemma / Jamba / InternVL work (#45, #46).
+- Correct the M5 Max baichuan-m1-14b decode comparison and flag the qwen3-0.6b gap (#49).
+- Drop change-cause notes from the result tables to keep them current-state only (#47, #48).
+
+### Tests
+- Add a qwen2.5-vl-3b-4bit warmup regression guard (#38).
 
 ## [v0.0.29] - 2026-05-20
 
@@ -658,6 +691,7 @@ Initial public release of mlxcel.
 - GitHub Actions release workflow for macOS ARM64
 - Profile mode for prefill/decode timing analysis
 
+[v0.0.30]: https://github.com/lablup/mlxcel/compare/v0.0.29...v0.0.30
 [v0.0.29]: https://github.com/lablup/mlxcel/compare/v0.0.28...v0.0.29
 [v0.0.28]: https://github.com/lablup/mlxcel/compare/v0.0.27...v0.0.28
 [v0.0.27]: https://github.com/lablup/mlxcel/compare/v0.0.26...v0.0.27
