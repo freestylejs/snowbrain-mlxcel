@@ -24,6 +24,8 @@ CLAUDE.md
 /TECHNICAL_REPORTS/
 /docs_internal/
 /docs/analysis/
+/.claude/
+/.codex/
 
 # MkDocs build output
 /site/
