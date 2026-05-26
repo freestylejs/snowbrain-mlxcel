@@ -9,8 +9,9 @@ mlxcel (0.0.31-1~jammy1) jammy; urgency=medium
   * Fix: tolerate missing or null chat message content, such as
     assistant tool-call turns, instead of rejecting it with HTTP 422
     (#91)
-  * Fix: make the Gemma 3n VLM per_layer_inputs path sequence-aware so
-    per-layer input shapes stay correct (#86)
+  * Fix: key the Gemma 3n VLM per_layer_inputs state per sequence id so
+    concurrent VLM requests in the batch scheduler no longer race on a
+    single shared cell and read the wrong sequence's tensor (#86)
   * Fix: use per-position verify attention for Qwen3.5 MTP speculative
     decoding so draft and verify stay in parity (#78)
   * Fix: correct the mask offset for batched quantized KV caches (#76)

@@ -15,7 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 - **Chat message `content`** that is missing or explicitly `null`, such as assistant tool-call turns, is now tolerated instead of being rejected with an HTTP 422, restoring multi-turn tool loops for OpenAI-compatible clients (#91).
-- **Gemma 3n VLM `per_layer_inputs`** is now sequence-aware so per-layer input shapes stay correct during VLM inference (#86).
+- **Gemma 3n VLM `per_layer_inputs`** is now keyed per sequence id, so a burst of concurrent VLM requests in the batch scheduler can no longer race on a single shared cell and read the wrong sequence's tensor (#86).
 - **Qwen3.5 MTP speculative decoding** uses per-position verify attention so the draft and verify passes stay in parity (#78).
 - **Batched quantized KV caches** now apply the correct mask offset (#76).
 
