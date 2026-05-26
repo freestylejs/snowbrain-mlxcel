@@ -6,6 +6,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [v0.0.31] - 2026-05-27
+
+### Added
+- **MiniCPM-V 4.6 VLM architecture**, including hardened image grid handling (#82, #83).
+- **RT-DETRv2 object detection model** exposed through the new `mlxcel detect` subcommand (#80).
+- **Anthropic-style `/v1/messages` API endpoint** on the server for Messages API clients (#74).
+
+### Fixed
+- **Chat message `content`** that is missing or explicitly `null`, such as assistant tool-call turns, is now tolerated instead of being rejected with an HTTP 422, restoring multi-turn tool loops for OpenAI-compatible clients (#91).
+- **Gemma 3n VLM `per_layer_inputs`** is now sequence-aware so per-layer input shapes stay correct during VLM inference (#86).
+- **Qwen3.5 MTP speculative decoding** uses per-position verify attention so the draft and verify passes stay in parity (#78).
+- **Batched quantized KV caches** now apply the correct mask offset (#76).
+
+### Docs
+- Document the `MLXCEL_CAPTURE_DECODE` environment variable and clarify the memory headroom wording (#72).
+
+### CI
+- Pin the Rust toolchain to 1.93.1 for reproducible builds (#87, #90).
+
+### Chore
+- Bump the `minor-and-patch` dependency group: `serde_json` 1.0.149 to 1.0.150 and `minijinja` 2.19.0 to 2.20.0 (#84).
+- Exclude the root `models` symlink (#88) and AI assistant temporary directories from `.gitignore`.
+
 ## [v0.0.30] - 2026-05-23
 
 ### Added
@@ -691,6 +714,7 @@ Initial public release of mlxcel.
 - GitHub Actions release workflow for macOS ARM64
 - Profile mode for prefill/decode timing analysis
 
+[v0.0.31]: https://github.com/lablup/mlxcel/compare/v0.0.30...v0.0.31
 [v0.0.30]: https://github.com/lablup/mlxcel/compare/v0.0.29...v0.0.30
 [v0.0.29]: https://github.com/lablup/mlxcel/compare/v0.0.28...v0.0.29
 [v0.0.28]: https://github.com/lablup/mlxcel/compare/v0.0.27...v0.0.28

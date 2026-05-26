@@ -1,3 +1,27 @@
+mlxcel (0.0.31-1~jammy1) jammy; urgency=medium
+
+  * Added: MiniCPM-V 4.6 VLM architecture, including hardened image
+    grid handling (#82, #83)
+  * Added: RT-DETRv2 object detection model with the new mlxcel detect
+    subcommand (#80)
+  * Added: Anthropic-style /v1/messages API endpoint on the server
+    (#74)
+  * Fix: tolerate missing or null chat message content, such as
+    assistant tool-call turns, instead of rejecting it with HTTP 422
+    (#91)
+  * Fix: make the Gemma 3n VLM per_layer_inputs path sequence-aware so
+    per-layer input shapes stay correct (#86)
+  * Fix: use per-position verify attention for Qwen3.5 MTP speculative
+    decoding so draft and verify stay in parity (#78)
+  * Fix: correct the mask offset for batched quantized KV caches (#76)
+  * Docs: document MLXCEL_CAPTURE_DECODE and clarify the memory
+    headroom wording (#72)
+  * CI: pin the Rust toolchain to 1.93.1 for reproducible builds
+    (#87, #90)
+  * Chore: bump serde_json to 1.0.150 and minijinja to 2.20.0 (#84)
+
+ -- Jeongkyu Shin <inureyes@gmail.com>  Wed, 27 May 2026 01:32:48 +0900
+
 mlxcel (0.0.30-1~jammy1) jammy; urgency=medium
 
   * Added: unified pre-load memory estimator. The new mlxcel inspect
