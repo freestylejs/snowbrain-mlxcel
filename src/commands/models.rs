@@ -31,24 +31,33 @@
 //! shims so the store semantics stay in one place.
 
 use std::io::{IsTerminal, Write};
+use std::path::Path;
 
 use anyhow::{Result, anyhow};
 
-use mlxcel::downloader::{RemoveOutcome, StoredModel, list_models, remove_model, store_root};
+use mlxcel::downloader::{
+    RemoveOutcome, StoredModel, dir_size, list_models_with_override, models_root,
+    remove_model_with_override,
+};
 
 /// Run `mlxcel list --local`: print downloaded models from the global store.
-pub(crate) fn run_list_local() -> Result<()> {
-    let models = list_models();
+///
+/// `models_dir` is the inline `--models-dir <path>` override (issue #107):
+/// when `Some`, the listing operates against that models root directly; when
+/// `None`, it resolves `MLXCEL_MODELS_DIR` then the cache-root `models/` path.
+pub(crate) fn run_list_local(models_dir: Option<&Path>) -> Result<()> {
+    let models = list_models_with_override(models_dir);
     let mut out = String::new();
-    render_local_models(&mut out, &models, store_root_display().as_deref());
+    render_local_models(&mut out, &models, store_root_display(models_dir).as_deref());
     print!("{out}");
     Ok(())
 }
 
-/// Resolve the store root as a display string for the listing header, or
-/// `None` when it cannot be resolved (no `MLXCEL_CACHE_DIR` / home dir).
-fn store_root_display() -> Option<String> {
-    store_root().map(|p| p.join("models").display().to_string())
+/// Resolve the active models root as a display string for the listing header,
+/// or `None` when it cannot be resolved (no override, no `MLXCEL_MODELS_DIR`,
+/// no `MLXCEL_CACHE_DIR` / home dir). Honors the `--models-dir` override.
+fn store_root_display(models_dir: Option<&Path>) -> Option<String> {
+    models_root(models_dir).map(|p| p.display().to_string())
 }
 
 /// Render the `mlxcel list --local` output into `out`.
@@ -76,7 +85,7 @@ fn render_local_models<W: std::fmt::Write>(
             None => writeln!(
                 out,
                 "No models downloaded (mlxcel store root is unavailable; \
-                 set MLXCEL_CACHE_DIR).\n\
+                 set MLXCEL_MODELS_DIR or MLXCEL_CACHE_DIR, or pass --models-dir).\n\
                  Download one with: mlxcel download <owner>/<name>"
             ),
         };
@@ -138,21 +147,29 @@ fn render_local_models<W: std::fmt::Write>(
 /// the read-only HuggingFace cache (reports it instead). When stdin is not a
 /// TTY and `--yes` was not passed, the command errors rather than silently
 /// deleting or silently skipping — the operator must opt in explicitly.
-pub(crate) fn run_remove(repo_id: &str, yes: bool, revision: Option<&str>) -> Result<()> {
+pub(crate) fn run_remove(
+    repo_id: &str,
+    yes: bool,
+    revision: Option<&str>,
+    models_dir: Option<&Path>,
+) -> Result<()> {
     // Probe the store first so we can show what will be removed (and its size)
     // before asking for confirmation, and so a not-found / HF-cache-only repo
-    // never reaches a confirmation prompt.
-    let target = mlxcel::downloader::model_dir(repo_id).ok_or_else(|| {
-        anyhow!(
-            "cannot resolve the mlxcel model store root \
-             (set MLXCEL_CACHE_DIR or ensure a home directory is available)"
-        )
-    })?;
+    // never reaches a confirmation prompt. Honors the `--models-dir` override
+    // (issue #107) so the probe and deletion target the same models root.
+    let target =
+        mlxcel::downloader::model_dir_with_override(repo_id, models_dir).ok_or_else(|| {
+            anyhow!(
+                "cannot resolve the mlxcel model store root \
+             (set MLXCEL_MODELS_DIR or MLXCEL_CACHE_DIR, pass --models-dir, \
+             or ensure a home directory is available)"
+            )
+        })?;
 
     if !target.is_dir() {
         // Not in the store. Distinguish HF-cache-only from truly absent by
         // letting the store helper do the probe (it is read-only).
-        match remove_model(repo_id, revision)? {
+        match remove_model_with_override(repo_id, revision, models_dir)? {
             RemoveOutcome::HfCacheOnly { hf_path } => {
                 return Err(anyhow!(
                     "'{repo_id}' is not in the mlxcel store; it exists only in the \
@@ -191,7 +208,7 @@ pub(crate) fn run_remove(repo_id: &str, yes: bool, revision: Option<&str>) -> Re
         }
     }
 
-    match remove_model(repo_id, revision)? {
+    match remove_model_with_override(repo_id, revision, models_dir)? {
         RemoveOutcome::Removed { path, size_bytes } => {
             println!(
                 "Removed '{repo_id}' ({}) from {}",
@@ -209,17 +226,13 @@ pub(crate) fn run_remove(repo_id: &str, yes: bool, revision: Option<&str>) -> Re
     }
 }
 
-/// Best-effort size string for the confirmation prompt. Recomputed from the
-/// store helper's public listing is overkill for a single dir, so we sum here
-/// via the same walk the library uses; failures degrade to "unknown size".
-fn dir_size_for_prompt(dir: &std::path::Path) -> String {
-    // Reuse the library's listing to find this exact path's size when present,
-    // avoiding a second size-walk implementation in the binary.
-    let target = dir.to_path_buf();
-    if let Some(m) = list_models().into_iter().find(|m| m.path == target) {
-        return mlxcel::memory_estimate::format_bytes(m.size_bytes);
-    }
-    "unknown size".to_string()
+/// Best-effort size string for the `rm` confirmation prompt. Sizes the single
+/// target directory directly via the library's shared walk, rather than listing
+/// and summing every model in the store: pointing `--models-dir` /
+/// `MLXCEL_MODELS_DIR` at a large volume with many snapshots should not make the
+/// prompt pay an O(whole-store) stat cost just to show one model's size.
+fn dir_size_for_prompt(dir: &Path) -> String {
+    mlxcel::memory_estimate::format_bytes(dir_size(dir))
 }
 
 /// Prompt on the controlling TTY for a yes/no confirmation. Returns `Ok(true)`
