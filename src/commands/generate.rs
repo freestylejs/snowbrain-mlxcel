@@ -32,6 +32,7 @@ use mlxcel::{
         },
         resolve_model_shard_plan, shard_config_from_cli, validate_supported_runtime,
     },
+    downloader::resolve_model_source,
     initialize_runtime, load_model, load_model_with_adapter, load_model_with_tensor_parallel,
     memory_estimate::{
         MemoryEstimate, QuantHint, estimate_total_memory, format_bytes, format_estimate,
@@ -1015,7 +1016,7 @@ fn install_surgery_pipeline_from_cli(args: &GenerateArgs) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn run_generate(args: GenerateArgs) -> Result<()> {
+pub(crate) fn run_generate(mut args: GenerateArgs) -> Result<()> {
     let runtime = initialize_runtime();
     print_runtime_setup(&runtime);
 
@@ -1025,9 +1026,22 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<()> {
     // error rather than being masked by an unrelated tensor-parallel
     // or pipeline-parallel diagnostic. When `--surgery` is absent this
     // is a no-op and the load path remains bit-exact identical to the
-    // pre-#371 baseline.
+    // pre-#371 baseline. This reads only the `--surgery` YAML path, never
+    // the model directory, so it must stay ahead of the `-m` resolver below
+    // — a malformed surgery config never triggers an auto-download.
     #[cfg(feature = "surgery")]
     install_surgery_pipeline_from_cli(&args)?;
+
+    // Resolve `-m` into a concrete model directory (epic #92, issue #94)
+    // before any consumer reads it. An existing path is used verbatim
+    // (byte-identical to the pre-#94 local-path behavior); an `owner/name`
+    // HuggingFace repo-id is reused from the legacy CWD / HF cache / mlxcel
+    // store, or auto-downloaded into the mlxcel store on a miss. Placed after
+    // the (model-independent) surgery YAML validation but before the
+    // tensor/pipeline-parallel validators and the quantization-advice,
+    // tokenizer, memory-preflight, and model-load steps — all of which read
+    // the model directory and therefore need the resolved path.
+    args.model.model = resolve_model_source(&args.model.model)?;
 
     validate_tensor_parallel_args(&args)?;
     validate_pipeline_parallel_args(&args)?;
