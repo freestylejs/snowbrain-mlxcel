@@ -53,11 +53,23 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: "14.0"
 
     steps:
+      # Self-healing release: build the *source of the target tag* while
+      # running the *current* workflow definition. GitHub always executes the
+      # release.yml baked into the triggering ref, so a bug in an old tag's
+      # workflow (e.g. a broken notarization step) cannot be fixed by
+      # re-running that tag. To recover, dispatch this workflow from main
+      # (or any branch carrying the fixed release.yml) and pass the old tag
+      # as release_tag: the fixed workflow runs, but the old tag's source is
+      # what gets built and uploaded.
+      #   - release event      -> the published release's tag
+      #   - workflow_dispatch  -> the release_tag input, when provided
+      #   - otherwise          -> the exact commit that triggered the run
       - name: Checkout code
         uses: actions/checkout@v6
         with:
           # Don't leave GITHUB_TOKEN in .git/config; release jobs only fetch.
           persist-credentials: false
+          ref: ${{ github.event.release.tag_name || github.event.inputs.release_tag || github.sha }}
 
       # Use persistent cache paths for self-hosted runner (outside workspace)
       - name: Setup persistent cache paths (self-hosted)
@@ -397,11 +409,23 @@ jobs:
     timeout-minutes: 120
 
     steps:
+      # Self-healing release: build the *source of the target tag* while
+      # running the *current* workflow definition. GitHub always executes the
+      # release.yml baked into the triggering ref, so a bug in an old tag's
+      # workflow (e.g. a broken notarization step) cannot be fixed by
+      # re-running that tag. To recover, dispatch this workflow from main
+      # (or any branch carrying the fixed release.yml) and pass the old tag
+      # as release_tag: the fixed workflow runs, but the old tag's source is
+      # what gets built and uploaded.
+      #   - release event      -> the published release's tag
+      #   - workflow_dispatch  -> the release_tag input, when provided
+      #   - otherwise          -> the exact commit that triggered the run
       - name: Checkout code
         uses: actions/checkout@v6
         with:
           # Don't leave GITHUB_TOKEN in .git/config; release jobs only fetch.
           persist-credentials: false
+          ref: ${{ github.event.release.tag_name || github.event.inputs.release_tag || github.sha }}
 
       # Use persistent cache paths for self-hosted runner (outside workspace)
       - name: Setup persistent cache paths (self-hosted)
