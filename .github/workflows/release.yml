@@ -6,8 +6,17 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Release tag to upload artifacts to (e.g. v0.1.0)'
+        description: 'Release tag to upload artifacts to (e.g. v0.1.0). Empty = no upload (build-only verification run).'
         required: false
+      targets:
+        description: 'Which platforms to build. Only applies to workflow_dispatch; a real release event always builds everything.'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - macos
+          - linux
 
 # Default-deny top-level permissions; each job grants only what it needs.
 permissions: {}
@@ -26,7 +35,17 @@ jobs:
     # actor has push access to, so this guard is the last line of defense
     # against a forked copy of the repo dispatching a build with the
     # canonical-org runner labels.
-    if: github.repository == 'lablup/mlxcel'
+    #
+    # On a real release event we always build every target; the `targets`
+    # input only filters manual workflow_dispatch runs (e.g. re-uploading a
+    # single platform's asset to an existing release without churning the
+    # other platforms' hashes).
+    if: |
+      github.repository == 'lablup/mlxcel' && (
+        github.event_name == 'release' ||
+        github.event.inputs.targets == 'all' ||
+        github.event.inputs.targets == 'macos'
+      )
     permissions:
       contents: write
 
@@ -351,7 +370,13 @@ jobs:
     name: Build Linux ARM64 CUDA (${{ matrix.variant }})
     runs-on: GB10
     environment: packaging
-    if: github.repository == 'lablup/mlxcel'
+    # See the macOS job for the rationale behind these two guards.
+    if: |
+      github.repository == 'lablup/mlxcel' && (
+        github.event_name == 'release' ||
+        github.event.inputs.targets == 'all' ||
+        github.event.inputs.targets == 'linux'
+      )
     permissions:
       contents: write
 
