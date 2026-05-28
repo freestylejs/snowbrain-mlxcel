@@ -1,3 +1,29 @@
+mlxcel (0.1.2-1~jammy1) jammy; urgency=medium
+
+  * Fix: when `tokenizer_config.json` ships no `chat_template` field
+    and there is no `chat_template.jinja`, the chat fallback path no
+    longer collapses into echo loops on base / non-instruction-tuned
+    models. Previously `render_prompt` called `concat_plaintext`,
+    which is bare content-only concatenation with no role markers,
+    so a base completion model took the most natural continuation
+    of an unstructured prompt and parroted the user's last turn
+    indefinitely. The implicit "no template found" path now uses a
+    generic `User: ... Assistant: ...` pseudo-template via
+    `concat_userassistant_fallback`, with a trailing `Assistant:`
+    cue (no newline) that nudges the model to produce an assistant
+    turn next instead of completing its own prompt with another
+    `User:` line. The `processor.is_none()` warning still fires and
+    still recommends the `-it` Hub counterpart; the explicit
+    `--no-chat-template` flag is unchanged and remains the offline
+    `mlxcel generate --no-chat-template` parallel for raw,
+    completion-style concatenation. Template-render failure inside
+    the chat-template path now falls back to the structured form
+    as well, rather than raw concat. Unknown roles such as `tool`
+    are preserved verbatim with the same `Role: ` pattern instead
+    of silently merging into the prior turn (#133, PR #136)
+
+ -- Jeongkyu Shin <inureyes@gmail.com>  Fri, 29 May 2026 00:15:00 +0900
+
 mlxcel (0.1.1-1~jammy1) jammy; urgency=medium
 
   * Fix: add `*.jinja` to the downloader file allow-list so

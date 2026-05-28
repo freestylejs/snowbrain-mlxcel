@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [v0.1.2] - 2026-05-29
+
+### Fixed
+- **Chat fallback for models without a `chat_template` no longer collapses into echo loops**. When `tokenizer_config.json` ships no `chat_template` field and there is no `chat_template.jinja`, `render_prompt` previously called `concat_plaintext`, which is bare content-only concatenation with no role markers. Base / non-instruction-tuned models, being completion models, then took the most natural continuation of an unstructured prompt and parroted the user's last turn indefinitely (the symptom reported in #133). The implicit "no template found" path now uses a generic `User: ... Assistant: ...` pseudo-template via `concat_userassistant_fallback`, with a trailing `Assistant:` cue (no newline) that nudges the model to produce an assistant turn next instead of completing its own prompt with another `User:` line. The `processor.is_none()` warning still fires and still names base-model behavior as the cause; the recommendation to try the `-it` Hub counterpart is unchanged. `--no-chat-template` keeps its existing raw concatenation semantics and remains the offline `mlxcel generate --no-chat-template` parallel for completion-style usage. Template-render failure inside the chat-template path now falls back to the structured form as well, rather than raw concat, since by then the user is already in chat mode. Unknown roles such as `tool` are preserved verbatim with the same `Role: ` pattern instead of silently merging into the prior turn (#133, PR #136).
+
 ## [v0.1.1] - 2026-05-28
 
 ### Fixed
@@ -750,6 +755,7 @@ Initial public release of mlxcel.
 - GitHub Actions release workflow for macOS ARM64
 - Profile mode for prefill/decode timing analysis
 
+[v0.1.2]: https://github.com/lablup/mlxcel/compare/v0.1.1...v0.1.2
 [v0.1.1]: https://github.com/lablup/mlxcel/compare/v0.1.0...v0.1.1
 [v0.1.0]: https://github.com/lablup/mlxcel/compare/v0.0.31...v0.1.0
 [v0.0.31]: https://github.com/lablup/mlxcel/compare/v0.0.30...v0.0.31
