@@ -1,3 +1,67 @@
+mlxcel (0.1.1-1~jammy1) jammy; urgency=medium
+
+  * Fix: add `*.jinja` to the downloader file allow-list so
+    `chat_template.jinja` is downloaded alongside the rest of the
+    model snapshot. Previously the allow-list only accepted exact-name
+    `chat_template` (no extension) plus `*.json`, `*.safetensors`,
+    `*.tiktoken`, `*.model`, and constrained `*.txt`, so models that
+    ship the chat template as a separate Jinja file (e.g.
+    `mlx-community/gemma-4-e4b-it-4bit`) silently fell back to the
+    raw-text path in the REPL. The `is_safe_relative_path` and
+    `is_explicitly_denied` guards still run before the allow-list so
+    no new attack surface is opened (#132, PR #134)
+  * Fix: expand the `mlxcel run` warning emitted when a model ships no
+    chat template. It now states that the model is likely a base /
+    non-instruction-tuned variant, that chat replies will be
+    incoherent or repetitive, suggests trying an `-it` variant on the
+    Hub (e.g. `gemma-4-e4b-it-4bit` for `gemma-4-e4b-4bit`), and
+    documents `--no-chat-template` for silent raw-text mode and
+    `mlxcel generate -p <prompt>` for one-shot completion. The
+    explicit `--no-chat-template` path remains completely silent
+    (#132, PR #134)
+  * Docs: refresh GB10 (NVIDIA Grace Blackwell) results to the
+    2026-05-28 full sweep on mlxcel 0.1.0 with MLX pin `84961223`
+    and the warm same-process harness (`--cooldown 0`). Adds the
+    recovered `internvl3-1b` and `molmo-7b` text rows and three VLM
+    image-path entries (`qwen2-vl-2b`, `qwen2-vl-2b-4bit`,
+    `qwen3-vl-30b-a3b`). Aligns the cross-hardware decode table in
+    `model_tests.md` so all three columns reflect the canonical
+    per-hardware doc state: GB10 2026-05-28, M1 Ultra 2026-05-28,
+    M5 Max 2026-05-27. Drops the "vs 2026-05-19" delta framing in
+    favor of a current-state snapshot and collapses the
+    `Partial (⚠️)` status into `Pass (✅)` (#131)
+  * CI: notarize macOS release binaries by submitting both signed
+    `mlxcel` and `mlxcel-server` to Apple's notary service via
+    `rcodesign notary-submit --wait`, so Gatekeeper no longer blocks
+    first launch with "developer cannot be verified". Pairs
+    notarization with `rcodesign verify` after signing,
+    `set -euo pipefail` on the prepare-cert and code-sign steps,
+    surfaced `openssl pkcs12` stderr on extraction failure, up-front
+    validation of `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`,
+    and `AC_API_*` secrets, `chmod 600` on the materialized PEM and
+    API key files, and an always-run cleanup that scrubs
+    `signing.pem`, `original.p12`, `AuthKey.p8`, `ac-key.json`, and
+    the notarization zip from `$RUNNER_TEMP` so self-hosted runners
+    cannot carry an unencrypted Developer ID private key across jobs
+  * CI: add a per-target `workflow_dispatch` filter (`targets`:
+    `all` / `macos` / `linux`) to the release workflow.
+    Re-uploading a single platform's artifact to an existing release
+    no longer rebuilds and replaces the other platforms' bit-different
+    (timestamp-driven) zips. Release events still build everything;
+    the filter is dispatch-only
+  * CI: pin `actions/checkout` ref to the target release tag in both
+    the macOS and Linux CUDA jobs (release event:
+    `github.event.release.tag_name`; `workflow_dispatch`:
+    `github.event.inputs.release_tag`; otherwise `github.sha`).
+    Without an explicit ref, `actions/checkout` would grab the
+    dispatched ref (which is `main` for `workflow_dispatch`), so
+    re-dispatching a build for an older tag would silently use
+    `main` HEAD's source instead of the tag's source. The workflow
+    YAML itself still runs from the dispatched ref, matching
+    `all-smi`'s self-healing release pattern
+
+ -- Jeongkyu Shin <inureyes@gmail.com>  Thu, 28 May 2026 22:31:44 +0900
+
 mlxcel (0.1.0-1~jammy1) jammy; urgency=medium
 
   * Added: `mlxcel run <repo-id-or-path>` subcommand. No `-p` enters

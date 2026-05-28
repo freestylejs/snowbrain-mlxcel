@@ -4,11 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [v0.1.1] - 2026-05-28
 
 ### Fixed
 - **`chat_template.jinja` is now downloaded** alongside the rest of the model snapshot. The downloader allow-list in `src/downloader/filters.rs::is_wanted_file` only accepted exact-name `chat_template` (no extension) plus the broader `*.json` / `*.safetensors` / `*.tiktoken` / `*.model` / constrained `*.txt` allowances, but the actual HuggingFace convention is `chat_template.jinja`. The file was being filtered out at download time, leaving `ChatTemplateProcessor::from_model_path`'s `chat_template.jinja` fallback dead and forcing the REPL into the raw-text path for any model that ships its template as a separate Jinja file (e.g. `mlx-community/gemma-4-e4b-it-4bit`). `is_wanted_file` now also accepts `*.jinja` files; the `is_safe_relative_path` and `is_explicitly_denied` guards still run before the allow-list so no new attack surface is opened (#132, PR #134).
 - **`mlxcel run` warning for models without a chat template is now actionable**: it states that the model is likely a base / non-instruction-tuned model, that chat replies will be incoherent or repetitive, suggests trying an `-it` (instruction-tuned) variant on the Hub (e.g. for `gemma-4-e4b-4bit`, try `gemma-4-e4b-it-4bit`), and explains how to proceed silently (`--no-chat-template`) or with one-shot completion (`mlxcel generate -p <prompt>`). The explicit `--no-chat-template` path remains completely silent (no regression) (#132, PR #134).
+
+### Docs
+- **GB10 (NVIDIA Grace Blackwell) doc refreshed** to the 2026-05-28 full sweep on mlxcel 0.1.0 with MLX pin `84961223` and the warm same-process harness (`--cooldown 0`). Adds the recovered `internvl3-1b` and `molmo-7b` text rows and three VLM image-path entries (`qwen2-vl-2b`, `qwen2-vl-2b-4bit`, `qwen3-vl-30b-a3b`). The cross-hardware decode table in `model_tests.md` now reflects the canonical state of each per-hardware doc: GB10 2026-05-28, M1 Ultra 2026-05-28, M5 Max 2026-05-27 (all on mlxcel 0.1.0, same MLX pin, same same-process harness). The "vs 2026-05-19" delta framing is dropped so the doc reads as a current-state snapshot, and the `Partial (⚠️)` status is collapsed into `Pass (✅)` because the partial-token information already lives in the Notes column. Updated GB10 Overall Status counts: 101 text pass / 8 fail, 38 VLM image-path pass / 0 fail (#131).
+
+### CI
+- **macOS release binaries are now notarized.** The release workflow submits signed `mlxcel` and `mlxcel-server` to Apple's notary service via `rcodesign notary-submit --wait` so Gatekeeper no longer blocks first launch with "developer cannot be verified". Stapling is skipped because bare Mach-O executables do not support stapling, and `spctl --assess` runs as a soft warn-only check since the notary ticket may still be propagating. Paired with `rcodesign verify` after signing to catch a broken signature before shipping, `set -euo pipefail` on the prepare-cert and code-sign steps so a failure on the first binary does not silently fall through to the second, surfaced `openssl pkcs12` stderr on extraction failure, up-front validation of `APPLE_CERTIFICATE` / `APPLE_CERTIFICATE_PASSWORD` / `AC_API_*` secrets, `chmod 600` on the materialized PEM and API key files, and an always-run cleanup that scrubs `signing.pem`, `original.p12`, `AuthKey.p8`, `ac-key.json`, and the notarization zip from `$RUNNER_TEMP` so self-hosted runners no longer carry an unencrypted Developer ID private key across jobs.
+- **Per-target `workflow_dispatch` filter on the release workflow** (`targets`: `all` / `macos` / `linux`). Re-uploading a single platform's artifact to an existing release (for example retrofitting notarized macOS binaries onto a release that was cut before notarization landed) no longer rebuilds and replaces the other platforms' bit-different (timestamp-driven) zips, so any sha256 pinned by a downstream consumer remains valid. Release events still build everything; the filter is dispatch-only. Modeled after the per-family `targets` filter in `all-smi`'s release workflow.
+- **`actions/checkout` ref pinned to the target release tag** in both the macOS and Linux CUDA jobs. The ref is resolved as `github.event.release.tag_name` on release events, `github.event.inputs.release_tag` on `workflow_dispatch`, otherwise `github.sha`. Without an explicit ref, `actions/checkout` would grab the dispatched ref (which is `main` for `workflow_dispatch`), so re-dispatching a build for an older tag would silently use `main` HEAD's source instead of the tag's source. The workflow YAML itself still runs from the dispatched ref so a CI-only fix can be applied on `main` and replayed against an old tag without rebuilding from newer sources, matching `all-smi`'s self-healing release pattern.
 
 ## [v0.1.0] - 2026-05-28
 
@@ -742,6 +750,7 @@ Initial public release of mlxcel.
 - GitHub Actions release workflow for macOS ARM64
 - Profile mode for prefill/decode timing analysis
 
+[v0.1.1]: https://github.com/lablup/mlxcel/compare/v0.1.0...v0.1.1
 [v0.1.0]: https://github.com/lablup/mlxcel/compare/v0.0.31...v0.1.0
 [v0.0.31]: https://github.com/lablup/mlxcel/compare/v0.0.30...v0.0.31
 [v0.0.30]: https://github.com/lablup/mlxcel/compare/v0.0.29...v0.0.30
