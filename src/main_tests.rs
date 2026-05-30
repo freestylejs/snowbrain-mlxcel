@@ -54,7 +54,7 @@ fn run_defaults_match_clap_defaults() {
     );
 }
 
-/// Issue #26: the rendered `mlxcel list` output must mention every model
+/// Issue #26: the rendered `mlxcel arch` output must mention every model
 /// that is registered in `ALL_MODEL_TYPES`. This is the safety net that
 /// catches the case where someone adds a `ModelType` variant but the
 /// renderer silently drops it.
@@ -272,5 +272,69 @@ fn serve_command_surgery_flag_defaults_to_none() {
     assert!(
         args.surgery.is_none(),
         "absent --surgery flag on serve must resolve to None"
+    );
+}
+
+#[test]
+fn list_command_parses_to_list() {
+    let cli = Cli::try_parse_from(["mlxcel", "list"]).expect("bare `list` must parse");
+    let Commands::List(args) = cli.command else {
+        panic!("expected list command");
+    };
+    assert!(
+        args.models_dir.is_none(),
+        "bare `list` must default --models-dir to None"
+    );
+}
+
+#[test]
+fn list_ls_alias_parses_to_list() {
+    let cli = Cli::try_parse_from(["mlxcel", "ls"]).expect("`ls` alias must parse");
+    assert!(
+        matches!(cli.command, Commands::List(_)),
+        "`ls` alias must map to the List command"
+    );
+}
+
+#[test]
+fn list_command_accepts_models_dir() {
+    let cli = Cli::try_parse_from(["mlxcel", "list", "--models-dir", "/tmp/x"])
+        .expect("`list --models-dir` must parse");
+    let Commands::List(args) = cli.command else {
+        panic!("expected list command");
+    };
+    assert_eq!(
+        args.models_dir,
+        Some(std::path::PathBuf::from("/tmp/x")),
+        "--models-dir must be captured on the List command"
+    );
+}
+
+#[test]
+fn list_command_rejects_removed_local_flag() {
+    // The `--local` flag was removed (issue #138): local is now the default,
+    // so clap must reject it as an unknown argument. This pins the removal so
+    // the flag cannot silently return.
+    assert!(
+        Cli::try_parse_from(["mlxcel", "list", "--local"]).is_err(),
+        "the removed `--local` flag must be rejected as an unknown argument"
+    );
+}
+
+#[test]
+fn arch_command_parses_to_arch() {
+    let cli = Cli::try_parse_from(["mlxcel", "arch"]).expect("`arch` must parse");
+    assert!(
+        matches!(cli.command, Commands::Arch(_)),
+        "`arch` must map to the Arch command"
+    );
+}
+
+#[test]
+fn arch_supported_alias_parses_to_arch() {
+    let cli = Cli::try_parse_from(["mlxcel", "supported"]).expect("`supported` alias must parse");
+    assert!(
+        matches!(cli.command, Commands::Arch(_)),
+        "`supported` alias must map to the Arch command"
     );
 }
