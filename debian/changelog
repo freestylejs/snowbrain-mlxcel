@@ -1,3 +1,27 @@
+mlxcel (0.1.3-1~jammy1) jammy; urgency=medium
+
+  * Changed (BREAKING): `mlxcel list` now lists local downloaded models by
+    default; the supported-architecture catalog moved to the new `mlxcel arch`
+    verb (alias `mlxcel supported`), and the `mlxcel list --local` flag was
+    removed (clap rejects it). Migration: use `mlxcel arch` for the catalog and
+    drop `--local`, since the bare `mlxcel list` now does the same thing (#138).
+  * Added: `mlxcel list` output redesign. The default table is now NAME / SIZE /
+    MODIFIED (a relative time from the snapshot directory mtime); the absolute
+    path moved behind `-v` / `--verbose`. New `--json` (stable array), `-q` /
+    `--quiet` (repo-ids only), and `--sort name|size|modified` modes; the header
+    contracts `$HOME` to `~` and dims secondary columns on a TTY, respecting
+    `NO_COLOR` (#141).
+  * Fixed (security): chat-template rendering is bounded with minijinja fuel (a
+    50M-instruction cap) so a pathological model template can no longer cause a
+    denial of service. Exhaustion returns a clean `OutOfFuel` error instead of
+    panicking, and real templates run far under the cap (#129, PR #139).
+  * Fixed: the base-model warning no longer presents `-it` as a universal
+    instruction-tuned suffix; it now names the per-family conventions (Gemma
+    `-it`; Llama and Qwen2.5 `-Instruct`; Qwen3 and Qwen3.5 plain name vs.
+    `-Base`) (#137).
+
+ -- Jeongkyu Shin <inureyes@gmail.com>  Sat, 30 May 2026 16:30:00 +0900
+
 mlxcel (0.1.2-1~jammy1) jammy; urgency=medium
 
   * Fix: when `tokenizer_config.json` ships no `chat_template` field
