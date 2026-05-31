@@ -1,0 +1,112 @@
+# ADR 0001: Paged-attention gather strategy and KV pool tensor layout
+
+**Status:** Accepted (2026-05-31). Part of epic #116 (unified paged KV cache), Phase 0 (#117).
+
+## Context
+
+Epic #116 introduces a unified paged KV store: one global pool of fixed-size physical KV blocks, indexed by a radix trie, with blocks shared (copy-on-write) across sequences that share a prefix. The decode step for a sequence then has to read KV from blocks that are scattered across the pool rather than laid out contiguously, because two sequences sharing a prefix point at the same physical blocks and a sequence's own blocks are allocated on demand as it grows.
+
+Two attention strategies can serve that scattered read:
+
+- **(A) gather-then-SDPA.** Use `take` to pull the sequence's physical blocks out of the pool by index, `reshape` + `transpose` them into the `[batch, n_kv_heads, ctx, head_dim]` shape the fused kernel expects, then call the existing fused `scaled_dot_product_attention`. This is a small delta from the current dense decode path and reuses only existing FFI. The risk is the extra gather copy on every decode step.
+- **(B) fused Metal paged-attention kernel.** A custom kernel, modeled on the fused Sparse-V SDPA kernel in `src/lib/mlx-cpp/turbo/sparse_v_sdpa.metal`, that takes a block table and reads scattered blocks directly inside the attention kernel, with no separate gather copy. This is the lower bound on decode cost but is a large, hard-to-tune piece of Metal to write and maintain.
+
+Apple unified memory changes the calculus relative to a discrete-GPU PagedAttention deployment. There is no host swap-out and no PCIe copy: KV blocks already live in memory the GPU addresses directly. The win the unified store is chasing is therefore memory sharing (one physical copy of a shared prefix) and prefill avoidance (reuse a cached prefix instead of recomputing it), not avoiding host transfers. That reframes the decode gather cost of strategy (A) as the main risk to quantify: if gathering scattered blocks per step is cheap relative to the SDPA it feeds, (A) captures the sharing and prefill wins without the cost of building (B).
+
+This ADR is backed by the synthetic op-level measurements in `examples/page_gather_microbench.rs`. The current decode path it compares against is `paged_decode_attention_dense_compat` (`src/lib/mlxcel-core/src/layers.rs`), which already materializes a dense per-sequence K/V before the fused SDPA. The pool itself is `PagedBlockPool` (`src/lib/mlxcel-core/src/cache/paged.rs`), whose block size is configurable (the `profile_paged_decode_kernel` example and the existing paged decode tooling default to 32).
+
+## Decision
+
+### Attention strategy
+
+Adopt **(A) gather-then-SDPA** for Phases 1 through 5 (#118 through #122). Defer the **(B)** fused Metal paged-attention kernel to Phase 6 (#123), and build it only if the measured gather overhead at the target context lengths is material.
+
+Rationale: the microbench shows gather overhead (layout A, measured against the contiguous-SDPA lower bound) stays under ~15% of SDPA time below ~4096 tokens of single-sequence context. Below that crossover the gather is dominated by the attention it feeds, so (A) is within noise of the fused-kernel lower bound while needing no new kernel. Overhead then grows with both context length and batch: single-sequence decode reaches ~56% at 16384 tokens and ~67% at 32768, and batched decode (batch 4) is already ~48% at 1024 tokens and runs 2x to 3x the contiguous SDPA cost past 4096. So (B) earns its complexity for long-context or batched serving, which is why it stays on the roadmap rather than being dropped; the concrete trigger for building it is single-sequence context past ~16384 tokens, or any sustained batched decode.
+
+### Pool tensor layout
+
+Two candidate per-layer pool layouts were measured:
+
+- Layout A: `[num_blocks, block_size, n_kv_heads, head_dim]`.
+- Layout B (head-split): `[n_kv_heads, num_blocks, block_size, head_dim]`.
+
+Both reach the same `[batch, n_kv_heads, ctx, head_dim]` SDPA input after one `take`, one `reshape`, and one `transpose`; they differ in the `take` axis (0 for A, 1 for B) and in the `slice_update` shape used to append a fresh block each step. The recommendation, finalized from the `take` and `slice_update` numbers in the Results table, is **layout A**, `[num_blocks, block_size, n_kv_heads, head_dim]`. Its gather-then-SDPA step is on average 2.1x faster than head-split layout B (1.2x to 3.2x across the sweep): taking on axis 0 keeps each block's `[block_size, n_kv_heads, head_dim]` slab contiguous, and MLX folds the trailing `[0, 2, 1, 3]` transpose into the SDPA read. Layout B takes on axis 1 and needs a `[1, 0, 2, 3]` transpose across the leading head axis, a scattered pattern MLX does not fuse into SDPA as cheaply, so `gatherB_sdpa` runs from roughly 2x the contiguous baseline at 4096 tokens to more than 4x at 16384. Block-append cost is layout-insensitive (`slice_update` averages ~680us for A and ~700us for B, within noise), so it does not offset layout A's gather advantage.
+
+### Block size
+
+Keep the existing default block size (32) unless the data argues otherwise. Block size has little effect on the gather-then-SDPA cost at a fixed context length: layout A overhead varies by only a few points across 16 / 32 / 64 (batch 1 at 4096 tokens is 12%, 15%, and 16% for blocks 16, 32, 64). The swept context lengths are exact multiples of every block size, so `frag%` is 0 throughout the Results table; in production the internal waste is at most one partial block per sequence, below `block_size / ctx`. The tradeoff the sweep exercises is fragmentation against gather dispatch cost: a smaller block (16) cuts internal fragmentation (fewer wasted slots in the last partial block of each sequence) but raises the number of `take` indices and therefore the gather dispatch, while a larger block (64) does the reverse.
+
+## Microbench methodology and reproduce
+
+The bench is fully synthetic and op-level. It allocates fake K/V tensors with `zeros` (only timing matters, not values), loads no model, and times each decode-step body with a warmup loop followed by `synchronize_default()`, then a timed loop that evals each result, then a closing `synchronize_default()`. Per-call cost is the total timed wall time divided by the iteration count. This is the same eval-per-iteration harness used by `examples/bridge_overhead_microbench.rs`.
+
+Paths measured per `(batch, ctx, block_size)`:
+
+- `contig_sdpa`: fused SDPA over a contiguous per-sequence K/V. This is the lower bound and the effective cost of the current `paged_decode_attention_dense_compat` path.
+- `gatherA_only` / `gatherB_only`: the `take` + `reshape` + `transpose` of K and V for each layout, with no attention, to isolate gather cost.
+- `gatherA_sdpa` / `gatherB_sdpa`: the full gather-then-SDPA decode step for each layout.
+- `sliceupd_A` / `sliceupd_B`: the per-step append of one fresh block into the pool via `slice_update`, for each layout.
+
+To keep `reshape` valid when the block size does not divide the context length, the materialized length is padded to `ctx_pad = ceil(ctx / block) * block`, and every path (including the contiguous baseline) attends over `ctx_pad` keys so the comparison is apples to apples. The reported `frag%` is `(ctx_pad - ctx) / ctx * 100`, the internal fragmentation the block size induces. Block ids are assigned in reverse pool order over a pool sized at 2x the needed blocks, so the gather reads genuinely scattered (non-contiguous) physical ids.
+
+Sweep: context lengths 1024 / 4096 / 16384 / 32768, batch sizes 1 / 4, block sizes 16 / 32 / 64. Dimensions: `head_dim` 128, `q_heads` 32, `kv_heads` 8, dtype f16.
+
+Reproduce:
+
+```text
+cargo run --release --features metal,accelerate --example page_gather_microbench
+```
+
+Run it under `caffeinate -i` so the host does not idle-throttle the GPU mid-run, and let the machine cool between sweeps; Apple Silicon down-clocks under sustained load, so a hot machine inflates the larger-context rows. The numbers in the Results table are measured on the spike machine and reproduce by re-running.
+
+## Results
+
+**Hardware:** Apple M1 Ultra (Mac Studio), 128 GB unified memory, macOS 26.5 (build 25F71). Built `--release --features metal,accelerate`. Each cell is the minimum of two full sweeps (the cooler run), 50 timed iterations after 20 warmup, dtype f16.
+
+| batch | ctx | block | frag% | contig_sdpa_us | gatherA_only_us | gatherA_sdpa_us | gatherB_only_us | gatherB_sdpa_us | sliceupd_A_us | sliceupd_B_us | overheadA% | overheadB% |
+|------:|----:|------:|------:|---------------:|----------------:|----------------:|----------------:|----------------:|--------------:|--------------:|-----------:|-----------:|
+| 1 | 1024 | 16 | 0.00 | 333 | 598 | 382 | 767 | 533 | 327 | 320 | 14 | 60 |
+| 1 | 1024 | 32 | 0.00 | 341 | 627 | 375 | 747 | 452 | 303 | 304 | 10 | 33 |
+| 1 | 1024 | 64 | 0.00 | 303 | 575 | 336 | 676 | 405 | 294 | 302 | 11 | 34 |
+| 1 | 4096 | 16 | 0.00 | 341 | 618 | 383 | 895 | 661 | 320 | 320 | 12 | 94 |
+| 1 | 4096 | 32 | 0.00 | 333 | 612 | 385 | 910 | 662 | 317 | 321 | 15 | 99 |
+| 1 | 4096 | 64 | 0.00 | 335 | 598 | 390 | 902 | 661 | 321 | 321 | 16 | 97 |
+| 1 | 16384 | 16 | 0.00 | 455 | 716 | 692 | 1861 | 1829 | 397 | 434 | 52 | 302 |
+| 1 | 16384 | 32 | 0.00 | 437 | 733 | 686 | 1877 | 1843 | 426 | 424 | 57 | 322 |
+| 1 | 16384 | 64 | 0.00 | 437 | 727 | 691 | 1884 | 1853 | 441 | 425 | 58 | 324 |
+| 1 | 32768 | 16 | 0.00 | 646 | 986 | 1070 | 3322 | 3338 | 683 | 687 | 66 | 417 |
+| 1 | 32768 | 32 | 0.00 | 635 | 987 | 1074 | 3360 | 3395 | 679 | 697 | 69 | 435 |
+| 1 | 32768 | 64 | 0.00 | 646 | 983 | 1065 | 3413 | 3461 | 681 | 685 | 65 | 436 |
+| 4 | 1024 | 16 | 0.00 | 339 | 609 | 513 | 946 | 732 | 334 | 316 | 52 | 116 |
+| 4 | 1024 | 32 | 0.00 | 340 | 614 | 514 | 904 | 739 | 314 | 323 | 51 | 118 |
+| 4 | 1024 | 64 | 0.00 | 362 | 643 | 516 | 892 | 710 | 312 | 317 | 42 | 96 |
+| 4 | 4096 | 16 | 0.00 | 483 | 727 | 1186 | 1880 | 2511 | 432 | 433 | 146 | 420 |
+| 4 | 4096 | 32 | 0.00 | 490 | 724 | 1209 | 1903 | 2552 | 437 | 433 | 147 | 421 |
+| 4 | 4096 | 64 | 0.00 | 500 | 729 | 1197 | 1920 | 2228 | 436 | 444 | 140 | 346 |
+| 4 | 16384 | 16 | 0.00 | 940 | 1383 | 3446 | 5987 | 7371 | 1039 | 1047 | 267 | 684 |
+| 4 | 16384 | 32 | 0.00 | 1018 | 1379 | 3408 | 6051 | 7685 | 1203 | 1266 | 235 | 655 |
+| 4 | 16384 | 64 | 0.00 | 1513 | 1874 | 4503 | 9275 | 9108 | 1202 | 1284 | 198 | 502 |
+| 4 | 32768 | 16 | 0.00 | 1757 | 2090 | 6551 | 11371 | 14245 | 1792 | 1850 | 273 | 711 |
+| 4 | 32768 | 32 | 0.00 | 2110 | 2947 | 6567 | 12089 | 15233 | 1817 | 2048 | 211 | 622 |
+| 4 | 32768 | 64 | 0.00 | 2289 | 3041 | 6695 | 13334 | 18431 | 1763 | 1761 | 193 | 705 |
+
+Reading the table: layout A's `gatherA_only` can exceed `gatherA_sdpa` at short context (batch 1 at 1024 tokens is ~600us vs ~380us) because timing the gather alone forces MLX to materialize the full contiguous K/V, while the gather-then-SDPA path lets MLX fuse the `take`, `reshape`, and `transpose` into the fused-SDPA read without ever materializing that intermediate. The decode-relevant cost is `gatherA_sdpa` and the `overheadA%` derived from it, not `gatherA_only`. That fusion is the main reason strategy (A) stays cheap at the common context lengths: the per-step gather does not pay for a separate full copy of the sequence KV.
+
+## Consequences
+
+Phases 1 through 3 inherit the following from this decision:
+
+- **Phase 1 (#118), global block-pool tensor storage:** the pool is stored in the layout chosen above, and block append uses the `slice_update` shape measured for that layout. No new kernel is needed for this phase.
+- **Phase 2 (#119), paged decode attention over real block tables:** decode reads blocks with `take` over the real block table, then `reshape` + `transpose` into the SDPA input, then the existing fused `scaled_dot_product_attention`. This is the `gatherA_sdpa` / `gatherB_sdpa` path the bench measured, so the decode hot path reuses only existing FFI (`take`, `reshape`, `transpose`, fused SDPA) and adds no new kernel in Phases 1 and 2.
+- **Phase 3 (#120), paged prefill into the block pool:** prefill writes into the same pool layout, so it inherits the append path and the layout's `slice_update` characteristics.
+
+The fused Metal paged-attention kernel (Phase 6, #123) stays deferred. The crossover context length above gives the downstream phases a concrete trigger: if real workloads run past it and the gather overhead shows up in end-to-end decode throughput, (B) is the planned next step, and the gather path built in Phases 1 and 2 remains the correctness reference and fallback for it.
+
+## References
+
+- Epic #116, unified KV cache.
+- Issue #117, this Phase 0 spike.
+- `examples/page_gather_microbench.rs`, the microbench backing this ADR.
+- `src/lib/mlx-cpp/turbo/sparse_v_sdpa.metal`, the fused-kernel model for strategy (B).
+- `src/lib/mlxcel-core/src/layers.rs`, `paged_decode_attention_dense_compat`, the current dense decode path.
+- `src/lib/mlxcel-core/src/cache/paged.rs`, `PagedBlockPool` and `PagedKvLayout`.
