@@ -42,7 +42,7 @@ use crate::drafter::masks::{make_drafter_masks_with_valid_len, BatchScalar, Laye
 use crate::drafter::{Drafter, DrafterError, DrafterKind, SharedKv};
 use crate::ffi::{self, MlxArray};
 use crate::generate::{LanguageModel, SamplingConfig};
-use crate::layers::{KVCache, Linear, RMSNorm, UnifiedEmbedding};
+use crate::layers::{KVCache, Linear, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use crate::weights::WeightMap;
 use cxx::UniquePtr;
 use std::collections::HashMap;
@@ -340,8 +340,8 @@ fn str_to_layer_type(s: &str) -> Result<LayerType, DrafterError> {
 pub struct Gemma4AssistantDraftModel {
     config: Gemma4AssistantConfig,
     inner: DraftInner,
-    pre_projection: Linear,
-    post_projection: Linear,
+    pre_projection: UnifiedLinear,
+    post_projection: UnifiedLinear,
     /// Explicit `lm_head` weight when `tie_word_embeddings == false`. `None`
     /// means the LM head is one of the tied / centroid variants resolved by
     /// `bind()`.
@@ -461,10 +461,27 @@ impl Gemma4AssistantDraftModel {
         let inner = DraftInner::from_weights(&weights, &text_cfg, "model")
             .map_err(|e| DrafterError::WeightLoad { reason: e })?;
 
-        let pre_projection = Linear::from_weights(&weights, "pre_projection")
-            .map_err(|e| DrafterError::WeightLoad { reason: e })?;
-        let post_projection = Linear::from_weights(&weights, "post_projection")
-            .map_err(|e| DrafterError::WeightLoad { reason: e })?;
+        // Use the quantization-aware `UnifiedLinear` so 4-bit assistant
+        // drafters (e.g. `gemma-4-12B-it-assistant-4bit`) load their packed
+        // pre/post projection weights and run them through `quantized_matmul`.
+        // `UnifiedLinear::from_weights` auto-detects quantization via the
+        // `.scales` sister tensor and falls back to a plain `Linear` when it is
+        // absent, so this is behavior-preserving for bf16 drafters (e.g. the
+        // 31B assistant) while fixing the 4-bit `[matmul]` shape-mismatch crash.
+        let pre_projection = UnifiedLinear::from_weights(
+            &weights,
+            "pre_projection",
+            text_cfg.group_size(),
+            text_cfg.bits(),
+        )
+        .map_err(|e| DrafterError::WeightLoad { reason: e })?;
+        let post_projection = UnifiedLinear::from_weights(
+            &weights,
+            "post_projection",
+            text_cfg.group_size(),
+            text_cfg.bits(),
+        )
+        .map_err(|e| DrafterError::WeightLoad { reason: e })?;
 
         let lm_head_weight = if config.tie_word_embeddings {
             None
@@ -824,6 +841,75 @@ impl Drafter for Gemma4AssistantDraftModel {
     fn bind(&mut self, target: &dyn LanguageModel) -> Result<(), DrafterError> {
         self.capture_target_embedding(target)?;
         self.resolve_lm_head()?;
+        Ok(())
+    }
+
+    /// Reject a target whose hidden size or vocabulary does not match this
+    /// MTP assistant drafter, with a clear `BindFailed` message.
+    ///
+    /// Two invariants are checked:
+    ///
+    /// 1. **Hidden size.** The drafter's `backbone_hidden_size` (3840 for the
+    ///    Gemma 4 Unified 12B assistant) must equal the target's text hidden
+    ///    size. The drafter input is `[token_embed ‖ target_hidden]` at width
+    ///    `2 × backbone_hidden_size`, so a mismatch breaks `pre_projection`.
+    ///    The target hidden size is observed from the trailing dim of
+    ///    `target.embed_tokens(sentinel)` — the same probe `bind()` uses.
+    /// 2. **Vocabulary.** The drafter's configured `text_config.vocab_size`
+    ///    must match the target's logit width. This is a best-effort check:
+    ///    it runs only when the target exposes `embed_tokens_module()` (every
+    ///    real Gemma 4 target does), projecting a `[1, 1, hidden]` zero tensor
+    ///    through `as_linear` to read the target vocab dimension. Targets that
+    ///    only implement `embed_tokens` (unit-test mocks) skip the vocab check.
+    fn validate_target_compat(&self, target: &dyn LanguageModel) -> Result<(), DrafterError> {
+        let backbone = self.config.backbone_hidden_size as i32;
+
+        // (1) Hidden-size match via the embed_tokens probe.
+        let sentinel = ffi::from_slice_i32(&[0_i32], &[1, 1]);
+        let embedded =
+            target
+                .embed_tokens(&sentinel)
+                .ok_or(DrafterError::TargetMissingFeature {
+                    feature: "embed_tokens",
+                })?;
+        let embed_shape = ffi::array_shape(&embedded);
+        let target_hidden = embed_shape.last().copied().unwrap_or(0);
+        if target_hidden != backbone {
+            return Err(DrafterError::BindFailed {
+                reason: format!(
+                    "Gemma 4 MTP assistant drafter is incompatible with this target: \
+                     drafter backbone_hidden_size = {backbone} but the target's text \
+                     hidden size = {target_hidden}. The MTP assistant consumes the \
+                     target's last backbone hidden state, so these must be equal. Pass \
+                     an assistant drafter built for this target (the Gemma 4 Unified 12B \
+                     target pairs with the gemma4_unified_assistant drafter, \
+                     backbone_hidden_size = 3840)."
+                ),
+            });
+        }
+
+        // (2) Vocabulary match via the target's LM-head projection. Skipped
+        // when the target only exposes `embed_tokens` (mocks) — those still
+        // pass the hidden-size gate above.
+        if let Some(embed_module) = target.embed_tokens_module() {
+            let drafter_vocab = self.config.text_config().vocab_size as i32;
+            let zero_hidden = ffi::zeros(&[1, 1, target_hidden], crate::dtype::FLOAT32);
+            let logits = embed_module.as_linear(&zero_hidden);
+            let logit_shape = ffi::array_shape(&logits);
+            let target_vocab = logit_shape.last().copied().unwrap_or(0);
+            if target_vocab != drafter_vocab {
+                return Err(DrafterError::BindFailed {
+                    reason: format!(
+                        "Gemma 4 MTP assistant drafter vocabulary is incompatible with \
+                         this target: drafter text_config.vocab_size = {drafter_vocab} but \
+                         the target vocabulary = {target_vocab}. The drafter's centroid \
+                         token_ordering expands to its own vocab, which must match the \
+                         target so accepted draft token ids index the same vocabulary."
+                    ),
+                });
+            }
+        }
+
         Ok(())
     }
 
