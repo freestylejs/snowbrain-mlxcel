@@ -203,6 +203,125 @@ pub fn create_causal_mask_with_left_padding(
     ffi::where_cond(&bool_out, &zeros_out, &neg_inf_out)
 }
 
+/// Create a sliding-window causal attention mask with per-sequence
+/// left-padding support.
+///
+/// This is the windowed counterpart of [`create_causal_mask_with_left_padding`]
+/// and the left-padding-aware counterpart of [`create_causal_mask_with_window`].
+/// It is used by the **ragged batched MTP prefill** path
+/// ([`crate::speculative::mtp`] via the Gemma 4 batched target adapter): when a
+/// B > 1 burst window mixes prompts of different lengths, every row is
+/// left-padded to `max_prompt_len` and the sliding-attention layers need a mask
+/// that (a) enforces the sliding-window causal band AND (b) prevents real query
+/// positions from attending to a row's leading padding keys.
+///
+/// # Arguments
+/// * `size` — Number of query tokens in the current step (the padded prompt
+///   width `max_prompt_len` for prefill).
+/// * `offset` — Tokens already in the KV buffer before this call. For a fresh
+///   prefill this is `0`. The total (uncapped) key length is `size + offset`.
+/// * `window` — Sliding window size. `None` collapses to
+///   [`create_causal_mask_with_left_padding`] (no windowing).
+/// * `left_padding` — Per-sequence number of leading padding tokens. Key
+///   positions `k < left_padding[b]` are masked for sequence `b`. When empty or
+///   all-zero the result is byte-identical to [`create_causal_mask_with_window`].
+///
+/// # Returns
+/// Additive mask (0 for attended positions, −∞ for masked positions).
+///
+/// # Shape note
+/// * **No padding** (`left_padding` empty or all-zero): same shape as
+///   [`create_causal_mask_with_window`] — `[size, T_k]` where
+///   `T_k = min(size + offset, window)`.
+/// * **With padding**: `[B, 1, size, T_k]` where `B = left_padding.len()`. The
+///   `[B, 1]` leading dims broadcast against a `[B, H, size, T_k]` score tensor.
+///
+/// # Full-key-axis precondition (not "size + offset <= window")
+/// The left-padding column filter assumes the K axis is the **full**
+/// `size + offset` (column `k` maps 1:1 to logical key position `k`). The
+/// sliding-window upper bound is enforced by an explicit `triu` band term, so
+/// `size + offset > window` is fully supported as long as the backing cache has
+/// not evicted/compacted any front keys. This is exactly the **MTP-buffered**
+/// sliding-cache regime: the `RotatingKVCache` rollback buffer (`buffer_size`)
+/// keeps the cache uncompacted up to a logical capacity of
+/// `window + buffer_size`, so the resident prompt padding at `[0, lp)` stays in
+/// the returned K and must keep being masked every verify step even once
+/// `size + offset > window`. (An earlier version asserted `size + offset <=
+/// window` and the Gemma 4 caller fell back to a padding-UNAWARE plain windowed
+/// mask above the window, which leaked the resident padding into the
+/// most-left-padded row and broke greedy parity.) The only unsupported case is a
+/// genuinely *compacted* axis (`actual_kv_len < size + offset`); the ragged
+/// caller never reaches buffer compaction in the eligible regime, and a
+/// compacted axis has already evicted the (oldest) padding so a plain windowed
+/// mask is padding-free there.
+///
+/// Used by: ragged batched MTP prefill + verify (Gemma 4 batched target adapter).
+#[must_use]
+pub fn create_causal_mask_with_window_and_left_padding(
+    size: i32,
+    offset: i32,
+    window: Option<i32>,
+    left_padding: &[i32],
+) -> UniquePtr<MlxArray> {
+    let no_padding = left_padding.is_empty() || left_padding.iter().all(|&p| p == 0);
+
+    // Fast path: no per-sequence padding -> identical to the windowed mask.
+    if no_padding {
+        return create_causal_mask_with_window(size, offset, window);
+    }
+
+    let uncapped_len = size + offset;
+
+    // Precondition: the **key axis is the full `size + offset`** (column k maps
+    // 1:1 to logical key position k), i.e. the backing cache has NOT evicted /
+    // compacted any front keys. The sliding-window upper bound is then enforced
+    // by the `triu` band term below, so `size + offset > window` is fully
+    // supported — this is the MTP-buffered sliding-cache regime, where the
+    // rollback buffer (`buffer_size`) keeps the cache uncompacted (logical
+    // capacity `window + buffer_size`) and the resident prompt padding at
+    // `[0, lp)` must keep being masked even though `size + offset > window`. The
+    // only unsupported case is a *compacted* axis (`actual_kv_len < size +
+    // offset`), which the ragged caller avoids: the eligible regime never
+    // reaches buffer compaction, and a compacted axis has already evicted the
+    // (oldest) padding so a plain windowed mask would be padding-free anyway.
+    let total_len = uncapped_len;
+
+    // ── Windowed causal (band) base mask, [size, total_len] ─────────────────
+    let ones = ffi::ones(&[size, total_len], dtype::FLOAT32);
+    let mut band = ffi::tril(&ones, offset);
+    if let Some(w) = window {
+        // Enforce the sliding-window upper bound q <= k + window - 1, identical
+        // to the non-capped branch of `create_causal_mask_with_window`.
+        let upper_mask = ffi::triu(&ones, offset - w + 1);
+        band = ffi::multiply(&band, &upper_mask);
+    }
+
+    // ── Left-padding column filter ──────────────────────────────────────────
+    // For sequence `b`, key positions `k < left_padding[b]` are padding and must
+    // be masked. Build a [B, 1, 1, total_len] boolean (k >= lp[b]) and multiply
+    // with the band mask broadcast to [1, 1, size, total_len].
+    let b = left_padding.len() as i32;
+
+    let rinds_1d = ffi::arange_i32(0, total_len, 1);
+    let rinds = ffi::reshape(&rinds_1d, &[1, 1, 1, total_len]);
+    let lp_tensor = ffi::from_slice_i32(left_padding, &[b, 1, 1, 1]);
+    let lp_mask = ffi::greater_equal(&rinds, &lp_tensor);
+
+    let band_4d = ffi::reshape(&band, &[1, 1, size, total_len]);
+
+    let ones_lp = ffi::ones(&[b, 1, 1, total_len], dtype::FLOAT32);
+    let zeros_lp = ffi::zeros(&[b, 1, 1, total_len], dtype::FLOAT32);
+    let lp_mask_f32 = ffi::where_cond(&lp_mask, &ones_lp, &zeros_lp);
+
+    let combined = ffi::multiply(&band_4d, &lp_mask_f32);
+
+    // Convert the 0/1 float mask to an additive 0 / -inf mask.
+    let zeros_out = ffi::zeros(&[b, 1, size, total_len], dtype::FLOAT32);
+    let neg_inf_out = ffi::full_f32(&[b, 1, size, total_len], f32::NEG_INFINITY, dtype::FLOAT32);
+    let bool_out = ffi::greater(&combined, &zeros_out);
+    ffi::where_cond(&bool_out, &zeros_out, &neg_inf_out)
+}
+
 /// Create a boolean causal attention mask.
 /// Used by: same as `create_causal_mask` (experimental path)
 ///
@@ -892,5 +1011,300 @@ mod tests {
         // q=3 attends to both cache keys
         assert_eq!(row3_col0, 0.0, "row3_col0 should be 0.0 (attend)");
         assert_eq!(row3_col1, 0.0, "row3_col1 should be 0.0 (attend)");
+    }
+
+    // --- Windowed left-padding mask (ragged batched MTP prefill) ----------
+
+    /// No-padding fast path must be byte-identical to the plain windowed mask.
+    #[test]
+    fn windowed_left_padding_mask_no_padding_matches_windowed() {
+        // Non-capped regime: size=6, offset=0, window=8 (>= size). No padding.
+        let ref_mask = create_causal_mask_with_window(6, 0, Some(8));
+        let lp_mask = create_causal_mask_with_window_and_left_padding(6, 0, Some(8), &[0, 0]);
+        let ref_shape = ffi::array_shape(&ref_mask);
+        let lp_shape = ffi::array_shape(&lp_mask);
+        assert_eq!(
+            ref_shape,
+            vec![6, 6],
+            "non-capped windowed mask is [size, size]"
+        );
+        assert_eq!(
+            ref_shape, lp_shape,
+            "no-padding windowed left-padding mask must match plain windowed mask shape"
+        );
+
+        // Empty left_padding slice also collapses to the windowed mask.
+        let lp_empty = create_causal_mask_with_window_and_left_padding(6, 0, Some(8), &[]);
+        assert_eq!(ffi::array_shape(&lp_empty), ref_shape);
+
+        // Spot-check a couple of cells are identical (additive 0 / -inf).
+        for (q, k) in [(0_i32, 0_i32), (3, 0), (3, 3), (5, 1), (5, 5)] {
+            let a = ffi::item_f32(&ffi::slice(&ref_mask, &[q, k], &[q + 1, k + 1]));
+            let b = ffi::item_f32(&ffi::slice(&lp_mask, &[q, k], &[q + 1, k + 1]));
+            assert_eq!(
+                a.is_finite(),
+                b.is_finite(),
+                "cell ({q},{k}) finiteness must match: ref={a}, lp={b}"
+            );
+            if a.is_finite() {
+                assert_eq!(a, b, "cell ({q},{k}) value mismatch: ref={a}, lp={b}");
+            }
+        }
+    }
+
+    /// With per-row left-padding the mask is `[B, 1, size, total_len]` and the
+    /// padding columns are masked for the padded rows while remaining unmasked
+    /// for the non-padded row.
+    #[test]
+    fn windowed_left_padding_mask_masks_padding_columns() {
+        // B=2, size=4 (padded width), offset=0, window large enough not to
+        // trigger sliding-window upper-bound masking (window >= size).
+        // Row 0: left_padding=2 (real tokens at padded indices 2,3).
+        // Row 1: left_padding=0 (all real).
+        let mask = create_causal_mask_with_window_and_left_padding(4, 0, Some(4), &[2, 0]);
+        let shape = ffi::array_shape(&mask);
+        assert_eq!(
+            shape,
+            vec![2, 1, 4, 4],
+            "padded mask must be [B,1,size,total]"
+        );
+
+        // Helper to read cell [b,0,q,k].
+        let cell = |b: i32, q: i32, k: i32| -> f32 {
+            ffi::item_f32(&ffi::slice(&mask, &[b, 0, q, k], &[b + 1, 1, q + 1, k + 1]))
+        };
+
+        // Row 0 (left_padding=2): the first real query is at padded index q=2.
+        // It must NOT attend to padding keys k=0,1, but MUST attend to k=2.
+        assert!(
+            cell(0, 2, 0).is_infinite() && cell(0, 2, 0) < 0.0,
+            "row0 q=2 -> padding k=0 must be -inf"
+        );
+        assert!(
+            cell(0, 2, 1).is_infinite() && cell(0, 2, 1) < 0.0,
+            "row0 q=2 -> padding k=1 must be -inf"
+        );
+        assert_eq!(cell(0, 2, 0 + 2), 0.0, "row0 q=2 -> real k=2 must attend");
+        // Causal upper bound: q=2 must NOT see future k=3.
+        assert!(
+            cell(0, 2, 3).is_infinite() && cell(0, 2, 3) < 0.0,
+            "row0 q=2 -> future k=3 must be -inf (causal)"
+        );
+
+        // Row 1 (no padding): standard causal band, k=0 attended by q=0.
+        assert_eq!(
+            cell(1, 0, 0),
+            0.0,
+            "row1 q=0 -> k=0 must attend (no padding)"
+        );
+        assert!(
+            cell(1, 0, 1).is_infinite() && cell(1, 0, 1) < 0.0,
+            "row1 q=0 -> future k=1 must be -inf (causal)"
+        );
+    }
+
+    /// In the non-capped prefill regime (`offset == 0`, `size <= window`) the
+    /// sliding-window upper bound is inert, so for the real-token sub-block the
+    /// windowed left-padding mask is byte-identical to the plain (non-windowed)
+    /// left-padding mask. This is the exact invariant the ragged batched MTP
+    /// prefill relies on: a short prefix prefill within the window sees no
+    /// windowing effect, only causal + left-padding.
+    #[test]
+    fn windowed_left_padding_mask_matches_plain_left_padding_when_uncapped() {
+        // size=5 <= window=8, offset=0 -> non-capped, upper bound inert.
+        let windowed = create_causal_mask_with_window_and_left_padding(5, 0, Some(8), &[1, 0]);
+        let plain = create_causal_mask_with_left_padding(5, 0, &[1, 0]);
+
+        let wshape = ffi::array_shape(&windowed);
+        let pshape = ffi::array_shape(&plain);
+        assert_eq!(wshape, vec![2, 1, 5, 5]);
+        assert_eq!(
+            wshape, pshape,
+            "non-capped windowed left-padding mask must share the plain shape"
+        );
+
+        let wcell = |b: i32, q: i32, k: i32| -> f32 {
+            ffi::item_f32(&ffi::slice(
+                &windowed,
+                &[b, 0, q, k],
+                &[b + 1, 1, q + 1, k + 1],
+            ))
+        };
+        let pcell = |b: i32, q: i32, k: i32| -> f32 {
+            ffi::item_f32(&ffi::slice(
+                &plain,
+                &[b, 0, q, k],
+                &[b + 1, 1, q + 1, k + 1],
+            ))
+        };
+        for b in 0..2 {
+            for q in 0..5 {
+                for k in 0..5 {
+                    let w = wcell(b, q, k);
+                    let p = pcell(b, q, k);
+                    assert_eq!(
+                        w.is_finite(),
+                        p.is_finite(),
+                        "cell ({b},{q},{k}) finiteness mismatch: windowed={w}, plain={p}"
+                    );
+                    if w.is_finite() {
+                        assert_eq!(w, p, "cell ({b},{q},{k}) value mismatch");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ragged batched MTP **verify-round** left-padding regression (issue #161 /
+    /// PR #162).
+    ///
+    /// Greedy parity for a variable-length B>1 burst requires that EVERY verify
+    /// round mask each row's resident `[0, left_padding[r])` prompt-padding keys
+    /// — not just the prefill. The padding K/V (token 0) is never evicted from
+    /// the unbounded full-attention cache, so a verify query at a nonzero cache
+    /// offset that attends those padding columns diverges from the row's
+    /// standalone B=1 run, and the divergence scales with `left_padding[r]`
+    /// (only the most-padded / shortest row breaks in the real-model gate).
+    ///
+    /// This pins the verify-frame mask the fixed `mask == None` forward path
+    /// builds: `create_causal_mask_with_left_padding(width, offset, left_padding)`
+    /// with `offset > 0` (cache already holds the padded prompt plus accepted
+    /// tokens) and a LARGE per-row padding gap. For the most-padded row the
+    /// leading `left_padding` key columns must be `-inf` and every real key
+    /// (the columns the standalone B=1 run would expose) must be `0.0`.
+    #[test]
+    fn left_padding_mask_masks_padding_in_verify_round_with_large_gap() {
+        // Verify round: width=2 query tokens, cache offset O=10 (e.g. padded
+        // prompt max_len=8 + 2 accepted), so the key axis is O+width=12.
+        // Row 0 (shortest / most padded): left_padding=6 — keys [0,6) are
+        //   prompt padding, real keys live at [6, 12).
+        // Row 1 (full length): left_padding=0 — every key is real.
+        let width = 2_i32;
+        let offset = 10_i32;
+        let total = width + offset; // 12
+        let mask = create_causal_mask_with_left_padding(width, offset, &[6, 0]);
+        assert_eq!(
+            ffi::array_shape(&mask),
+            vec![2, 1, width, total],
+            "verify left-padding mask must be [B, 1, width, offset+width]",
+        );
+
+        let cell = |b: i32, q: i32, k: i32| -> f32 {
+            ffi::item_f32(&ffi::slice(&mask, &[b, 0, q, k], &[b + 1, 1, q + 1, k + 1]))
+        };
+
+        // Row 0: the leading 6 padding columns must be masked for every query.
+        for q in 0..width {
+            for k in 0..6 {
+                let v = cell(0, q, k);
+                assert!(
+                    v.is_infinite() && v < 0.0,
+                    "row0 (lp=6) padding key {k} for query {q} must be -inf, got {v}",
+                );
+            }
+        }
+        // Row 0: real keys [6, offset) are in the causal past of both queries
+        // (query absolute positions are offset and offset+1) and must attend.
+        for q in 0..width {
+            for k in 6..offset {
+                let v = cell(0, q, k);
+                assert_eq!(
+                    v, 0.0,
+                    "row0 real key {k} for query {q} must attend (0.0), got {v}",
+                );
+            }
+        }
+        // Row 0: causal upper bound still holds for the appended query columns —
+        // query q (absolute offset+q) must not see future key offset+q+1.
+        assert!(
+            cell(0, 0, offset + 1).is_infinite() && cell(0, 0, offset + 1) < 0.0,
+            "row0 query 0 must not attend future key {}",
+            offset + 1,
+        );
+
+        // Row 1 (no padding): the same real-key columns are attended and no
+        // column is spuriously masked — the byte-identical baseline.
+        for q in 0..width {
+            for k in 0..=(offset + q) {
+                let v = cell(1, q, k);
+                assert_eq!(
+                    v, 0.0,
+                    "row1 (lp=0) key {k} for query {q} must attend (0.0), got {v}",
+                );
+            }
+        }
+    }
+
+    /// Ragged batched MTP **buffered sliding-cache** verify regression (issue
+    /// #161 / PR #162).
+    ///
+    /// The MTP rollback buffer keeps the sliding `RotatingKVCache` UNCOMPACTED
+    /// far past the bare `sliding_window` (logical capacity `window +
+    /// buffer_size`), so the resident prompt padding survives at columns
+    /// `[0, lp)` even when `size + offset > window`. The verify forward must
+    /// therefore use `create_causal_mask_with_window_and_left_padding` with the
+    /// FULL key axis (`size + offset`) in this regime — enforcing BOTH the
+    /// sliding-window band AND the `[0, lp)` padding filter. (The pre-fix gate
+    /// fell back to a padding-UNAWARE plain windowed mask once `size + offset >
+    /// window`, leaking the resident padding into the most-padded row.)
+    ///
+    /// This pins that, with `size + offset > window`, the most-padded row's
+    /// leading padding is masked, the in-window real keys attend, and keys
+    /// OLDER than the sliding window are excluded by the band.
+    #[test]
+    fn windowed_left_padding_mask_masks_padding_and_band_when_buffered_over_window() {
+        // Single verify query (width=1) at cache offset 11 (buffered: 7-token
+        // padded prompt + 4 accepted), window=8 -> size+offset=12 > window, but
+        // the buffered cache returns the full 12-key axis (no compaction).
+        // Row 0 (most padded): lp=5; row 1: lp=0.
+        let size = 1_i32;
+        let offset = 11_i32;
+        let window = 8_i32;
+        let total = size + offset; // 12
+        let mask =
+            create_causal_mask_with_window_and_left_padding(size, offset, Some(window), &[5, 0]);
+        assert_eq!(
+            ffi::array_shape(&mask),
+            vec![2, 1, size, total],
+            "buffered windowed left-padding mask must keep the FULL [B,1,size,size+offset] axis",
+        );
+
+        let cell = |b: i32, k: i32| -> f32 {
+            ffi::item_f32(&ffi::slice(&mask, &[b, 0, 0, k], &[b + 1, 1, 1, k + 1]))
+        };
+
+        // The single query is at absolute position `offset` (= 11). Its
+        // sliding-window admits keys [offset - window + 1, offset] = [4, 11].
+        // Row 0 padding occupies [0, 5); the *intersection* of "real" and
+        // "in-window" is [5, 11].
+        for k in 0..5 {
+            let v = cell(0, k);
+            assert!(
+                v.is_infinite() && v < 0.0,
+                "row0 padding key {k} must be -inf, got {v}",
+            );
+        }
+        // Key 4 is real but OUTSIDE the sliding window (4 < offset-window+1 = 4?
+        // 11-8+1 = 4, so key 4 is the oldest in-window slot) -> attends. Keys
+        // [4, 11] attend; here [5, 11] are real+in-window (key 4 is padding-free
+        // only for row 1).
+        for k in 5..=offset {
+            let v = cell(0, k);
+            assert_eq!(v, 0.0, "row0 real in-window key {k} must attend, got {v}");
+        }
+
+        // Row 1 (no padding): the sliding-window band excludes keys older than
+        // `offset - window + 1` = 4, i.e. keys [0, 4) are -inf, [4, 11] attend.
+        for k in 0..(offset - window + 1) {
+            let v = cell(1, k);
+            assert!(
+                v.is_infinite() && v < 0.0,
+                "row1 out-of-window key {k} must be -inf (sliding band), got {v}",
+            );
+        }
+        for k in (offset - window + 1)..=offset {
+            let v = cell(1, k);
+            assert_eq!(v, 0.0, "row1 in-window key {k} must attend, got {v}");
+        }
     }
 }

@@ -348,3 +348,479 @@ fn unified_batched_adapter_implements_mtp_target() {
         a.batch_size()
     }
 }
+
+// ===========================================================================
+// Ragged (variable-length-prompt) batched MTP prefill helpers (issue #161)
+//
+// These pin the pure left-padding builder and the shifted-frame seed-anchor
+// formula without loading real Gemma 4 weights. The on-hardware greedy-parity
+// validation of the ragged forward ships behind the orchestrator's real-model
+// gate.
+// ===========================================================================
+
+/// `left_padded_input` right-aligns each row to `max_prompt_len`, reports the
+/// per-row left-padding (`max_len - L_r`) and valid length (`L_r`), and builds
+/// a `[B, max_len]` tensor.
+#[test]
+fn ragged_left_padded_input_right_aligns_rows() {
+    let _runtime = crate::initialize_runtime();
+    // Rows of length 2, 5, 3 -> max_len = 5.
+    let per_row = vec![vec![10, 11], vec![20, 21, 22, 23, 24], vec![30, 31, 32]];
+    let prefill =
+        Gemma4MtpBatchedTargetAdapter::left_padded_input(&per_row, 3).expect("left-padded");
+    assert_eq!(prefill.max_len, 5);
+    assert_eq!(prefill.left_padding, vec![3, 0, 2], "lp = max_len - L_r");
+    assert_eq!(prefill.valid_len, vec![2, 5, 3], "valid = L_r");
+    let shape = mlxcel_core::array_shape(prefill.arr.as_ref().unwrap());
+    assert_eq!(shape, vec![3, 5], "must build a [B, max_len] tensor");
+}
+
+/// The padded tensor places each row's real tokens at indices `[lp, max_len)`
+/// with the leading `lp` columns zeroed (the padding token id).
+#[test]
+fn ragged_left_padded_input_places_tokens_at_suffix() {
+    let _runtime = crate::initialize_runtime();
+    let per_row = vec![vec![7, 8], vec![1, 2, 3, 4]];
+    let prefill =
+        Gemma4MtpBatchedTargetAdapter::left_padded_input(&per_row, 2).expect("left-padded");
+    assert_eq!(prefill.max_len, 4);
+    assert_eq!(prefill.left_padding, vec![2, 0]);
+
+    // Read individual cells of the [2, 4] tensor.
+    let cell = |r: i32, c: i32| -> i32 {
+        let v = mlxcel_core::slice(prefill.arr.as_ref().unwrap(), &[r, c], &[r + 1, c + 1]);
+        let scalar = mlxcel_core::reshape(&v, &[]);
+        mlxcel_core::item_i32(&scalar)
+    };
+    // Row 0 (lp=2): [PAD, PAD, 7, 8].
+    assert_eq!(cell(0, 0), 0, "row0 leading pad");
+    assert_eq!(cell(0, 1), 0, "row0 leading pad");
+    assert_eq!(cell(0, 2), 7, "row0 first real token at index lp=2");
+    assert_eq!(cell(0, 3), 8);
+    // Row 1 (lp=0): [1, 2, 3, 4].
+    assert_eq!(cell(1, 0), 1);
+    assert_eq!(cell(1, 3), 4);
+}
+
+/// Empty / zero-length rows are rejected.
+#[test]
+fn ragged_left_padded_input_rejects_empty_row() {
+    let _runtime = crate::initialize_runtime();
+    let per_row = vec![vec![1, 2], vec![], vec![3]];
+    let msg = match Gemma4MtpBatchedTargetAdapter::left_padded_input(&per_row, 3) {
+        Ok(_) => panic!("empty row must be rejected"),
+        Err(e) => format!("{e}"),
+    };
+    assert!(
+        msg.contains("non-empty"),
+        "error must explain the non-empty requirement, got: {msg}"
+    );
+}
+
+/// Shifted-frame seed-anchor formula: `kv_offset = left_padding + kv_valid_len`,
+/// `bonus_position = kv_offset - 1`. This is the load-bearing per-row position
+/// derivation that keeps each ragged row in its own RoPE frame.
+#[test]
+fn ragged_seed_anchors_use_shifted_frame() {
+    // Ragged window: max_len = 5, rows of valid length 2, 5, 3 ->
+    // left_padding = [3, 0, 2].
+    let kv_valid_len = vec![2_usize, 5, 3];
+    let left_padding = vec![3_usize, 0, 2];
+    let (kv_offset, bonus_position) =
+        super::seed_anchors_from_valid_len(&kv_valid_len, &left_padding);
+    // Every row's physical/padded offset collapses to max_len = 5 at the seed.
+    assert_eq!(
+        kv_offset,
+        vec![5, 5, 5],
+        "kv_offset = lp + valid (== max_len)"
+    );
+    assert_eq!(bonus_position, vec![4, 4, 4], "bonus = kv_offset - 1");
+}
+
+/// Equal-length rows (`left_padding == 0`) reduce to the legacy metadata:
+/// `kv_offset == kv_valid_len`, `bonus_position == kv_valid_len - 1`.
+#[test]
+fn ragged_seed_anchors_equal_length_reduces_to_legacy() {
+    let kv_valid_len = vec![7_usize, 7, 7];
+    let left_padding = vec![0_usize, 0, 0];
+    let (kv_offset, bonus_position) =
+        super::seed_anchors_from_valid_len(&kv_valid_len, &left_padding);
+    assert_eq!(kv_offset, vec![7, 7, 7]);
+    assert_eq!(bonus_position, vec![6, 6, 6]);
+}
+
+/// After a verify round, each row advances its logical valid length by its own
+/// `accepted + 1` while `left_padding` stays constant — so per-row anchors
+/// diverge correctly. Models the `verify_finalize_batched` bookkeeping.
+#[test]
+fn ragged_seed_anchors_track_per_row_round_advance() {
+    // Seed valid lengths (= unpadded prompt lengths) and constant lp.
+    let mut kv_valid_len = vec![2_usize, 5, 3];
+    let left_padding = vec![3_usize, 0, 2];
+    // Round 1 per-row accepts: row0 accepts 0, row1 accepts 3, row2 accepts 1.
+    let accepted = [0_usize, 3, 1];
+    for (v, a) in kv_valid_len.iter_mut().zip(accepted) {
+        *v += a + 1;
+    }
+    // Logical valid lengths now 3, 9, 5.
+    assert_eq!(kv_valid_len, vec![3, 9, 5]);
+    let (kv_offset, bonus_position) =
+        super::seed_anchors_from_valid_len(&kv_valid_len, &left_padding);
+    // Physical/padded offsets: lp + valid.
+    assert_eq!(kv_offset, vec![6, 9, 7]);
+    assert_eq!(bonus_position, vec![5, 8, 6]);
+}
+
+// ===========================================================================
+// END-TO-END ragged greedy parity (the real-generation proxy the parity gate
+// needs). Drives the *real* `Gemma4MtpBatchedTargetAdapter` — ragged prefill,
+// multi-round verify, per-row finalize/rollback, persisted per-row
+// `left_padding`/position bookkeeping — against the synthetic 1-layer Gemma 4
+// wrapper, and asserts the most-left-padded (shortest) row's GREEDILY GENERATED
+// token sequence (including its EOS stop) is byte-identical to that same row run
+// alone as B = 1.
+//
+// This is the unit proxy that the prior logit/mask-level tests missed: it
+// actually *generates* multiple tokens through the same prefill->verify->
+// finalize loop the round-loop driver uses (driven here target-only, i.e. a
+// perfect/full-accept drafter, so no drafter checkpoint is required), so any
+// per-row frame/position/EOS-retirement defect that flips the most-padded row's
+// argmax or drops its EOS surfaces as a sequence mismatch.
+// ===========================================================================
+
+/// Greedily extend `prompt` token-by-token through the *batched* adapter for a
+/// single row, stepping the real verify+finalize loop. Returns the emitted
+/// sequence (seed bonus first), stopping at the first `eos` token or after
+/// `max_new` tokens. The other rows are extended in lockstep but ignored.
+///
+/// `row` selects which batch row to read; the verify block width is 1 (pure
+/// autoregressive greedy), which still drives the real per-row mask /
+/// `left_padding` / position bookkeeping every round.
+fn batched_greedy_extend_row(
+    adapter: &Gemma4MtpBatchedTargetAdapter<'_>,
+    seed_bonuses: &[i32],
+    row: usize,
+    eos: i32,
+    max_new: usize,
+    sampler: &SamplingConfig,
+) -> Vec<i32> {
+    let batch = seed_bonuses.len();
+    let mut bonus_per_row = seed_bonuses.to_vec();
+    let mut emitted = vec![seed_bonuses[row]];
+    if emitted[0] == eos {
+        return emitted;
+    }
+    while emitted.len() < max_new {
+        // Width-1 verify block per row = [bonus].
+        let verify_input: Vec<Vec<i32>> = bonus_per_row.iter().map(|&b| vec![b]).collect();
+        let fwd = adapter
+            .verify_forward_batched(&verify_input, sampler)
+            .expect("batched verify forward");
+        // Per-row next greedy token (argmax at the single verify position).
+        let next_per_row: Vec<i32> = (0..batch)
+            .map(|r| fwd.target_tokens_per_row[r][0])
+            .collect();
+        // accepted = 0 for every row (no draft proposals); finalize advances
+        // each row by 1 and rolls back the (zero) speculative tail.
+        let _seed = adapter
+            .verify_finalize_batched(&vec![0usize; batch], 1, fwd.captured)
+            .expect("batched verify finalize");
+        let tok = next_per_row[row];
+        emitted.push(tok);
+        bonus_per_row = next_per_row;
+        if tok == eos {
+            break;
+        }
+    }
+    emitted
+}
+
+/// Standalone B = 1 analogue of [`batched_greedy_extend_row`] driving the
+/// single-row adapter's real verify+finalize loop.
+fn b1_greedy_extend(
+    adapter: &Gemma4MtpTargetAdapter<'_>,
+    seed_bonus: i32,
+    eos: i32,
+    max_new: usize,
+    sampler: &SamplingConfig,
+    logprobs: &mlxcel_core::sampling::LogprobsConfig,
+) -> Vec<i32> {
+    let mut bonus = seed_bonus;
+    let mut emitted = vec![seed_bonus];
+    if emitted[0] == eos {
+        return emitted;
+    }
+    while emitted.len() < max_new {
+        let vout = adapter.verify_forward(&[bonus], sampler, logprobs);
+        let next = vout.target_tokens[0];
+        let _seed = adapter.verify_finalize(0, 1, vout.captured);
+        emitted.push(next);
+        bonus = next;
+        if next == eos {
+            break;
+        }
+    }
+    emitted
+}
+
+/// Drive the full prefill + multi-round verify + finalize loop for BOTH rows of
+/// a large-length-gap ragged batch and the two standalone B = 1 runs, returning
+/// `(batched_short, std_short, batched_long, std_long)`. `eos` is the stop
+/// token threaded into every walk.
+fn run_ragged_vs_b1(
+    short_row: &[i32],
+    long_row: &[i32],
+    eos: i32,
+    max_new: usize,
+    layer_type: &str,
+) -> (Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>) {
+    let sampler = SamplingConfig::greedy();
+    let logprobs = mlxcel_core::sampling::LogprobsConfig::default();
+    let build = || crate::models::gemma4_tests::build_synthetic_wrapper_with_layer(layer_type);
+
+    // ---- Standalone B = 1 ground truth ----
+    let w_short = build();
+    let a_short = Gemma4MtpTargetAdapter::new(&w_short, None);
+    let (b_short, _, _) = a_short.prefill_and_seed(short_row, &sampler, &[], &logprobs);
+    let std_short = b1_greedy_extend(&a_short, b_short, eos, max_new, &sampler, &logprobs);
+
+    let w_long = build();
+    let a_long = Gemma4MtpTargetAdapter::new(&w_long, None);
+    let (b_long, _, _) = a_long.prefill_and_seed(long_row, &sampler, &[], &logprobs);
+    let std_long = b1_greedy_extend(&a_long, b_long, eos, max_new, &sampler, &logprobs);
+
+    // ---- Ragged B = 2: short row (cache consumed by its walk) ----
+    let w_batch = build();
+    let adapter = Gemma4MtpBatchedTargetAdapter::new(&w_batch, 2);
+    let (bonuses, _seed) = adapter
+        .prefill_and_seed_batched(&[short_row.to_vec(), long_row.to_vec()], &sampler)
+        .expect("ragged prefill");
+    let batched_short = batched_greedy_extend_row(&adapter, &bonuses, 0, eos, max_new, &sampler);
+
+    // Fresh adapter to extend the long row in isolation.
+    let w_batch2 = build();
+    let adapter2 = Gemma4MtpBatchedTargetAdapter::new(&w_batch2, 2);
+    let (bonuses2, _seed2) = adapter2
+        .prefill_and_seed_batched(&[short_row.to_vec(), long_row.to_vec()], &sampler)
+        .expect("ragged prefill");
+    let batched_long = batched_greedy_extend_row(&adapter2, &bonuses2, 1, eos, max_new, &sampler);
+
+    (batched_short, std_short, batched_long, std_long)
+}
+
+/// End-to-end MULTI-ROUND greedy parity for the most-left-padded row. A 2-row
+/// ragged batch with a large length gap must produce, for the SHORT (most-
+/// padded) row, a byte-identical multi-token greedy sequence to that short
+/// prompt run alone as B = 1. EOS is a sentinel the synthetic model never emits,
+/// so both paths run the full `max_new` rounds — this is the path where the
+/// documented failure mode ("verify-round perturbation accumulates and flips the
+/// most-padded row's greedy argmax") would surface as a sequence mismatch.
+#[test]
+fn ragged_end_to_end_greedy_parity_most_padded_row_multiround() {
+    let _runtime = crate::initialize_runtime();
+    for layer_type in ["sliding_attention", "full_attention"] {
+        // Large length gap: short row lp = 5, long row lp = 0.
+        let short_row: Vec<i32> = vec![2, 3];
+        let long_row: Vec<i32> = vec![4, 5, 6, 7, 2, 3, 1];
+        let max_new = 10usize;
+        // Sentinel EOS the degenerate fixture never produces, forcing
+        // full-length multi-round generation in every walk.
+        let eos = -1i32;
+
+        let (batched_short, std_short, batched_long, std_long) =
+            run_ragged_vs_b1(&short_row, &long_row, eos, max_new, layer_type);
+
+        eprintln!(
+            "E2E multiround [{layer_type}] short: standalone={std_short:?} \
+             batched={batched_short:?}; long: standalone={std_long:?} batched={batched_long:?}"
+        );
+
+        // Both paths must actually GENERATE multiple tokens (not stop at the
+        // seed), otherwise the multi-round parity assertion would be vacuous.
+        assert!(
+            std_short.len() >= 3,
+            "[{layer_type}] short-row multi-round walk must generate >= 3 tokens \
+             (got {std_short:?})"
+        );
+        // The load-bearing assertion: the most-left-padded row's multi-round
+        // greedy output is byte-identical batched-vs-standalone every step. The
+        // `full_attention` iteration is the one that exercises the unbounded
+        // KVCache verify-round left-padding mask (where the prompt padding is
+        // resident forever).
+        assert_eq!(
+            batched_short, std_short,
+            "[{layer_type}] SHORT (most-left-padded) row multi-round greedy \
+             sequence must be byte-identical to its standalone B = 1 run"
+        );
+        assert_eq!(
+            batched_long, std_long,
+            "[{layer_type}] LONG (lp == 0) control row multi-round greedy sequence \
+             must match standalone"
+        );
+    }
+}
+
+/// End-to-end EOS-STOP parity for the most-left-padded row: when the short row's
+/// standalone greedy decode hits EOS early, the batched ragged most-padded row
+/// must stop at the SAME position (not run to the cap emitting pad — the exact
+/// "empty + full token budget + no EOS" symptom the real 31B gate caught).
+///
+/// EOS is set to the token the synthetic model greedily emits first, so the
+/// short row's standalone decode is a known 1-token sequence ending in EOS; the
+/// ragged most-padded row must reproduce that EOS stop rather than continuing.
+#[test]
+fn ragged_end_to_end_greedy_parity_most_padded_row_hits_eos() {
+    let _runtime = crate::initialize_runtime();
+    let sampler = SamplingConfig::greedy();
+    let logprobs = mlxcel_core::sampling::LogprobsConfig::default();
+    let short_row: Vec<i32> = vec![2, 3];
+    let long_row: Vec<i32> = vec![4, 5, 6, 7, 2, 3, 1];
+    let max_new = 12usize;
+
+    // The token the model greedily emits first becomes EOS, so the short row's
+    // standalone greedy decode terminates on EOS within budget.
+    let w_probe = crate::models::gemma4_tests::build_synthetic_wrapper();
+    let a_probe = Gemma4MtpTargetAdapter::new(&w_probe, None);
+    let (probe_bonus, _, _) = a_probe.prefill_and_seed(&short_row, &sampler, &[], &logprobs);
+    let eos = probe_bonus;
+
+    let (batched_short, std_short, batched_long, std_long) =
+        run_ragged_vs_b1(&short_row, &long_row, eos, max_new, "sliding_attention");
+
+    eprintln!(
+        "E2E eos-stop eos={eos} short: standalone={std_short:?} batched={batched_short:?}; \
+         long: standalone={std_long:?} batched={batched_long:?}"
+    );
+
+    // The short row's standalone greedy decode must terminate on EOS within
+    // budget (a "known sequence ending in EOS"), not run to the cap.
+    assert!(
+        std_short.last() == Some(&eos) && std_short.len() < max_new,
+        "short row standalone greedy must end in EOS within budget (got {std_short:?})"
+    );
+    assert_eq!(
+        batched_short, std_short,
+        "SHORT (most-left-padded) row must reproduce the standalone EOS stop, not \
+         run to the token cap emitting pad"
+    );
+    assert_eq!(
+        batched_long, std_long,
+        "LONG (lp == 0) control row must match standalone EOS behaviour"
+    );
+}
+
+/// Hidden-state contamination probe — the most sensitive signal, immune to the
+/// synthetic fixture's degenerate argmax. After the ragged prefill, run several
+/// width-1 verify rounds so the shared cache offset grows past the prompt + its
+/// padding, then compare the most-left-padded row's captured verify hidden state
+/// against the standalone B = 1 run at the same logical step.
+///
+/// Note on the tolerance: exact bitwise equality is NOT achievable, because
+/// left-padding shifts every real token's *absolute* RoPE position by `lp`. RoPE
+/// is relative — `rotate(q, p_q) · rotate(k, p_k)` depends only on `p_q - p_k` —
+/// so the attention scores are mathematically identical, but the two absolute
+/// rotations round differently in fp, leaving a tiny (~1e-3) residual. A padding
+/// *contamination* bug, by contrast, makes the most-padded row attend `lp`
+/// spurious padding keys and perturbs the hidden by a LARGE amount (pre-fix this
+/// probe saw first-byte divergences, i.e. O(1) relative error). The tolerance
+/// below is loose enough to pass the unavoidable RoPE rounding yet far tighter
+/// than any contamination, so it is a real proxy for the greedy-parity gate.
+/// Runs for both attention families — `full_attention` exercises the unbounded
+/// KVCache (padding resident forever) and `sliding_attention` the MTP-buffered
+/// RotatingKVCache (padding resident until the buffer compacts).
+#[test]
+fn ragged_most_padded_row_verify_hidden_has_no_padding_contamination() {
+    let _runtime = crate::initialize_runtime();
+    let sampler = SamplingConfig::greedy();
+    let logprobs = mlxcel_core::sampling::LogprobsConfig::default();
+
+    // Read the most-padded row (row 0) hidden from a verify capture's
+    // `VerifyCaptured.tensors[0]` (`[B, width, hidden]`) as f32 values.
+    fn row0_hidden_f32(captured: &VerifyCaptured, width: i32, hidden: i32) -> Vec<f32> {
+        let h = captured
+            .tensors
+            .first()
+            .expect("verify capture carries hidden at index 0");
+        let row0 = mlxcel_core::slice(h.as_ref().unwrap(), &[0, 0, 0], &[1, width, hidden]);
+        let row0_f32 = mlxcel_core::astype(&row0, mlxcel_core::dtype::FLOAT32);
+        mlxcel_core::eval(&row0_f32);
+        let bytes = mlxcel_core::array_to_raw_bytes(&row0_f32);
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    for layer_type in ["sliding_attention", "full_attention"] {
+        let build = || crate::models::gemma4_tests::build_synthetic_wrapper_with_layer(layer_type);
+        let short_row: Vec<i32> = vec![2, 3];
+        let long_row: Vec<i32> = vec![4, 5, 6, 7, 2, 3, 1];
+        let hidden_dim = 4i32; // synthetic fixture hidden_size.
+        // Walk a few rounds so the SWA cache offset grows past `sliding_window`
+        // (= 8) while the MTP rollback buffer (`buffer_size = 32`) keeps the
+        // prompt padding RESIDENT and uncompacted — the exact regime the
+        // ragged path hits on the real 31B and the one the pre-fix mask logic
+        // mis-handled. At this depth BOTH defects bite: the full-attention path
+        // (unbounded cache, padding resident forever) and the sliding path
+        // (buffered cache, `sliding_offset + l > window` yet padding resident).
+        let warmup_rounds = 4usize;
+
+        // ---- Standalone B = 1 short row ----
+        let w_short = build();
+        let a_short = Gemma4MtpTargetAdapter::new(&w_short, None);
+        let (mut b_short, _, _) = a_short.prefill_and_seed(&short_row, &sampler, &[], &logprobs);
+        for _ in 0..warmup_rounds {
+            let vout = a_short.verify_forward(&[b_short], &sampler, &logprobs);
+            b_short = vout.target_tokens[0];
+            let _ = a_short.verify_finalize(0, 1, vout.captured);
+        }
+        let std_capture = a_short.verify_forward(&[b_short], &sampler, &logprobs);
+        let std_h = row0_hidden_f32(&std_capture.captured, 1, hidden_dim);
+
+        // ---- Ragged B = 2, most-padded row (row 0) ----
+        let w_batch = build();
+        let adapter = Gemma4MtpBatchedTargetAdapter::new(&w_batch, 2);
+        let (bonuses, _seed) = adapter
+            .prefill_and_seed_batched(&[short_row.clone(), long_row.clone()], &sampler)
+            .expect("ragged prefill");
+        let mut bonus_per_row = bonuses;
+        for _ in 0..warmup_rounds {
+            let verify_input: Vec<Vec<i32>> = bonus_per_row.iter().map(|&b| vec![b]).collect();
+            let fwd = adapter
+                .verify_forward_batched(&verify_input, &sampler)
+                .expect("batched verify forward");
+            bonus_per_row = (0..2).map(|r| fwd.target_tokens_per_row[r][0]).collect();
+            let _ = adapter
+                .verify_finalize_batched(&[0usize, 0usize], 1, fwd.captured)
+                .expect("batched verify finalize");
+        }
+        let verify_input: Vec<Vec<i32>> = bonus_per_row.iter().map(|&b| vec![b]).collect();
+        let batched_capture = adapter
+            .verify_forward_batched(&verify_input, &sampler)
+            .expect("batched verify forward");
+        let batched_h = row0_hidden_f32(&batched_capture.captured, 1, hidden_dim);
+
+        // Max relative deviation across the hidden vector.
+        let max_rel = std_h
+            .iter()
+            .zip(&batched_h)
+            .map(|(&s, &b)| (s - b).abs() / s.abs().max(1e-3))
+            .fold(0.0f32, f32::max);
+        eprintln!(
+            "[{layer_type}] most-padded-row hidden max_rel_dev={max_rel:.6} std={std_h:?} batched={batched_h:?}"
+        );
+        // Measured on this fixture at `warmup_rounds = 4`: the pure RoPE-rounding
+        // residual (fix applied) is ~1.5e-5, while the pre-fix padding
+        // contamination is ~1.6e-4 (sliding, buffered) / ~2.8e-4 (full,
+        // unbounded) and grows with depth. An 8e-5 ceiling sits cleanly between
+        // them, so this assertion FAILS without the verify-round padding mask and
+        // PASSES with it — a real unit proxy for the 31B greedy-parity gate.
+        assert!(
+            max_rel < 8e-5,
+            "[{layer_type}] most-left-padded row verify hidden deviates from the \
+             standalone B = 1 run by max_rel={max_rel} — far above the ~1.5e-5 RoPE \
+             fp-rounding floor, indicating the row attends resident prompt padding \
+             (greedy-parity break)"
+        );
+    }
+}

@@ -36,7 +36,8 @@ use mlxcel_core::layers::{
     compiled_gelu_mlp_fp16,
 };
 use mlxcel_core::utils::{
-    create_causal_mask, create_causal_mask_with_window, pipeline_hint, slice_axis,
+    create_causal_mask, create_causal_mask_with_left_padding, create_causal_mask_with_window,
+    create_causal_mask_with_window_and_left_padding, pipeline_hint, slice_axis,
 };
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
@@ -1754,6 +1755,7 @@ impl Gemma4TextModel {
             None,
             false,
             None,
+            None,
         )
     }
 
@@ -1794,6 +1796,7 @@ impl Gemma4TextModel {
         mut sinks: Option<&mut Gemma4SpeculativeSinks>,
         skip_final_norm: bool,
         bidirectional_block_ids: Option<&MlxArray>,
+        left_padding: Option<&[i32]>,
     ) -> UniquePtr<MlxArray> {
         // When `input_embeddings` is supplied (e.g. from the VLM path where
         // vision/audio features have already been merged into the embedding
@@ -1824,23 +1827,80 @@ impl Gemma4TextModel {
             None
         };
 
+        // Ragged batched MTP (variable-length B>1 burst) threads the per-row
+        // leading-padding column count so EVERY verify step masks each row's
+        // `[0, left_padding[r])` resident prompt padding. Without this the
+        // verify query attends the prompt's padding K/V (token 0) and breaks
+        // greedy parity for the most-left-padded row (the error scales with
+        // `left_padding[r]`). This MUST be honoured for single-token decode
+        // steps (`l == 1`) too, not only multi-token verify blocks — the
+        // padding stays resident in both the unbounded full-attention cache and
+        // the MTP-buffered sliding cache, so an `l == 1` step that took the
+        // `mask == None` fast path would silently attend it.
+        let has_padding = left_padding
+            .map(|lp| lp.iter().any(|&p| p > 0))
+            .unwrap_or(false);
+
         let (global_mask, sliding_mask) = if let Some(mask) = mask {
             (Some(mlxcel_core::copy(mask)), Some(mlxcel_core::copy(mask)))
-        } else if l > 1 {
+        } else if has_padding {
+            // Resident prompt padding present (ragged burst). Build per-row
+            // left-padding-aware masks for ANY query width, including `l == 1`.
             let global_offset = first_cache_offset(caches, "full_attention");
             let sliding_offset = first_cache_offset(caches, "sliding_attention");
-            let sliding_effective_offset =
-                sliding_offset.min((self.config.sliding_window as i32 - l).max(0));
+            let window = self.config.sliding_window as i32;
+            let lp = left_padding.expect("has_padding implies Some");
 
+            // Full attention: unbounded KVCache keeps the padding at columns
+            // `[0, lp)` for the whole run; mask it with the plain left-padding
+            // causal mask sized to the full key axis (`l + global_offset`).
+            let global_mask = create_causal_mask_with_left_padding(l, global_offset, lp);
+
+            // Sliding attention: the MTP rollback buffer (`buffer_size`) keeps
+            // the cache *uncompacted* far past the bare `sliding_window` — its
+            // logical capacity is `sliding_window + buffer_size` — so the
+            // resident prompt padding survives at columns `[0, lp)` long after
+            // `sliding_offset + l > sliding_window`. The previous gate
+            // (`sliding_offset + l <= window` -> windowed-left-padding mask,
+            // else a padding-UNAWARE plain windowed mask) therefore stopped
+            // masking the padding exactly when it was still resident, leaking
+            // `lp` padding keys into the most-padded row's window every verify
+            // step. While the buffer has not compacted, the key axis is the full
+            // `[0, sliding_offset + l)` (no eviction), so the windowed
+            // left-padding mask — which enforces both the sliding-window band
+            // (`tril(offset)` ∩ `triu(offset - window + 1)`) AND the `[0, lp)`
+            // padding filter — is the correct mask for `sliding_offset + l >
+            // window` too. The eligible regime (`max_prompt_len <=
+            // sliding_window`, realistic output lengths) never reaches the
+            // buffer-compaction point, so the full key axis always holds; if the
+            // cache ever did compact, the oldest keys (padding first) would be
+            // evicted and `trim_mask_to_keys` would crop the mask to the
+            // surviving (padding-free) suffix.
+            let sliding_mask = create_causal_mask_with_window_and_left_padding(
+                l,
+                sliding_offset,
+                Some(window),
+                lp,
+            );
+            (Some(global_mask), Some(sliding_mask))
+        } else if l > 1 {
+            // Non-ragged prefill / multi-token verify: derive both masks from
+            // the cache offsets (byte-identical to the pre-ragged behaviour).
+            let global_offset = first_cache_offset(caches, "full_attention");
+            let sliding_offset = first_cache_offset(caches, "sliding_attention");
+            let window = self.config.sliding_window as i32;
+            let sliding_effective_offset = sliding_offset.min((window - l).max(0));
             (
                 Some(create_causal_mask(l, global_offset)),
                 Some(create_causal_mask_with_window(
                     l,
                     sliding_effective_offset,
-                    Some(self.config.sliding_window as i32),
+                    Some(window),
                 )),
             )
         } else {
+            // Ordinary single-token decode with no resident padding: the
+            // attention kernels derive their own causal / windowed masks.
             (None, None)
         };
 
@@ -2297,6 +2357,7 @@ impl Gemma4Model {
             None,
             false,
             bidirectional_block_ids,
+            None,
         );
         let mut logits = self.text_model.embed_tokens.as_linear(&hidden);
         if let Some(cap) = self.config.final_logit_softcapping {
@@ -2314,6 +2375,7 @@ impl Gemma4Model {
     /// `sinks` is `None`.
     ///
     /// Used by: [`Gemma4Wrapper::forward_with_speculative_sinks`].
+    #[allow(clippy::too_many_arguments)]
     fn forward_with_caches_and_speculative_sinks(
         &self,
         input_ids: &MlxArray,
@@ -2323,6 +2385,7 @@ impl Gemma4Model {
         per_layer_inputs: Option<&MlxArray>,
         capture_layer_ids: Option<&[usize]>,
         sinks: Option<&mut Gemma4SpeculativeSinks>,
+        left_padding: Option<&[i32]>,
     ) -> UniquePtr<MlxArray> {
         let hidden = self.text_model.forward_with_speculative_sinks(
             input_ids,
@@ -2334,6 +2397,7 @@ impl Gemma4Model {
             sinks,
             false,
             None,
+            left_padding,
         );
         let mut logits = self.text_model.embed_tokens.as_linear(&hidden);
         if let Some(cap) = self.config.final_logit_softcapping {
@@ -2347,6 +2411,7 @@ impl Gemma4Model {
     /// Used by: Gemma 4 MTP deferred greedy verification, which needs the
     /// pre-norm hidden states and shared K/V slabs but can project only the
     /// positions required by the speculative walk.
+    #[allow(clippy::too_many_arguments)]
     fn forward_hidden_with_caches_and_speculative_sinks(
         &self,
         input_ids: &MlxArray,
@@ -2357,6 +2422,7 @@ impl Gemma4Model {
         capture_layer_ids: Option<&[usize]>,
         sinks: Option<&mut Gemma4SpeculativeSinks>,
         skip_final_norm: bool,
+        left_padding: Option<&[i32]>,
     ) -> UniquePtr<MlxArray> {
         self.text_model.forward_with_speculative_sinks(
             input_ids,
@@ -2368,6 +2434,7 @@ impl Gemma4Model {
             sinks,
             skip_final_norm,
             None,
+            left_padding,
         )
     }
 
@@ -3052,6 +3119,16 @@ impl Gemma4Wrapper {
         self.model.text_model.layers.len()
     }
 
+    /// Sliding-window size of the sliding-attention layers.
+    ///
+    /// Used by the ragged batched MTP target adapter to gate variable-length
+    /// prefill eligibility: ragged left-padded prefill is only admitted when
+    /// `max_prompt_len <= sliding_window` (the non-capped RotatingKVCache
+    /// regime), where the windowed left-padding mask is well-defined.
+    pub(crate) fn sliding_window_value(&self) -> usize {
+        self.model.config.sliding_window
+    }
+
     pub(crate) fn eos_token_ids_value(&self) -> Vec<i32> {
         self.model.eos_token_ids.clone()
     }
@@ -3155,6 +3232,7 @@ impl Gemma4Wrapper {
                     per_layer_inputs,
                     capture_layer_ids,
                     sinks,
+                    None,
                 )
             },
         )
@@ -3179,6 +3257,7 @@ impl Gemma4Wrapper {
     /// projection.
     ///
     /// Used by: [`crate::models::gemma4_mtp_target::Gemma4MtpBatchedTargetAdapter`].
+    #[allow(clippy::too_many_arguments)]
     pub fn forward_with_speculative_sinks_explicit_cache(
         &self,
         input_ids: &MlxArray,
@@ -3188,6 +3267,7 @@ impl Gemma4Wrapper {
         caches: &mut [Cache],
         capture_layer_ids: Option<&[usize]>,
         sinks: Option<&mut Gemma4SpeculativeSinks>,
+        left_padding: Option<&[i32]>,
     ) -> UniquePtr<MlxArray> {
         self.model.forward_with_caches_and_speculative_sinks(
             input_ids,
@@ -3197,6 +3277,7 @@ impl Gemma4Wrapper {
             per_layer_inputs,
             capture_layer_ids,
             sinks,
+            left_padding,
         )
     }
 
@@ -3228,6 +3309,7 @@ impl Gemma4Wrapper {
                     capture_layer_ids,
                     sinks,
                     skip_final_norm,
+                    None,
                 )
             },
         )
