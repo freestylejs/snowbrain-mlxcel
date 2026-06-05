@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [v0.1.4] - 2026-06-05
+
+### Added
+- **Gemma 4 Unified (`gemma4_unified`) multimodal architecture** (#153, closes #151).
+- **Gemma 4 Unified MTP speculative drafter (`gemma4_unified_assistant`)** (#157, closes #158). The Gemma 4 Unified decode target now routes through the existing MTP speculative burst dispatch, reusing the MTP drafter and round loop unchanged. The drafter's pre/post projections load through the quantization-aware `UnifiedLinear`, so a 4-bit assistant (e.g. `gemma-4-12B-it-assistant-4bit`) no longer crashes at forward time with a matmul shape mismatch. On `gemma-4-12b-it-4bit` plus the 4-bit assistant, temperature-0 output is byte-identical to classic decode at about 1.87x decode speedup (39 to 74 tok/s).
+- **Variable-length prompts in B>1 batched MTP bursts**, behind the new `MLXCEL_ENABLE_MTP_BATCH_RAGGED` opt-in (subordinate to `MLXCEL_ENABLE_MTP_BATCH`) (#162, closes #161). Rows of different prompt lengths join one burst via per-row left-padding plus a windowed left-padding causal mask; greedy parity holds because every token in a row is shifted by the same constant left-padding offset. Eligibility is limited to `max_prompt_len <= sliding_window`; out-of-regime windows fall back to per-row B=1 service. Off by default (measured 0.94x to 1.13x on the 31B), so the production path is byte-for-byte unchanged.
+- **Unified paged KV cache (epic #116), Phase 0**: decode-time page-gather microbench and ADR 0001, which selects the `[num_blocks, block_size, n_kv_heads, head_dim]` pool layout (about 2.1x faster on gather-then-SDPA than the head-split layout) and the gather-then-SDPA strategy (#145, closes #117).
+- **Unified paged KV cache, Phase 1**: physical block-pool K/V tensor storage in `PagedBlockPool`, lazily allocated per layer with `write_block` / `gather_visible` primitives (#148, closes #118).
+- **Unified paged KV cache, Phase 2**: pooled paged-decode read path over real, possibly fragmented block tables, bit-identical to the dense fallback over 200 steps (#149, closes #119).
+- **Unified paged KV cache, Phase 3**: paged prefill writer with shared-prefix copy-on-write, so a suffix write after a shared prefix allocates only the divergent blocks (#150, closes #120). These four phases are additive machinery exercised by tests; the live decode path stays byte-for-byte unchanged until the scheduler wiring lands.
+
+### Changed
+- **B=1 MTP speculative decoding now runs by default for every MTP target**, including batch-capable ones such as Gemma 4 31B (#159, closes #158). Previously batch-capable targets declined singleton MTP unless `MLXCEL_ENABLE_MTP_B1=1` was set, a calibration from an earlier "B=1 is slower" measurement. M5 Max measurement shows B=1 MTP is profitable with byte-identical output at temperature 0: about 1.2x to 1.4x on the 31B plus bf16 assistant, and about 1.87x on the 12B Unified pair. Opt out with `MLXCEL_ENABLE_MTP_B1=0`.
+
+### Fixed
+- **Quantized fused MoE experts in the `gemma4_unified` loader are now split correctly.** The fused-expert split in `sanitize_gemma4_unified_weights` only matched the bare non-quantized `.weight`, so a quantized MoE checkpoint's `.weight` / `.scales` / `.biases` legs fell through unsplit and `switch_glu` construction could not find its per-projection quantized parts. The split now matches each quantized component leg and slices it on the output (doubled-FFN) axis at the same half boundary, with a dequantize-equivalence test proving no group straddling (#156).
+
+### Docs
+- Recorded the measured Gemma 4 31B B>1 batched MTP numbers and aligned the related code comments (#160).
+
+### Chore
+- Bumped the `minor-and-patch` dependency group: `uuid` 1.23.1 to 1.23.2 and `hyper` 1.9.0 to 1.10.1 (#147).
+- Added the local `/notes/` scratch directory to `.gitignore`.
+
 ## [v0.1.3] - 2026-05-30
 
 ### Changed
@@ -765,6 +789,7 @@ Initial public release of mlxcel.
 - GitHub Actions release workflow for macOS ARM64
 - Profile mode for prefill/decode timing analysis
 
+[v0.1.4]: https://github.com/lablup/mlxcel/compare/v0.1.3...v0.1.4
 [v0.1.3]: https://github.com/lablup/mlxcel/compare/v0.1.2...v0.1.3
 [v0.1.2]: https://github.com/lablup/mlxcel/compare/v0.1.1...v0.1.2
 [v0.1.1]: https://github.com/lablup/mlxcel/compare/v0.1.0...v0.1.1

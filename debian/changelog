@@ -1,3 +1,50 @@
+mlxcel (0.1.4-1~jammy1) jammy; urgency=medium
+
+  * Added: Gemma 4 Unified (`gemma4_unified`) multimodal architecture
+    (#153, closes #151).
+  * Added: Gemma 4 Unified MTP speculative drafter
+    (`gemma4_unified_assistant`). The Gemma 4 Unified decode target routes
+    through the existing MTP burst dispatch, reusing the drafter and round
+    loop unchanged. The 4-bit assistant's pre/post projections load through
+    the quantization-aware UnifiedLinear, so a 4-bit assistant no longer
+    crashes at forward time with a matmul shape mismatch. Temperature-0
+    output is byte-identical to classic decode at about 1.87x decode
+    speedup (39 to 74 tok/s) on the gemma-4-12b-it-4bit + 4-bit assistant
+    pair (#157, closes #158).
+  * Added (opt-in): variable-length prompts in B>1 batched MTP bursts,
+    behind MLXCEL_ENABLE_MTP_BATCH_RAGGED. Rows of different prompt lengths
+    join one burst via per-row left-padding; greedy parity holds because
+    every token in a row is shifted by the same constant. Off by default
+    (measured 0.94x to 1.13x on the 31B), so the production path is
+    byte-for-byte unchanged (#162, closes #161).
+  * Added: unified paged KV cache foundation (epic #116): the decode-time
+    page-gather microbench and ADR 0001 (#145), physical block-pool K/V
+    tensor storage in PagedBlockPool (#148), the pooled paged-decode read
+    path over real block tables (#149), and the paged prefill writer with
+    shared-prefix copy-on-write (#150). Additive machinery exercised by
+    tests; the live decode path is byte-for-byte unchanged until the
+    scheduler wiring lands.
+  * Changed: B=1 MTP speculative decoding now runs by default for every
+    MTP target, including batch-capable ones such as Gemma 4 31B.
+    Previously batch-capable targets declined singleton MTP unless
+    MLXCEL_ENABLE_MTP_B1=1 was set. M5 Max measurement shows it is
+    profitable with byte-identical output at temperature 0: about 1.2x to
+    1.4x on the 31B plus bf16 assistant and about 1.87x on the 12B Unified
+    pair. Opt out with MLXCEL_ENABLE_MTP_B1=0 (#159, closes #158).
+  * Fixed: quantized fused MoE experts in the gemma4_unified loader are now
+    split correctly. The split in sanitize_gemma4_unified_weights only
+    matched the bare non-quantized .weight, so a quantized MoE checkpoint's
+    .weight / .scales / .biases legs fell through unsplit and switch_glu
+    construction could not find its per-projection quantized parts. The
+    split now matches each quantized component leg and slices it on the
+    output axis at the same half boundary (#156).
+  * Docs: recorded the measured Gemma 4 31B B>1 batched MTP numbers and
+    aligned the related code comments (#160).
+  * Chore: bumped the minor-and-patch dependency group: uuid 1.23.1 to
+    1.23.2 and hyper 1.9.0 to 1.10.1 (#147).
+
+ -- Jeongkyu Shin <inureyes@gmail.com>  Fri, 05 Jun 2026 12:30:00 +0900
+
 mlxcel (0.1.3-1~jammy1) jammy; urgency=medium
 
   * Changed (BREAKING): `mlxcel list` now lists local downloaded models by
