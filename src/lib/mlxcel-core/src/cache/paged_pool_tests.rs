@@ -41,6 +41,7 @@ use crate::dtype;
 use crate::ffi;
 use crate::ffi::MlxArray;
 use cxx::UniquePtr;
+use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -880,4 +881,229 @@ fn write_prefill_cow_forks_shared_partial_tail_block() {
     );
     assert_eq!(flatten_fp32(&gk_b), flatten_fp32(&dense_b_k));
     assert_eq!(flatten_fp32(&gv_b), flatten_fp32(&dense_b_v));
+}
+
+// ---------------------------------------------------------------------------
+// 13. read_block_contents + acquire_and_write_block (#125): a multi-block
+//     prefill round-trips byte-identically through a SECOND (decode-node) pool.
+//
+// Models the cross-node block-content transfer: the origin pool's blocks are
+// read out slab-by-slab (`read_block_contents`), then re-materialized on a
+// fresh pool (`acquire_and_write_block`) with a remapped block table. The
+// gathered visible window must be byte-identical, the fresh ids must be
+// independent of (here, disjoint from) the origin ids, and block accounting
+// (per-block refcount + live count) must match the origin.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn extract_then_restore_with_contents_round_trips() {
+    let block_size = 4usize;
+    let total = 10i32; // 2 full blocks + a half-full third (partial-tail padding).
+    let mut origin = fp16_pool(block_size, 1);
+    let mut origin_state = PagedSequenceState::new(origin.layout());
+
+    let k_prefill = make_block(100.0, total);
+    let v_prefill = make_block(500.0, total);
+    origin
+        .write_prefill(&mut origin_state, 0, &k_prefill, &v_prefill)
+        .unwrap();
+
+    let origin_blocks = origin_state.layer(0).unwrap().block_ids.clone();
+    assert_eq!(origin_blocks.len(), 3);
+    let origin_live = origin.live_block_count();
+    assert_eq!(origin_live, 3);
+    let origin_max_id = origin_blocks
+        .iter()
+        .map(|b| b.as_u64())
+        .max()
+        .expect("non-empty block table");
+
+    // Baseline visible window from the origin pool.
+    let (origin_gk, origin_gv) = origin
+        .gather_visible(&origin_state, 0)
+        .unwrap()
+        .expect("origin gather must return data");
+
+    // "Transfer": read every block's full [block_size, H, D] slab out of origin.
+    let transferred: Vec<(u64, UniquePtr<MlxArray>, UniquePtr<MlxArray>)> = origin_blocks
+        .iter()
+        .map(|&block_id| {
+            let (k, v) = origin.read_block_contents(block_id, 0).unwrap();
+            (block_id.as_u64(), k, v)
+        })
+        .collect();
+
+    // Decode node: a fresh pool whose id counter is pre-advanced past the
+    // origin's max (a real decode pool is rarely pristine), so the restored
+    // blocks get provably disjoint fresh ids.
+    let mut decode = fp16_pool(block_size, 1);
+    let mut resident = PagedSequenceState::new(decode.layout());
+    decode
+        .append_tokens(&mut resident, 0, block_size * origin_blocks.len())
+        .unwrap();
+    let resident_live = decode.live_block_count();
+    assert_eq!(resident_live, origin_blocks.len());
+
+    // Acquire + write each transferred block, remapping origin id -> fresh id.
+    let mut id_map: HashMap<u64, PagedBlockId> = HashMap::new();
+    for (origin_id, k, v) in &transferred {
+        let fresh = decode.acquire_and_write_block(0, k, v).unwrap();
+        id_map.insert(*origin_id, fresh);
+    }
+
+    // Rebuild the block table over the fresh ids (same len / logical_start).
+    let mut decode_state = PagedSequenceState::new(decode.layout());
+    {
+        let layer = decode_state.layer_mut(0).unwrap();
+        layer.block_ids = origin_blocks
+            .iter()
+            .map(|origin_id| id_map[&origin_id.as_u64()])
+            .collect();
+        layer.len = origin_state.layer(0).unwrap().len;
+        layer.logical_start = origin_state.layer(0).unwrap().logical_start;
+    }
+
+    // Fresh ids are independent of the origin ids (disjoint here)...
+    for fresh in id_map.values() {
+        assert!(
+            fresh.as_u64() > origin_max_id,
+            "decode pool must allocate fresh ids past the origin's (got {}, origin max {origin_max_id})",
+            fresh.as_u64()
+        );
+    }
+
+    // ...but the gathered content is byte-identical to the origin window.
+    let (decode_gk, decode_gv) = decode
+        .gather_visible(&decode_state, 0)
+        .unwrap()
+        .expect("decode gather must return data");
+    assert_eq!(flatten_fp32(&origin_gk), flatten_fp32(&decode_gk));
+    assert_eq!(flatten_fp32(&origin_gv), flatten_fp32(&decode_gv));
+
+    // Block accounting matches the origin: every restored block is solely owned
+    // (refcount 1) and the decode pool's live count is the resident blocks plus
+    // exactly the origin's live count (no double-allocation, no leak).
+    for fresh in id_map.values() {
+        assert_eq!(decode.refcount(*fresh), 1);
+    }
+    assert_eq!(decode.live_block_count(), resident_live + origin_live);
+}
+
+/// The distributed handoff (#125) ships pool blocks through `array_to_raw_bytes`
+/// -> wire -> `from_bytes`. That byte round-trip must preserve 16-bit float
+/// content EXACTLY. A `from_bytes` bug used to read fp16/bf16 bytes as per-byte
+/// `uint8`->float casts (reading half the bytes, one value per byte), silently
+/// corrupting every transferred block; the single-layer FP32 round-trip above
+/// could not catch it because FP32 has an explicit `from_bytes` case. This
+/// exercises the exact serde path in both 16-bit dtypes across two physical
+/// blocks (one partial tail), comparing the gathered window byte-for-byte.
+fn assert_byte_roundtrip_preserves_content(cast_dtype: i32) {
+    let block_size = 4usize;
+    let total = 10i32; // 2 full blocks + a half-full third (partial tail).
+    let mut origin = fp16_pool(block_size, 1);
+    let mut origin_state = PagedSequenceState::new(origin.layout());
+
+    // Cast the deterministic content to the real pool-backed 16-bit dtype.
+    let k_prefill = ffi::astype(&make_block(100.0, total), cast_dtype);
+    let v_prefill = ffi::astype(&make_block(500.0, total), cast_dtype);
+    origin
+        .write_prefill(&mut origin_state, 0, &k_prefill, &v_prefill)
+        .unwrap();
+
+    let origin_blocks = origin_state.layer(0).unwrap().block_ids.clone();
+    let (origin_gk, origin_gv) = origin
+        .gather_visible(&origin_state, 0)
+        .unwrap()
+        .expect("origin gather");
+
+    // Transfer each block through the raw byte wire (read -> bytes -> from_bytes).
+    let transferred: Vec<(u64, UniquePtr<MlxArray>, UniquePtr<MlxArray>)> = origin_blocks
+        .iter()
+        .map(|&block_id| {
+            let (k, v) = origin.read_block_contents(block_id, 0).unwrap();
+            let kk = ffi::from_bytes(
+                &ffi::array_to_raw_bytes(&k),
+                &ffi::array_shape(&k),
+                ffi::array_dtype(&k),
+            );
+            let vv = ffi::from_bytes(
+                &ffi::array_to_raw_bytes(&v),
+                &ffi::array_shape(&v),
+                ffi::array_dtype(&v),
+            );
+            (block_id.as_u64(), kk, vv)
+        })
+        .collect();
+
+    let mut decode = fp16_pool(block_size, 1);
+    let mut decode_state = PagedSequenceState::new(decode.layout());
+    let mut id_map: HashMap<u64, PagedBlockId> = HashMap::new();
+    for (origin_id, k, v) in &transferred {
+        id_map.insert(*origin_id, decode.acquire_and_write_block(0, k, v).unwrap());
+    }
+    {
+        let layer = decode_state.layer_mut(0).unwrap();
+        layer.block_ids = origin_blocks.iter().map(|o| id_map[&o.as_u64()]).collect();
+        layer.len = origin_state.layer(0).unwrap().len;
+        layer.logical_start = origin_state.layer(0).unwrap().logical_start;
+    }
+    let (decode_gk, decode_gv) = decode
+        .gather_visible(&decode_state, 0)
+        .unwrap()
+        .expect("decode gather");
+
+    assert_eq!(
+        flatten_fp32(&origin_gk),
+        flatten_fp32(&decode_gk),
+        "K content corrupted by the byte round-trip (dtype {cast_dtype})"
+    );
+    assert_eq!(
+        flatten_fp32(&origin_gv),
+        flatten_fp32(&decode_gv),
+        "V content corrupted by the byte round-trip (dtype {cast_dtype})"
+    );
+}
+
+/// `acquire_and_write_block` mints a fresh block before the fallible write. If
+/// the write is rejected (a malformed or oversized transferred slab on the #125
+/// restore path) the just-minted block must be released, not leaked. After a
+/// rejected write the pool's live block count must be unchanged.
+#[test]
+fn acquire_and_write_block_releases_on_write_failure() {
+    let block_size = 4usize;
+    let mut pool = fp16_pool(block_size, 1);
+
+    // Capture this layer's geometry (n_kv_heads = H, head_dim = D) with one
+    // good block, so a later mismatched slab is rejected by write_block.
+    let _good = pool
+        .acquire_and_write_block(
+            0,
+            &make_block_3d(0.0, block_size as i32),
+            &make_block_3d(500.0, block_size as i32),
+        )
+        .unwrap();
+    assert_eq!(pool.live_block_count(), 1);
+
+    // A slab whose n_kv_heads disagrees with the captured meta (H + 1 vs H) is
+    // rejected by write_block; the block acquired for it must be released.
+    let bad = ffi::from_slice_f32(
+        &vec![0.0f32; (block_size as i32 * (H + 1) * D) as usize],
+        &[block_size as i32, H + 1, D],
+    );
+    assert!(pool.acquire_and_write_block(0, &bad, &bad).is_err());
+    assert_eq!(
+        pool.live_block_count(),
+        1,
+        "a rejected write must not leak the freshly acquired block"
+    );
+}
+
+#[test]
+fn paged_block_byte_roundtrip_preserves_fp16() {
+    assert_byte_roundtrip_preserves_content(dtype::FLOAT16);
+}
+
+#[test]
+fn paged_block_byte_roundtrip_preserves_bf16() {
+    assert_byte_roundtrip_preserves_content(dtype::BFLOAT16);
 }
