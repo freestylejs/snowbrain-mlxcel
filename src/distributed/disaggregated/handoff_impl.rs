@@ -63,7 +63,7 @@ use mlxcel_core::cache::{CachePool, PagedKvLayout, SequenceId, SequenceStateLayo
 use mlxcel_core::generate::LanguageModel;
 
 use crate::distributed::kv_cache_serde::{
-    CacheIngestLimits, ExpectedBlockGeometry, SerializableSamplingState,
+    CacheIngestLimits, ExpectedBlockGeometry, SerializableCacheState, SerializableSamplingState,
     deserialize_cache_state_with_limits, restore_into_cache_pool_sequence_anchored,
     serialize_cache_pool_sequence, serialize_cache_state,
 };
@@ -182,14 +182,18 @@ pub fn probe_block_geometry(
 /// whole `SerializableCacheState` to bytes. `token_history` is the sequence's
 /// prompt token ids (needed so the decode node can continue sampling with the
 /// same context); `sampling` carries the request's sampling parameters when the
-/// caller tracks them.
+/// caller tracks them; `generated_tokens` carries the prefill node's first
+/// sampled token(s) so the decode node seeds its continuation correctly (#126
+/// B2b) and the emitted stream matches a single-node run.
 pub fn extract_sequence_handoff(
     cache_pool: &CachePool,
     id: SequenceId,
     sampling: Option<SerializableSamplingState>,
     token_history: Vec<i32>,
+    generated_tokens: Vec<i32>,
 ) -> Result<Vec<u8>> {
-    let state = serialize_cache_pool_sequence(cache_pool, id, sampling, token_history)?;
+    let mut state = serialize_cache_pool_sequence(cache_pool, id, sampling, token_history)?;
+    state.generated_tokens = generated_tokens;
     serialize_cache_state(&state)
 }
 
@@ -211,18 +215,33 @@ pub fn ingest_sequence_handoff(
     block_size: usize,
 ) -> Result<SequenceId> {
     let state = deserialize_cache_state_with_limits(bytes, limits)?;
+    ingest_sequence_handoff_state(cache_pool, model, &state, limits, geometry, block_size)
+}
+
+/// Decode side, pre-deserialized variant: reconstruct a sequence from an already
+/// parsed [`SerializableCacheState`] (otherwise identical to
+/// [`ingest_sequence_handoff`]).
+///
+/// A serving-role scheduler that also needs the handoff's request context (the
+/// prompt token history and the prefill node's generated tokens, to seed a live
+/// decode sequence) deserializes the frame once, reads that context, and calls
+/// this so the heavy paged-block restore is not paid for twice.
+pub fn ingest_sequence_handoff_state(
+    cache_pool: &mut CachePool,
+    model: &dyn LanguageModel,
+    state: &SerializableCacheState,
+    limits: &CacheIngestLimits,
+    geometry: &ExpectedBlockGeometry,
+    block_size: usize,
+) -> Result<SequenceId> {
     let layout = handoff_paged_layout(model.num_layers(), block_size)?;
     let seq_id = cache_pool
         .allocate_with_layout(model, Some(layout))
         .map_err(|e| anyhow!("handoff ingest: allocate decode sequence: {e}"))?;
 
-    if let Err(e) = restore_into_cache_pool_sequence_anchored(
-        &state,
-        cache_pool,
-        seq_id,
-        limits,
-        Some(geometry),
-    ) {
+    if let Err(e) =
+        restore_into_cache_pool_sequence_anchored(state, cache_pool, seq_id, limits, Some(geometry))
+    {
         // Release the just-allocated slot so a rejected handoff does not leak a
         // sequence (or any pool blocks the partial restore acquired).
         cache_pool.release(seq_id);
