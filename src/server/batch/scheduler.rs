@@ -122,6 +122,30 @@ fn effective_decode_storage_backend(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChunkedPrefillRange {
+    start: usize,
+    end: usize,
+    is_terminal: bool,
+}
+
+#[inline]
+fn next_chunked_prefill_range(
+    prompt_len: usize,
+    offset: usize,
+    chunk_size: usize,
+) -> Option<ChunkedPrefillRange> {
+    if chunk_size == 0 || offset >= prompt_len {
+        return None;
+    }
+    let end = offset.saturating_add(chunk_size).min(prompt_len);
+    Some(ChunkedPrefillRange {
+        start: offset,
+        end,
+        is_terminal: end >= prompt_len,
+    })
+}
+
 /// Core batch scheduler that drives the model worker loop.
 ///
 /// Replaces the old sequential `recv()` loop with an iteration-level scheduler
@@ -2922,9 +2946,6 @@ impl BatchScheduler {
             cached = seq.prefill_start_offset,
         )
         .entered();
-        // Counter reflects only the work the model actually runs.
-        let suffix_len = seq.prompt_tokens.len() - seq.prefill_start_offset;
-        self.batch_observability.record_prefill_start(suffix_len);
 
         // Reset internal caches for non-batching models (same as execute_full_prefill).
         if !self.model.supports_batching() {
@@ -2932,8 +2953,23 @@ impl BatchScheduler {
         }
 
         let chunk_size = self.prefill_chunk_size;
-        let start = seq.prefill_start_offset;
-        let end = (start + chunk_size).min(seq.prompt_tokens.len());
+        let chunk_range = match next_chunked_prefill_range(
+            seq.prompt_tokens.len(),
+            seq.prefill_start_offset,
+            chunk_size,
+        ) {
+            Some(range) => range,
+            None => {
+                self.abort_sequence(seq, "Chunked prefill start had no suffix tokens to process");
+                return;
+            }
+        };
+        // Counter reflects only the work the model actually runs.
+        let suffix_len = seq.prompt_tokens.len() - seq.prefill_start_offset;
+        self.batch_observability.record_prefill_start(suffix_len);
+
+        let start = chunk_range.start;
+        let end = chunk_range.end;
         let chunk = &seq.prompt_tokens[start..end];
 
         // Align the first chunk to a 32-token tile boundary on M5+ hardware.
@@ -2960,7 +2996,7 @@ impl BatchScheduler {
 
         let eff_len = eff_chunk.len() as i32;
         let input = mlxcel_core::from_slice_i32(&eff_chunk, &[1, eff_len]);
-        {
+        let logits = {
             let caches = match self.cache_pool.get_caches_mut(seq.seq_id) {
                 Some(c) => c,
                 None => {
@@ -2970,7 +3006,7 @@ impl BatchScheduler {
             };
 
             // VLM embeddings are applied only on the first chunk.
-            if let Some(ref embeddings) = seq.vlm_embeddings {
+            let logits = if let Some(ref embeddings) = seq.vlm_embeddings {
                 match prepared_embedding_refs(embeddings) {
                     Ok((input_embeds, caller_mask)) => {
                         let effective_mask =
@@ -2984,6 +3020,7 @@ impl BatchScheduler {
                         );
                         mlxcel_core::eval(&logits);
                         self.model.after_prefill();
+                        logits
                     }
                     Err(err) => {
                         self.abort_sequence(seq, &err.to_string());
@@ -2998,7 +3035,8 @@ impl BatchScheduler {
                     pad_mask_opt.as_ref().map(|m| m.as_ref().unwrap()),
                 );
                 mlxcel_core::eval(&logits);
-            }
+                logits
+            };
 
             // Trim padding positions from KV caches when the chunk was padded.
             if pad_mask_opt.is_some() && eff_chunk.len() > actual_chunk_len {
@@ -3007,7 +3045,8 @@ impl BatchScheduler {
                     c.trim(excess);
                 }
             }
-        }
+            logits
+        };
         self.sync_sequence_storage(seq.seq_id);
 
         // H2: enforce the `--max-kv-size` cap after each
@@ -3027,6 +3066,26 @@ impl BatchScheduler {
             seq.prompt_tokens.len()
         );
 
+        // The chunked-vs-full decision in `prefill_sequence` keys off the
+        // *full* prompt length, but the work we just ran covers only the
+        // suffix `[prefill_start_offset..]`. When a prompt-cache hit adopts a
+        // long prefix, that suffix can fit entirely in chunk 0 even though the
+        // full prompt cleared the chunking threshold — so this first chunk has
+        // already reached the end of the prompt and there is nothing to
+        // continue. Finish the prefill now (mirroring the final-chunk handling
+        // in `continue_chunked_prefill`). Storing the sequence for
+        // continuation instead would feed an empty `[end..end]` chunk on the
+        // next tick, producing a zero-length forward whose `[1, 0, vocab]`
+        // logits crash in `slice_last_logits` (issue #179).
+        if chunk_range.is_terminal {
+            let eos_tokens =
+                merged_eos_token_ids(self.model.eos_token_ids(), &seq.sampling.stop_token_ids);
+            let needs_history = seq.sampling.needs_token_history();
+            let token_history = initial_token_history(&seq.prompt_tokens, needs_history);
+            self.finish_prefill(seq, logits, eos_tokens, token_history, needs_history);
+            return;
+        }
+
         // Store the sequence for continuation
         self.chunked_prefill_seq = Some(seq);
     }
@@ -3045,12 +3104,23 @@ impl BatchScheduler {
             total = seq.prompt_tokens.len(),
         )
         .entered();
-        self.batch_observability.record_prefill_chunk();
 
         let chunk_size = self.prefill_chunk_size;
         let offset = seq.prefill_offset;
         let total = seq.prompt_tokens.len();
-        let end = (offset + chunk_size).min(total);
+        let chunk_range = match next_chunked_prefill_range(total, offset, chunk_size) {
+            Some(range) => range,
+            None => {
+                self.abort_sequence(
+                    seq,
+                    "Chunked prefill continuation had no remaining tokens to process",
+                );
+                return;
+            }
+        };
+        self.batch_observability.record_prefill_chunk();
+
+        let end = chunk_range.end;
         let chunk = &seq.prompt_tokens[offset..end];
 
         // Align each continuation chunk to a 32-token tile boundary on M5+.
@@ -3133,7 +3203,7 @@ impl BatchScheduler {
             seq.seq_id,
         );
 
-        if end < total {
+        if !chunk_range.is_terminal {
             // More chunks remain -- store and yield back to the scheduler
             mlxcel_core::eval(&logits);
             mlxcel_core::clear_memory_cache();
