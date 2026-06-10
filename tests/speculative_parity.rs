@@ -923,6 +923,332 @@ fn greedy_parity_mtp_gemma4_batched_b4_matches_b1() {
     );
 }
 
+/// Greedy-parity gate for a VARIABLE-length (ragged) B = 4 batched MTP burst:
+/// each row is left-padded to the max prompt length, so the adapter
+/// auto-routes to the ragged left-padding prefill (the
+/// `prefill_and_seed_batched` length-uniformity check).
+///
+/// Asserts byte-equality against each row's isolated B = 1 stream over the
+/// row's hole-free LOCKSTEP PREFIX (the prefill bonus plus every round before
+/// the row's first sub-round-max accept), which is the region issue #163's
+/// NaN-safe padding rows and stale-tail exclusion make structurally exact.
+/// Full-stream equality after divergent accepts is blocked by the pre-existing
+/// per-row position holes tracked in issue #203 (the batched verify writes and
+/// rotates every row's window at the shared physical offset, so a sub-max row
+/// keeps an inflated relative RoPE distance no mask can repair); restore the
+/// full-stream assertion here when #203 lands. When a run stays lockstep
+/// throughout, this gate degenerates to the full strict assertion.
+///
+/// Gated `#[ignore]` (real-model heavy: loads the Gemma-4-31B target + bf16
+/// drafter); runs in the CI hardware lane.
+#[test]
+#[ignore = "real-model heavy (Gemma-4-31B target + drafter, ragged B=4 batched run); CI hardware lane only"]
+fn greedy_parity_mtp_gemma4_batched_b4_ragged_matches_b1() {
+    use mlxcel::models::gemma4_mtp_target::{
+        Gemma4MtpBatchedTargetAdapter, Gemma4MtpTargetAdapter,
+    };
+    use mlxcel::{LoadedModel, initialize_runtime, load_model};
+    use mlxcel_core::drafter::{DrafterKind, load_drafter};
+    use mlxcel_core::generate::SamplingConfig;
+    use mlxcel_core::speculative::mtp::{MtpBatchedGenerator, MtpGenerator};
+
+    let pairing = &REACHABLE_PAIRINGS[1];
+    let (target_path, draft_path, present) = pairing_present(pairing);
+    if !present {
+        eprintln!(
+            "Skipping {} (ragged B=4): target={:?} draft={:?}",
+            pairing.name, target_path, draft_path,
+        );
+        return;
+    }
+
+    let _runtime = initialize_runtime();
+    mlxcel_core::synchronize_default();
+    mlxcel_core::clear_memory_cache();
+
+    let (loaded_target, _tok) = load_model(&target_path).expect("target model must load");
+    let wrapper: &mlxcel::models::Gemma4Wrapper = match &loaded_target {
+        LoadedModel::Gemma4(w) => w,
+        LoadedModel::Gemma4VLM(vlm) => &vlm.text_model,
+        _ => panic!("MTP batched pairing requires a Gemma 4 family target"),
+    };
+
+    let block_size = pairing.block_size as usize;
+    let sampling = SamplingConfig::greedy();
+    let max_tokens = 24_usize;
+
+    // DIFFERENT-length prompts (lengths 6/7/9/12) so the batched adapter
+    // auto-routes to the ragged left-padding prefill. Same chat-template token
+    // style as the equal-length B=4 test, extended with distinct content ids.
+    let prompts: Vec<Vec<i32>> = vec![
+        vec![2, 105, 2364, 107, 9259, 108],
+        vec![2, 105, 2364, 107, 9259, 1596, 108],
+        vec![2, 105, 2364, 107, 9259, 1596, 6176, 3030, 108],
+        vec![
+            2, 105, 2364, 107, 9259, 1596, 6176, 3030, 4711, 1234, 5678, 108,
+        ],
+    ];
+
+    // ---- B = 1 reference runs (one per row, unique SequenceId) ----
+    let mut reference: Vec<Vec<i32>> = Vec::with_capacity(prompts.len());
+    for (row, prompt) in prompts.iter().enumerate() {
+        let seq_id = mlxcel_core::cache::SequenceId::from_raw(2000 + row as u64);
+        let adapter = Gemma4MtpTargetAdapter::new(wrapper, Some(seq_id));
+        let (mut drafter, kind) =
+            load_drafter(&draft_path, Some(DrafterKind::Mtp)).expect("MTP drafter must load");
+        assert_eq!(kind, DrafterKind::Mtp);
+        drafter
+            .bind(wrapper as &dyn mlxcel_core::generate::LanguageModel)
+            .expect("drafter bind");
+        let mut generator = MtpGenerator::new(adapter, drafter, block_size);
+        let no_cancel = std::sync::atomic::AtomicBool::new(false);
+        let logprobs_config = mlxcel_core::sampling::LogprobsConfig::default();
+        let (tokens, _logprobs, _stats) = generator.generate(
+            prompt,
+            max_tokens,
+            &sampling,
+            &[],
+            &no_cancel,
+            &logprobs_config,
+        );
+        eprintln!(
+            "[ragged B=4] B=1 reference row {row} (prompt_len={}): {} tokens",
+            prompt.len(),
+            tokens.len()
+        );
+        reference.push(tokens);
+    }
+
+    // ---- ragged B = 4 batched run ----
+    let batch_adapter = Gemma4MtpBatchedTargetAdapter::new(wrapper, prompts.len());
+    let (mut batched_drafter, _kind) = load_drafter(&draft_path, Some(DrafterKind::Mtp))
+        .expect("MTP drafter must load for the batched run");
+    batched_drafter
+        .bind(wrapper as &dyn mlxcel_core::generate::LanguageModel)
+        .expect("batched drafter bind");
+    let mut batched_generator =
+        MtpBatchedGenerator::new(batch_adapter, batched_drafter, block_size);
+    let run = batched_generator
+        .run_batched(&prompts, &sampling, max_tokens)
+        .expect("ragged batched MTP run must succeed");
+
+    // ---- Lockstep-prefix byte-equality assertions (per row) ----
+    //
+    // Full-stream parity after a divergent (mixed-accept) round is not
+    // structurally guaranteed today (issue #203: per-row position holes;
+    // observed on M1 Ultra, where the strict equal-length gate is red on main
+    // too). What #163 makes exact is the lockstep prefix: the prefill bonus
+    // plus every round up to (excluding) the row's first sub-max round.
+    assert_eq!(
+        run.tokens.len(),
+        reference.len(),
+        "ragged batched run must produce one token stream per row"
+    );
+    let batch = run.tokens.len();
+    let rounds = run.accept_lens.iter().map(Vec::len).max().unwrap_or(0);
+    // lockstep_len[r] = 1 (prefill bonus) + sum of (accept + 1) over rounds
+    // in which row r accepted the round max, stopping at its first sub-max
+    // round (the hole never heals, so the prefix is frozen there).
+    let mut lockstep_len: Vec<usize> = vec![1; batch];
+    let mut holed: Vec<bool> = vec![false; batch];
+    for j in 0..rounds {
+        let round_max = (0..batch)
+            .filter_map(|r| run.accept_lens[r].get(j).copied())
+            .max()
+            .unwrap_or(0);
+        for r in 0..batch {
+            if holed[r] {
+                continue;
+            }
+            match run.accept_lens[r].get(j).copied() {
+                Some(a) if a == round_max => lockstep_len[r] += a as usize + 1,
+                Some(_) => holed[r] = true,
+                None => {}
+            }
+        }
+    }
+    for row in 0..batch {
+        let batched_row = &run.tokens[row];
+        let reference_row = &reference[row];
+        assert!(
+            !batched_row.is_empty(),
+            "row {row}: ragged batched run emitted no tokens"
+        );
+        // The prefill bonus comes from a uniform-phase forward and doubles as
+        // the NaN canary: a NaN-poisoned ragged prefill (pre-#163 main on M1
+        // Ultra) degenerates it to token id 0 instead of the B = 1 token.
+        assert_eq!(
+            batched_row[0], reference_row[0],
+            "row {row} prefill bonus: ragged B=4 ({}) != B=1 isolated ({}); \
+             NaN-safe ragged prefill regression",
+            batched_row[0], reference_row[0],
+        );
+        let k = lockstep_len[row]
+            .min(batched_row.len())
+            .min(reference_row.len());
+        for i in 0..k {
+            assert_eq!(
+                batched_row[i], reference_row[i],
+                "row {row} token {i} (lockstep prefix {k}): ragged B=4 ({}) != \
+                 B=1 isolated ({}); greedy-parity violation inside the \
+                 hole-free lockstep region",
+                batched_row[i], reference_row[i],
+            );
+        }
+        eprintln!(
+            "[ragged B=4] row {row}: lockstep prefix {k}/{} tokens byte-identical (accept_lens {:?})",
+            batched_row.len(),
+            run.accept_lens[row],
+        );
+    }
+    eprintln!(
+        "[ragged B=4] PASS: all {batch} variable-length rows byte-identical to their \
+         B=1 isolated bursts over the hole-free lockstep prefix (#203 tracks full-stream)"
+    );
+}
+
+/// Throughput study plumbing for the issue #163 default-on evaluation (item 4).
+/// Measures, on the real 31B, (a) serial B=1 over variable-length prompts, (b)
+/// one ragged B=4 batched run over the same prompts, and (c) a classic
+/// equal-length control (B=4 batched and serial B=1) for the same-length
+/// speedup reference. Prints tok/s for each leg plus the ragged/serial and
+/// classic/serial ratios; asserts only run success. The orchestrator runs this
+/// on local hardware and records the study in the PR / issue. Changes no
+/// defaults or env-var semantics.
+#[test]
+#[ignore = "real-model heavy throughput probe; run manually with --nocapture"]
+fn mtp_gemma4_ragged_throughput_probe() {
+    use mlxcel::models::gemma4_mtp_target::{
+        Gemma4MtpBatchedTargetAdapter, Gemma4MtpTargetAdapter,
+    };
+    use mlxcel::{LoadedModel, initialize_runtime, load_model};
+    use mlxcel_core::drafter::{DrafterKind, load_drafter};
+    use mlxcel_core::generate::{LanguageModel, SamplingConfig};
+    use mlxcel_core::speculative::mtp::{MtpBatchedGenerator, MtpGenerator};
+    use std::time::Instant;
+
+    let pairing = &REACHABLE_PAIRINGS[1];
+    let (target_path, draft_path, present) = pairing_present(pairing);
+    if !present {
+        eprintln!(
+            "Skipping {} (throughput probe): target={:?} draft={:?}",
+            pairing.name, target_path, draft_path,
+        );
+        return;
+    }
+
+    let _runtime = initialize_runtime();
+    mlxcel_core::synchronize_default();
+    mlxcel_core::clear_memory_cache();
+
+    let (loaded_target, _tok) = load_model(&target_path).expect("target model must load");
+    let wrapper: &mlxcel::models::Gemma4Wrapper = match &loaded_target {
+        LoadedModel::Gemma4(w) => w,
+        LoadedModel::Gemma4VLM(vlm) => &vlm.text_model,
+        _ => panic!("MTP batched pairing requires a Gemma 4 family target"),
+    };
+
+    let block_size = pairing.block_size as usize;
+    let sampling = SamplingConfig::greedy();
+    let max_tokens = 48_usize;
+
+    // Variable-length prompts (6/8/10/12) for the ragged-vs-serial comparison.
+    let ragged_prompts: Vec<Vec<i32>> = vec![
+        vec![2, 105, 2364, 107, 9259, 108],
+        vec![2, 105, 2364, 107, 9259, 1596, 6176, 108],
+        vec![2, 105, 2364, 107, 9259, 1596, 6176, 3030, 4711, 108],
+        vec![
+            2, 105, 2364, 107, 9259, 1596, 6176, 3030, 4711, 1234, 5678, 108,
+        ],
+    ];
+    // Equal-length control prompts (all length 8) for the classic same-length
+    // batched-vs-serial speedup reference.
+    let classic_prompts: Vec<Vec<i32>> = vec![
+        vec![2, 105, 2364, 107, 9259, 1596, 6176, 108],
+        vec![2, 105, 2364, 107, 1596, 6176, 3030, 108],
+        vec![2, 105, 2364, 107, 6176, 3030, 4711, 108],
+        vec![2, 105, 2364, 107, 3030, 4711, 1234, 108],
+    ];
+
+    let no_cancel = std::sync::atomic::AtomicBool::new(false);
+    let logprobs_config = mlxcel_core::sampling::LogprobsConfig::default();
+
+    // Serial B=1 over a prompt set; returns (total_generated_tokens, seconds).
+    let serial_b1 = |prompts: &[Vec<i32>], seq_base: u64| -> (usize, f64) {
+        let start = Instant::now();
+        let mut total = 0_usize;
+        for (row, prompt) in prompts.iter().enumerate() {
+            let seq_id = mlxcel_core::cache::SequenceId::from_raw(seq_base + row as u64);
+            let adapter = Gemma4MtpTargetAdapter::new(wrapper, Some(seq_id));
+            let (mut drafter, _kind) =
+                load_drafter(&draft_path, Some(DrafterKind::Mtp)).expect("MTP drafter must load");
+            drafter
+                .bind(wrapper as &dyn LanguageModel)
+                .expect("drafter bind");
+            let mut generator = MtpGenerator::new(adapter, drafter, block_size);
+            let (tokens, _lp, _stats) = generator.generate(
+                prompt,
+                max_tokens,
+                &sampling,
+                &[],
+                &no_cancel,
+                &logprobs_config,
+            );
+            total += tokens.len();
+        }
+        (total, start.elapsed().as_secs_f64())
+    };
+
+    // Batched B=4 over a prompt set; returns (total_generated_tokens, seconds).
+    let batched_b4 = |prompts: &[Vec<i32>]| -> (usize, f64) {
+        let batch_adapter = Gemma4MtpBatchedTargetAdapter::new(wrapper, prompts.len());
+        let (mut batched_drafter, _kind) =
+            load_drafter(&draft_path, Some(DrafterKind::Mtp)).expect("MTP drafter must load");
+        batched_drafter
+            .bind(wrapper as &dyn LanguageModel)
+            .expect("batched drafter bind");
+        let mut generator = MtpBatchedGenerator::new(batch_adapter, batched_drafter, block_size);
+        let start = Instant::now();
+        let run = generator
+            .run_batched(prompts, &sampling, max_tokens)
+            .expect("batched MTP run must succeed");
+        let total: usize = run.tokens.iter().map(Vec::len).sum();
+        (total, start.elapsed().as_secs_f64())
+    };
+
+    let eps = f64::EPSILON;
+    // (a) serial B=1 baseline over the variable-length prompts.
+    let (serial_tokens, serial_secs) = serial_b1(&ragged_prompts, 3000);
+    let serial_tps = serial_tokens as f64 / serial_secs.max(eps);
+    // (b) ragged B=4 over the same variable-length prompts.
+    let (ragged_tokens, ragged_secs) = batched_b4(&ragged_prompts);
+    let ragged_tps = ragged_tokens as f64 / ragged_secs.max(eps);
+    // (c) classic equal-length control: B=4 batched and serial B=1.
+    let (classic_b4_tokens, classic_b4_secs) = batched_b4(&classic_prompts);
+    let classic_b4_tps = classic_b4_tokens as f64 / classic_b4_secs.max(eps);
+    let (classic_serial_tokens, classic_serial_secs) = serial_b1(&classic_prompts, 4000);
+    let classic_serial_tps = classic_serial_tokens as f64 / classic_serial_secs.max(eps);
+
+    eprintln!("[throughput] === Gemma 4 31B MTP ragged throughput probe ===");
+    eprintln!(
+        "[throughput] (a) serial B=1 (variable len): {serial_tokens} toks / {serial_secs:.3}s = {serial_tps:.1} tok/s",
+    );
+    eprintln!(
+        "[throughput] (b) ragged B=4 (variable len): {ragged_tokens} toks / {ragged_secs:.3}s = {ragged_tps:.1} tok/s",
+    );
+    eprintln!(
+        "[throughput] (c) classic B=4 (equal len):   {classic_b4_tokens} toks / {classic_b4_secs:.3}s = {classic_b4_tps:.1} tok/s",
+    );
+    eprintln!(
+        "[throughput] (c) classic serial B=1 (equal len): {classic_serial_tokens} toks / {classic_serial_secs:.3}s = {classic_serial_tps:.1} tok/s",
+    );
+    eprintln!(
+        "[throughput] ratio ragged/serial = {:.3}x; classic B=4/serial = {:.3}x",
+        ragged_tps / serial_tps.max(eps),
+        classic_b4_tps / classic_serial_tps.max(eps),
+    );
+}
+
 /// Sanity that the test discovery against `models/` finds at least one of
 /// the reachable pairings on hosts that have downloaded the checkpoints,
 /// and cleanly skips with a log line on hosts that have not.
