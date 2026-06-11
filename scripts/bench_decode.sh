@@ -54,7 +54,12 @@ NO_CHAT_TEMPLATE=0
 OUTPUT=""
 SUFFIX=""
 DATE=$(date '+%Y-%m-%d')
-MLX_VERSION="0.31.2"
+# Version recorded in the CSV `mlx_version` column. This is the MLXCEL
+# version from Cargo.toml (the /update-benchmarks staleness check compares
+# this column against Cargo.toml); it was a stale hardcoded "0.31.2" until
+# 2026-06-12.
+MLX_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+[[ -n "$MLX_VERSION" ]] || MLX_VERSION="unknown"
 BUILD_TYPE="release"
 
 # Thermal cooldown between models. Defaults to 0 to preserve existing
@@ -63,6 +68,14 @@ BUILD_TYPE="release"
 # during long all-model runs.
 COOLDOWN_SECS=0
 BIG_MODEL_COOLDOWN_SECS=0
+# Pre-warm before `all` sweeps (default ON). The first sweep right after a
+# fresh binary build measures early models up to 2x slow: GPU pipeline
+# caches are cold and the machine is still hot from compiling. The pre-warm
+# runs one small throwaway generation (compiles shared kernels) and then
+# settles for PRE_WARM_SETTLE_SECS so thermals recover before the first
+# measured model. Disable with --no-pre-warm for intentionally cold runs.
+PRE_WARM=1
+PRE_WARM_SETTLE_SECS=30
 # Models whose total weight bytes exceed this threshold get an additional
 # BIG_MODEL_COOLDOWN_SECS pause after running.
 BIG_MODEL_THRESHOLD_BYTES=$((10 * 1024 * 1024 * 1024))
@@ -203,6 +216,13 @@ Options:
                       after a "big" model is COOLDOWN + BIG_COOLDOWN.
   --big-threshold-gb N  Size in GB that triggers --big-cooldown
                         (default: 10).
+  --no-pre-warm       Skip the pre-warm pass before an `all` sweep. The
+                      pre-warm runs one small throwaway generation and then
+                      settles for --pre-warm-settle seconds, so that cold GPU
+                      pipeline caches and post-build thermals do not depress
+                      the first measured models (observed up to 2x slow on
+                      the first sweep after a fresh build, 2026-06-12).
+  --pre-warm-settle N Settle sleep after the pre-warm pass (default: 30)
   --no-cooldown       Force --cooldown=0 and --big-cooldown=0, overriding
                       any earlier values on the same command line.
   --help              Show this help
@@ -381,6 +401,8 @@ while [[ $# -gt 0 ]]; do
                       BIG_MODEL_THRESHOLD_BYTES=$(( $2 * 1024 * 1024 * 1024 ))
                       shift 2 ;;
     --no-cooldown)    COOLDOWN_SECS=0; BIG_MODEL_COOLDOWN_SECS=0; shift ;;
+    --no-pre-warm)    PRE_WARM=0; shift ;;
+    --pre-warm-settle) PRE_WARM_SETTLE_SECS="$2"; shift 2 ;;
     --help)           usage; exit 0 ;;
     -*)               echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
     *)                MODEL_ARG="$1"; shift ;;
@@ -451,11 +473,15 @@ is_gpu_crash_model() {
 # Run
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
-# CUDA JIT preheat: on first run after build, CUDA JIT-compiles many kernels
-# (binary ops, reduce, etc.) which can take 3-8 minutes per model. Run one
-# small model first so shared kernels are cached before the benchmark loop.
+# Pre-warm before `all` sweeps: on the first run after a build the shared
+# kernels are not cached yet (CUDA JIT-compiles for 3-8 minutes per model;
+# Metal compiles pipeline variants on first dispatch) and the machine is
+# still hot from compiling, which measured up to 2x slow on the first
+# models of a fresh sweep (2026-06-12 M1 Ultra refresh). Run one small
+# throwaway generation so shared kernels are cached, then settle so
+# thermals recover before the first measured model. --no-pre-warm skips.
 # ---------------------------------------------------------------------------
-if [[ "$BACKEND" == "cuda" && "$MODEL_ARG" == "all" ]]; then
+if [[ "$PRE_WARM" == "1" && "$MODEL_ARG" == "all" ]]; then
   # Find a small model to preheat with
   preheat_model=""
   for candidate in smollm-135m-4bit ernie-4.5-0.3b-4bit qwen2.5-0.5b-bf16; do
@@ -465,13 +491,21 @@ if [[ "$BACKEND" == "cuda" && "$MODEL_ARG" == "all" ]]; then
     fi
   done
   if [[ -n "$preheat_model" ]]; then
-    >&2 echo "=== CUDA JIT preheat: $(basename "$preheat_model") ==="
-    >&2 echo "    First run compiles CUDA JIT kernels (may take several minutes)..."
+    >&2 echo "=== Pre-warm: $(basename "$preheat_model") ==="
+    if [[ "$BACKEND" == "cuda" ]]; then
+      >&2 echo "    First run compiles CUDA JIT kernels (may take several minutes)..."
+    else
+      >&2 echo "    Warming shared GPU pipeline caches..."
+    fi
     if timeout "$JIT_PREHEAT_TIMEOUT" "$MLXCEL" generate \
         -m "$preheat_model" -p "Hello" -n 5 --profile >/dev/null 2>&1; then
-      >&2 echo "    JIT preheat complete."
+      >&2 echo "    Pre-warm complete."
     else
-      >&2 echo "    JIT preheat failed (non-fatal, continuing)."
+      >&2 echo "    Pre-warm failed (non-fatal, continuing)."
+    fi
+    if [[ "$PRE_WARM_SETTLE_SECS" -gt 0 ]]; then
+      >&2 echo "    Settling for ${PRE_WARM_SETTLE_SECS}s (thermal recovery)..."
+      sleep "$PRE_WARM_SETTLE_SECS"
     fi
     >&2 echo ""
   fi
