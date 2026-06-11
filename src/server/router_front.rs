@@ -365,6 +365,7 @@ async fn route_chat(state: Arc<RouterState>, request: ChatCompletionRequest) -> 
         let request_id_str2 = request_id_str.clone();
         let model = request.model.clone();
         let handoff_timeout = state.handoff_timeout;
+        let max_tokens = opts.max_tokens;
 
         let mut filter = stream_filter;
         tokio::spawn(async move {
@@ -391,11 +392,16 @@ async fn route_chat(state: Arc<RouterState>, request: ChatCompletionRequest) -> 
                 }
             };
 
-            let result =
-                drive_handoff_result(&mut { rx }, &request_id_str2, handoff_timeout, |text| {
+            let result = drive_handoff_result(
+                &mut { rx },
+                &request_id_str2,
+                handoff_timeout,
+                max_tokens,
+                |text| {
                     emit_filtered(filter.feed(text));
-                })
-                .await;
+                },
+            )
+            .await;
 
             // Flush any text still buffered inside the filter (e.g. an
             // unterminated partial delimiter match at end of stream).
@@ -433,9 +439,15 @@ async fn route_chat(state: Arc<RouterState>, request: ChatCompletionRequest) -> 
                     content.push_str(&c);
                 }
             };
-            let r = drive_handoff_result(&mut rx, &request_id_str, state.handoff_timeout, |text| {
-                absorb(filter.feed(text));
-            })
+            let r = drive_handoff_result(
+                &mut rx,
+                &request_id_str,
+                state.handoff_timeout,
+                opts.max_tokens,
+                |text| {
+                    absorb(filter.feed(text));
+                },
+            )
             .await;
             absorb(filter.flush());
             state.pending.lock().unwrap().remove(&request_id);
@@ -463,6 +475,7 @@ async fn drive_handoff_result(
     rx: &mut UnboundedReceiver<ResultFrame>,
     request_id_str: &str,
     handoff_timeout: Duration,
+    max_tokens: usize,
     mut on_token: impl FnMut(&str),
 ) -> Result<()> {
     let bridge = StreamBridge::new(request_id_str.to_string(), handoff_timeout);
@@ -493,32 +506,64 @@ async fn drive_handoff_result(
         return Ok(());
     }
 
-    // Transition to the decode phase and wait for the continuation.
+    // Transition to the decode phase and consume the incrementally streamed
+    // continuation frames (issue #199) until the terminal `done` frame. The
+    // timeout applies per frame, so long generations keep streaming as long
+    // as the decode node makes progress.
     bridge
         .start_decode_stream()
         .map_err(|e| anyhow::anyhow!("stream bridge: {e}"))?;
 
-    let cont = tokio::time::timeout(handoff_timeout, rx.recv())
-        .await
-        .map_err(|_| anyhow::anyhow!("timed out waiting for the decode continuation"))?
-        .ok_or_else(|| anyhow::anyhow!("decode result channel closed before continuation"))?;
-
-    if let Some(e) = cont.error {
-        anyhow::bail!("decode node error: {e}");
-    }
     let mut seq: u64 = 1;
-    for text in &cont.tokens {
-        bridge
-            .submit_decode_token(&TokenEvent {
-                token_id: 0,
-                text: text.clone(),
-                sequence_number: seq,
-                source: TokenSource::Decode,
-                is_final: false,
-            })
-            .map_err(|e| anyhow::anyhow!("stream bridge: {e}"))?;
-        on_token(text);
-        seq += 1;
+    loop {
+        let cont = tokio::time::timeout(handoff_timeout, rx.recv())
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting for the decode continuation"))?
+            .ok_or_else(|| anyhow::anyhow!("decode result channel closed before continuation"))?;
+
+        if let Some(e) = cont.error {
+            anyhow::bail!("decode node error: {e}");
+        }
+        // The router set the request's token budget itself; do not trust the
+        // remote `done` flag to terminate the stream. A decode node that
+        // exceeds the budget (buggy or hostile) is cut off here, which also
+        // bounds the total frame count and, with the per-frame timeout, the
+        // total wall-clock time per request.
+        if seq as usize > max_tokens {
+            anyhow::bail!(
+                "decode node exceeded the request token budget ({max_tokens}) without \
+                 a terminal frame"
+            );
+        }
+        // Wire-level ordering check: a non-zero `start_sequence` must match
+        // the next expected position (frames could in principle reorder
+        // across pooled transport connections). This is a liveness and
+        // debugging aid against benign loss or reordering, NOT a tamper
+        // defense: the transport is unauthenticated and the disaggregated
+        // deployment model assumes a trusted network segment.
+        if cont.start_sequence != 0 && cont.start_sequence != seq {
+            anyhow::bail!(
+                "decode continuation frame out of order: expected sequence {seq}, \
+                 got {}",
+                cont.start_sequence
+            );
+        }
+        for text in &cont.tokens {
+            bridge
+                .submit_decode_token(&TokenEvent {
+                    token_id: 0,
+                    text: text.clone(),
+                    sequence_number: seq,
+                    source: TokenSource::Decode,
+                    is_final: false,
+                })
+                .map_err(|e| anyhow::anyhow!("stream bridge: {e}"))?;
+            on_token(text);
+            seq += 1;
+        }
+        if cont.done {
+            break;
+        }
     }
     bridge.finalize();
     Ok(())
