@@ -529,6 +529,19 @@ pub(crate) struct SamplingOptions {
     pub(crate) seed: Option<u64>,
 }
 
+/// Clap value parser: an f32 in the closed interval [0, 1].
+///
+/// Used by: `--diffusion-threshold` (fail fast at startup instead of
+/// surfacing a per-request engine error under the confidence sampler).
+fn parse_unit_interval(s: &str) -> Result<f32, String> {
+    let v: f32 = s.parse().map_err(|e| format!("not a number: {e}"))?;
+    if (0.0..=1.0).contains(&v) {
+        Ok(v)
+    } else {
+        Err(format!("must be between 0 and 1, got {v}"))
+    }
+}
+
 /// Block-diffusion generation options.
 ///
 /// These flags only affect diffusion models (e.g. DiffusionGemma); ordinary
@@ -555,7 +568,8 @@ pub(crate) struct DiffusionCliOptions {
     #[arg(
         long = "diffusion-threshold",
         value_name = "FLOAT",
-        default_value_t = 0.9
+        default_value_t = 0.9,
+        value_parser = parse_unit_interval
     )]
     pub(crate) diffusion_threshold: f32,
 
@@ -1538,6 +1552,61 @@ pub(crate) struct ServeArgs {
     #[cfg(feature = "surgery")]
     #[arg(long = "surgery", value_name = "FILE", env = "MLXCEL_SURGERY")]
     pub(crate) surgery: Option<PathBuf>,
+
+    // Block-diffusion serve-level flag group (--max-denoising-steps,
+    // --diffusion-sampler, --diffusion-threshold). Only affects diffusion
+    // models such as DiffusionGemma; autoregressive models ignore it. The flags
+    // set the per-request diffusion defaults for the single-stream worker loop.
+    #[command(flatten)]
+    pub(crate) diffusion: DiffusionServeOptions,
+}
+
+/// Serve-level block-diffusion options.
+///
+/// A focused subset of [`DiffusionCliOptions`] exposing only the knobs that
+/// the single-stream diffusion serving loop honors per request
+/// (`--diffusion-sampler`, `--diffusion-threshold`, `--max-denoising-steps`).
+/// They only affect diffusion models (e.g. DiffusionGemma); ordinary
+/// autoregressive models ignore them. Canvas-shaping flags from the generate
+/// CLI are intentionally not exposed in serve mode.
+#[derive(Args, Debug)]
+#[command(next_help_heading = "Diffusion Options")]
+pub(crate) struct DiffusionServeOptions {
+    /// Maximum denoising steps per canvas block (diffusion models only;
+    /// default: the checkpoint's generation_config, typically 48)
+    #[arg(long = "max-denoising-steps", value_name = "N")]
+    pub(crate) max_denoising_steps: Option<usize>,
+
+    /// Per-step acceptance sampler for diffusion models
+    #[arg(
+        long = "diffusion-sampler",
+        value_name = "SAMPLER",
+        default_value = "entropy-bound",
+        value_parser = ["entropy-bound", "confidence-threshold"]
+    )]
+    pub(crate) diffusion_sampler: String,
+
+    /// Confidence threshold for `--diffusion-sampler confidence-threshold`
+    /// (diffusion models only)
+    #[arg(
+        long = "diffusion-threshold",
+        value_name = "FLOAT",
+        default_value_t = 0.9,
+        value_parser = parse_unit_interval
+    )]
+    pub(crate) diffusion_threshold: f32,
+}
+
+// Manual `Default` kept in lock-step with the `#[arg(default_value*)]`
+// attributes above, same contract as the other serve option groups.
+impl Default for DiffusionServeOptions {
+    fn default() -> Self {
+        Self {
+            max_denoising_steps: None,
+            diffusion_sampler: "entropy-bound".to_string(),
+            diffusion_threshold: 0.9,
+        }
+    }
 }
 
 fn main() -> anyhow::Result<()> {
