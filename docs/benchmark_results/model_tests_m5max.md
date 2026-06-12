@@ -10,7 +10,7 @@ Compatibility and performance testing for mlxcel models on **MacBook Pro M5 Max 
 | **OS** | macOS 26.4 (Tahoe) |
 | **mlxcel version** | 0.1.0 |
 | **MLX version** | 0.31.2 (via mlxcel-core; pinned commit `84961223`) |
-| **mlx-lm baseline** | 0.31.3 (dev checkout `references/mlx-lm`, commit `ed1fca4`) |
+| **mlx-lm baseline** | 0.31.3 (dev checkout https://github.com/ml-explore/mlx-lm, commit `ed1fca4`) |
 | **mlx-vlm baseline** | 0.4.4 |
 | **Test Prompt** | "Hello, how are you today?" (text) / "What is in this image?" (VLM) |
 | **Max Tokens** | 100 |
@@ -240,7 +240,7 @@ All entries use the VLM prompt 'What is in this image?' with
 Source CSVs (same M5 Max host, mlxcel 0.0.28 with `--cooldown 15 --big-cooldown 15`):
 
 - mlxcel: `benchmarks/metal_m5max_2026-05-19.csv`
-- mlx-lm: `benchmarks/pylm_m5max_2026-05-18.csv` (mlx-lm 0.31.3 dev checkout in `references/mlx-lm`)
+- mlx-lm: `benchmarks/pylm_m5max_2026-05-18.csv` (mlx-lm 0.31.3 dev checkout in https://github.com/ml-explore/mlx-lm)
 - mlxcel VLM: `benchmarks/metal_m5max_vlm_2026-05-19.csv`, `benchmarks/metal_m5max_vlm_2026-05-20.csv` (Gemma3n VLM entries)
 - mlx-vlm: `benchmarks/pylm_m5max_vlm_2026-05-18.csv` (mlx-vlm 0.4.4)
 
@@ -714,7 +714,7 @@ per-token per-simdgroup scan (4–8× fewer scans on M5 Max for D=128 / D=256).
 
 #### Post- TurboQuant+ delegated FP16 working-set experiment (4K)
 
-Follow-up on 2026-05-07 after comparing `references/turboquant_plus`: the MLX
+Follow-up on 2026-05-07 after comparing `turboquant_plus`: the MLX
 delegated KVCache keeps FP16 K/V in an internal native cache and routes decode
 through native SDPA, while packed storage is compacted outside the hot path.
 mlxcel now has an opt-in analogue via
