@@ -1217,10 +1217,10 @@ fn trim_to_logical_start_empties_the_layer() {
 
 #[test]
 fn write_prefill_presizes_pool_in_one_step_for_multi_chunk_span() {
-    // 100 blocks of 4 slots = 400 tokens, spanning four 32-block grow chunks.
-    // presize_for_span must allocate the layer pool once at ceil(100/32)*32 =
-    // 128 rows instead of growing 32 -> 64 -> 96 -> 128 with a full slab copy
-    // at each step.
+    // 100 blocks of 4 slots = 400 tokens, spanning four 32-row slabs.
+    // presize_for_span must create the layer pool in one step at
+    // ceil(100/32)*32 = 128 rows (four slabs) instead of growing through
+    // intermediate capacities.
     let block_size = 4usize;
     let total = 400i32;
     let mut pool = fp16_pool(block_size, 1);
@@ -1240,10 +1240,10 @@ fn write_prefill_presizes_pool_in_one_step_for_multi_chunk_span() {
     let expected_bytes = 2 * expected_capacity_rows * block_size * (H as usize) * (D as usize) * 4;
     assert_eq!(pool.pool_tensor_bytes(), expected_bytes);
 
-    // The regression #224 fixes: presize allocates the pool at the final size
-    // directly, so NO slab-copy growth happened. The old incremental path
-    // converged to the same 128 rows via three grow_pool reallocations, so
-    // this assertion (not the final capacity above) is what pins presize.
+    // The regression #224 fixed: presize allocates the pool at the final
+    // size directly, so NO growth episode happened. The old incremental path
+    // converged to the same 128 rows via three growth steps, so this
+    // assertion (not the final capacity above) is what pins presize.
     assert_eq!(pool.pool_grow_events(), 0);
 
     // Round-trip stays byte-identical to the dense reference.
@@ -1260,8 +1260,8 @@ fn write_prefill_presizes_pool_in_one_step_for_multi_chunk_span() {
 #[test]
 fn write_prefill_after_presize_grows_incrementally_and_round_trips() {
     // First prefill presizes to 32 rows (8 blocks used). A second prefill
-    // pushing past the presized capacity must take the grow_pool path (now
-    // with eager eval) and stay byte-identical.
+    // pushing past the presized capacity must take the growth path
+    // (ensure_layer_capacity appending a slab) and stay byte-identical.
     let block_size = 4usize;
     let first = 32i32; // 8 blocks
     let second = 160i32; // 40 more blocks -> 48 total, beyond the 32-row chunk
@@ -1280,7 +1280,7 @@ fn write_prefill_after_presize_grows_incrementally_and_round_trips() {
     assert_eq!(state.layer(0).unwrap().len, (first + second) as usize);
 
     // The second span needed 40 more rows past the presized 32: exactly one
-    // grow_pool reallocation (32 -> 64), not one per 32-row chunk.
+    // growth episode (one ensure_layer_capacity call appending slabs).
     assert_eq!(pool.pool_grow_events(), 1);
 
     let total = first + second;
@@ -1308,4 +1308,114 @@ fn write_prefill_after_presize_grows_incrementally_and_round_trips() {
     );
     assert_eq!(flatten_fp32(&gk), flatten_fp32(&dense_k));
     assert_eq!(flatten_fp32(&gv), flatten_fp32(&dense_v));
+}
+
+// ---------------------------------------------------------------------------
+// 13. Chunked slabs (#235): growth appends slabs without copying, and gather
+//     stays byte-identical when a block table crosses slabs non-monotonically.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn slab_growth_appends_without_copy_and_fragmented_gather_round_trips() {
+    let block_size = 4usize;
+    let mut pool = fp16_pool(block_size, 1);
+
+    // A: 40 blocks (160 tokens) -> rows 0..39, spanning two 32-row slabs.
+    let mut state_a = PagedSequenceState::new(pool.layout());
+    let a_tokens = 160i32;
+    pool.write_prefill(
+        &mut state_a,
+        0,
+        &make_block(100.0, a_tokens),
+        &make_block(500.0, a_tokens),
+    )
+    .unwrap();
+    let bytes_two_slabs = pool.pool_tensor_bytes();
+    assert_eq!(
+        pool.pool_grow_events(),
+        0,
+        "the presized first prefill creates slabs; creation is not growth"
+    );
+
+    // B: 26 more blocks push past the presized 64-row capacity (40 + 26 = 66)
+    // and need a third slab. Exactly one growth episode and exactly one
+    // slab's worth of new bytes per side (no copy, no ladder).
+    let mut state_b = PagedSequenceState::new(pool.layout());
+    let b_tokens = 104i32;
+    pool.write_prefill(
+        &mut state_b,
+        0,
+        &make_block(200.0, b_tokens),
+        &make_block(600.0, b_tokens),
+    )
+    .unwrap();
+    let slab_bytes_per_side = 32 * block_size * (H as usize) * (D as usize) * 4;
+    assert_eq!(pool.pool_grow_events(), 1);
+    assert_eq!(
+        pool.pool_tensor_bytes(),
+        bytes_two_slabs + 2 * slab_bytes_per_side,
+        "growth must append exactly one slab per side"
+    );
+
+    // D: 6 more blocks (rows 66..71) so two release batches can interleave.
+    let mut state_d = PagedSequenceState::new(pool.layout());
+    pool.write_prefill(
+        &mut state_d,
+        0,
+        &make_block(400.0, 24),
+        &make_block(800.0, 24),
+    )
+    .unwrap();
+
+    // Release A then D: the free list ends with D's rows, so C's LIFO reuse
+    // starts in the THIRD slab (rows 66..71) and then drops back to row 0,
+    // crossing slab boundaries non-monotonically. The gather must split the
+    // row list into per-slab runs and still round-trip byte-identically.
+    pool.release_sequence(&mut state_a).unwrap();
+    pool.release_sequence(&mut state_d).unwrap();
+    let mut state_c = PagedSequenceState::new(pool.layout());
+    let c_tokens = 184i32;
+    pool.write_prefill(
+        &mut state_c,
+        0,
+        &make_block(300.0, c_tokens),
+        &make_block(700.0, c_tokens),
+    )
+    .unwrap();
+    {
+        let layer = state_c.layer(0).unwrap();
+        let rows: Vec<usize> = layer
+            .block_ids
+            .iter()
+            .map(|id| pool.debug_row_of(*id, 0).unwrap())
+            .collect();
+        assert!(
+            rows.windows(2).any(|w| w[0] > w[1]),
+            "C must reuse freed rows non-monotonically to exercise run splitting (rows: {rows:?})"
+        );
+        let crosses = rows.windows(2).any(|w| w[0] / 32 != w[1] / 32);
+        assert!(
+            crosses,
+            "C's rows must cross a slab boundary (rows: {rows:?})"
+        );
+    }
+
+    let (gk, gv) = pool
+        .gather_visible(&state_c, 0)
+        .unwrap()
+        .expect("gather must return data");
+    let dense_k = dense_reference(&[(make_block(300.0, c_tokens), 0)], c_tokens, 0, c_tokens);
+    let dense_v = dense_reference(&[(make_block(700.0, c_tokens), 0)], c_tokens, 0, c_tokens);
+    assert_eq!(flatten_fp32(&gk), flatten_fp32(&dense_k));
+    assert_eq!(flatten_fp32(&gv), flatten_fp32(&dense_v));
+
+    // B (rows spanning the second and third slabs) still round-trips too.
+    let (gk_b, gv_b) = pool
+        .gather_visible(&state_b, 0)
+        .unwrap()
+        .expect("gather must return data");
+    let dense_kb = dense_reference(&[(make_block(200.0, b_tokens), 0)], b_tokens, 0, b_tokens);
+    let dense_vb = dense_reference(&[(make_block(600.0, b_tokens), 0)], b_tokens, 0, b_tokens);
+    assert_eq!(flatten_fp32(&gk_b), flatten_fp32(&dense_kb));
+    assert_eq!(flatten_fp32(&gv_b), flatten_fp32(&dense_vb));
 }
