@@ -270,7 +270,7 @@ runtime comparison.
 
 ### Run-over-run (2026-06-12 vs 2026-05-28 mlxcel)
 
-The 2026-06-12 sweep is throughput-neutral within noise after the MLX a6ec712 bump: median -1.8% and mean -1.5% over 100 comparable text models, VLM median -1.1% over 41 models. Two singletons stand out: internvl3-1b (text path) improved from 228.8 to 339.1 tok/s (+48%), and molmo-7b (text path) regressed from 81.6 to 68.5 tok/s (-16%, confirmed across three runs).
+The 2026-06-12 sweep is throughput-neutral within noise after the MLX a6ec712 bump: median -1.8% and mean -1.5% over 100 comparable text models, VLM median -1.1% over 41 models. The two apparent singletons (internvl3-1b +48%, molmo-7b -16% vs the 05-28 table) were attributed by rebuilding and re-measuring at three code states (current main, the pre-bump commit e099821, and the 05-28-era v0.1.2 with the old MLX pin): all three reproduce today's values (molmo-7b 66-69 tok/s, internvl3-1b 337-344 tok/s), so the 05-28 documented baselines for those two models were single-run measurement artifacts, not real run-over-run changes. The 06-12 values in this document are the reproducible ones.
 
 ### Representative decode wins
 
@@ -285,7 +285,7 @@ The 2026-06-12 sweep is throughput-neutral within noise after the MLX a6ec712 bu
 | gemma-4-e2b-it-4bit (VLM) | 105.83 | 97.19 | **109%** |
 | phi-3.5-vision-4bit (VLM) | 118.68 | 92.53 | **128%** |
 
-internvl3-1b has no text-path Python baseline, but its 339.1 tok/s text decode is the single largest run-over-run gain of the 06-12 sweep (+48% vs 05-28).
+internvl3-1b has no text-path Python baseline; its 339.1 tok/s text decode is reproducible across the old and new MLX pins and the 05-28-era build, so the lower 05-28 table value was a measurement artifact rather than a since-fixed slowdown.
 
 ### Main optimization gaps
 
@@ -297,7 +297,7 @@ internvl3-1b has no text-path Python baseline, but its 339.1 tok/s text decode i
 | gemma-4-31b-4bit (VLM) | 15.73 | 20.30 | 77% | large VLM path |
 | gemma-3-4b-it-4bit (VLM) | 89.56 | 97.36 | 92% | measured with warmup=0; see VLM test conditions |
 
-molmo-7b (text path, no Python baseline) regressed from 81.6 to 68.5 tok/s in the 06-12 sweep (-16%, confirmed across three runs); its VLM path is unchanged (80.44 tok/s).
+molmo-7b (text path, no Python baseline) reads 68.5 tok/s in the 06-12 sweep, lower than the 81.6 recorded on 05-28; re-measurement on the 05-28-era v0.1.2 build also gives 66.2 tok/s, so the old table value was a single-run artifact and there is no actual regression. Its VLM path is unchanged (80.44 tok/s).
 
 ## Performance vs mlx-lm / mlx-vlm baseline (mlxcel 2026-06-12 vs pinned 2026-05-19 reference)
 
