@@ -461,6 +461,11 @@ pub struct PagedBlockPool {
     /// evicts against; the scheduler sets it from the configured / estimated KV
     /// byte budget divided by the per-block byte size.
     block_budget: Option<usize>,
+    /// Number of [`Self::grow_pool`] reallocations that actually grew a slab
+    /// (across all layers). Each one copies an entire layer tensor, so this is
+    /// the observable cost #224's presize exists to avoid; tests pin it and
+    /// observability can surface it.
+    grow_events: u64,
 }
 
 /// Number of physical block rows the pool tensor grows by when a freshly
@@ -494,7 +499,15 @@ impl PagedBlockPool {
             free_rows: vec![Vec::new(); num_layers],
             next_row: vec![0; num_layers],
             block_budget: None,
+            grow_events: 0,
         }
+    }
+
+    /// Number of slab-copy pool growths since construction (see
+    /// [`Self::grow_pool`]). A long prefill should presize instead of
+    /// accumulating these.
+    pub fn pool_grow_events(&self) -> u64 {
+        self.grow_events
     }
 
     pub fn layout(&self) -> &PagedKvLayout {
@@ -1175,6 +1188,22 @@ impl PagedBlockPool {
         // Walk every block the new tokens span and write its slice.
         let first_block = (first_abs / block_size) as usize;
         let last_block = ((last_abs - 1) / block_size) as usize;
+
+        // Size the layer's pool once for the whole span before any block
+        // write. Without this, assign_row grows the slab in
+        // POOL_GROW_CHUNK_BLOCKS steps and every step reallocates and copies
+        // the entire layer tensor, transiently holding each step's old+new
+        // slab pair in one lazy graph on long prefills (#224).
+        self.presize_for_span(
+            state,
+            layer_idx,
+            first_block,
+            last_block,
+            n_kv_heads,
+            head_dim,
+            k_dtype,
+        )?;
+
         for block_index in first_block..=last_block {
             let block_start_abs = block_index as i32 * block_size;
             let slot_start = (first_abs.max(block_start_abs) - block_start_abs) as usize;
@@ -1208,6 +1237,60 @@ impl PagedBlockPool {
             self.write_block(target_id, layer_idx, slot_start, &k_slice, &v_slice)?;
         }
         Ok(())
+    }
+
+    /// Ensure the layer's pool tensors can hold every span block in
+    /// `first_block..=last_block` of `state` without incremental growth.
+    ///
+    /// Counts the span blocks that still need a physical row, nets out the
+    /// reusable free rows, and either allocates the pool at the right size
+    /// (first write to the layer) or grows it once. [`Self::assign_row`]
+    /// keeps its grow fallback for rows minted outside the span (e.g. a
+    /// copy-on-write fork), so undershooting here stays correct.
+    #[allow(clippy::too_many_arguments)]
+    fn presize_for_span(
+        &mut self,
+        state: &PagedSequenceState,
+        layer_idx: usize,
+        first_block: usize,
+        last_block: usize,
+        n_kv_heads: i32,
+        head_dim: i32,
+        dtype: i32,
+    ) -> Result<(), String> {
+        let mut unassigned = 0usize;
+        for block_index in first_block..=last_block {
+            let block_id = state.layers[layer_idx].block_ids[block_index];
+            if !self.block_rows[layer_idx].contains_key(&block_id) {
+                unassigned += 1;
+            }
+        }
+        let minted = unassigned.saturating_sub(self.free_rows[layer_idx].len());
+        if minted == 0 {
+            return Ok(());
+        }
+        let target = self.next_row[layer_idx].saturating_add(minted);
+        match self.pool_meta[layer_idx] {
+            Some(meta) if target <= meta.capacity_blocks => Ok(()),
+            Some(_) => self.grow_pool(layer_idx, target),
+            None => {
+                let capacity = target
+                    .div_ceil(POOL_GROW_CHUNK_BLOCKS)
+                    .saturating_mul(POOL_GROW_CHUNK_BLOCKS)
+                    .max(POOL_GROW_CHUNK_BLOCKS);
+                let block_size = self.layout.block_size as i32;
+                let shape = [capacity as i32, block_size, n_kv_heads, head_dim];
+                self.pool_k[layer_idx] = Some(ffi::zeros(&shape, dtype));
+                self.pool_v[layer_idx] = Some(ffi::zeros(&shape, dtype));
+                self.pool_meta[layer_idx] = Some(PagedPoolMeta {
+                    n_kv_heads,
+                    head_dim,
+                    dtype,
+                    capacity_blocks: capacity,
+                });
+                Ok(())
+            }
+        }
     }
 
     /// Copy the current contents of `src_block_id` into a freshly acquired block
@@ -1628,6 +1711,22 @@ impl PagedBlockPool {
             capacity_blocks: new_capacity,
             ..meta
         });
+        self.grow_events += 1;
+        // Materialize the grown copies immediately. The old slabs then return
+        // to the MLX buffer cache before the next layer grows, so a
+        // multi-layer growth episode transiently holds one layer's old+new
+        // pair instead of accumulating every layer's pair in a single lazy
+        // graph (#224).
+        ffi::eval(
+            self.pool_k[layer_idx]
+                .as_ref()
+                .expect("pool_k present after grow"),
+        );
+        ffi::eval(
+            self.pool_v[layer_idx]
+                .as_ref()
+                .expect("pool_v present after grow"),
+        );
         Ok(())
     }
 
