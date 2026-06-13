@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [v0.2.1] - 2026-06-13
+
+### Added
+- **Exact-prefix prompt-cache snapshots now cover model-owned recurrent and mixed-cache families.** Mamba, Mamba2, Jamba, Nemotron-H, Qwen 3.5 / 3.6 text, MoE, and VLM wrappers can donate and restore same-session whole-prefix state instead of falling back to cold prefill (#241).
+- **Gemma 4 text, VLM, and Unified wrappers now donate and restore exact-prefix prompt-cache snapshots.** The snapshots preserve model-owned standard and rotating cache state; real `gemma-4-26b-a4b-it-4bit` smoke validation inserted a 10,568,520-byte snapshot with no oversized rejection (#243).
+
+### Changed
+- CLI help and user docs now describe the v0.2.x server option surface consistently across `mlxcel serve` and `mlxcel-server`, including disaggregated peer roles, VLM prefix-cache environment settings, paged KV budget settings, and Gemma 4 snapshot-cache support.
+
 ## [v0.2.0] - 2026-06-13
 
 ### Added
@@ -841,6 +850,7 @@ Initial public release of mlxcel.
 - GitHub Actions release workflow for macOS ARM64
 - Profile mode for prefill/decode timing analysis
 
+[v0.2.1]: https://github.com/lablup/mlxcel/compare/v0.2.0...v0.2.1
 [v0.2.0]: https://github.com/lablup/mlxcel/compare/v0.1.4...v0.2.0
 [v0.1.4]: https://github.com/lablup/mlxcel/compare/v0.1.3...v0.1.4
 [v0.1.3]: https://github.com/lablup/mlxcel/compare/v0.1.2...v0.1.3

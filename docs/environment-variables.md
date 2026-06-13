@@ -37,6 +37,7 @@ and cached on first use. Set them before starting `mlxcel` or `mlxcel-server`.
 | `MLXCEL_MODELS_DIR` | directory path | unset (falls back to `${MLXCEL_CACHE_DIR:-$HOME/.cache/mlxcel}/models`) | Dedicated model-store root. Snapshots live directly at `$MLXCEL_MODELS_DIR/<owner>/<name>` with no `models/` subdir, so the whole store can sit on a separate volume without dragging the tokenizer-script cache along. Read by `mlxcel download`, the `-m/--model` resolver (`generate` / `serve` / `inspect` / `run`), the `mlxcel-server -m/--model` resolver, and `list` / `rm`. Resolution precedence for the models root: the `--models-dir <PATH>` CLI flag, then `MLXCEL_MODELS_DIR`, then `${MLXCEL_CACHE_DIR:-$HOME/.cache/mlxcel}/models`. (`download --local-dir <PATH>` is separate: it writes the snapshot verbatim at that exact path.) |
 | `MLXCEL_DEFAULT_ORG` | HuggingFace org/user name | `mlx-community` | Org prepended to a bare, prefix-less model name (no `/`) by the `-m/--model` resolver (`generate` / `serve` / `inspect` / `run`), the `mlxcel-server -m` resolver, and the `download` verb (`mlxcel download` / `mlx-server download`), so `mlxcel run Qwen3-4B-4bit` resolves to `mlx-community/Qwen3-4B-4bit` and `mlxcel download Qwen3-4B-4bit` downloads that same repo. An explicit `owner/name` repo-id and an existing local path are unaffected. An empty/whitespace value falls back to `mlx-community`. |
 | `MLXCEL_SERVER_DECODE_STORAGE` | `auto`, `dense`, `paged` | `auto` | Server continuous-batching decode storage. `--decode-storage-backend` takes precedence. Invalid values warn and fall back to `auto`. |
+| `MLXCEL_KV_CACHE_BUDGET` | `auto` or unsigned integer bytes | unset | Paged KV block-pool budget for continuous batching. `--kv-cache-budget` takes precedence. Applies when `--decode-storage-backend paged` uses pool-backed Fp16 caches. |
 | `MLXCEL_SURGERY` | YAML file path | unset | Feature-gated weight-load surgery configuration. `--surgery` takes precedence when the `surgery` feature is built. |
 
 ## Server context sizing
@@ -87,6 +88,7 @@ These variables are applied when the corresponding CLI flag is absent.
 | `MLXCEL_PROMPT_CACHE_MAX_ENTRIES` | unsigned integer | `1024` | `--prompt-cache-max-entries` |
 | `MLXCEL_PROMPT_CACHE_TTL` | unsigned integer seconds | `3600` | `--prompt-cache-ttl` |
 | `MLXCEL_PROMPT_CACHE_MIN_PREFIX` | unsigned integer tokens | `32` | `--prompt-cache-min-prefix` |
+| `MLXCEL_ENABLE_VLM_PREFIX_CACHE` | boolean | `false` | `--enable-vlm-prefix-cache` |
 | `APC_ENABLED` | boolean | `true` | `--apc-enabled` |
 | `APC_BLOCK_SIZE` | unsigned integer tokens | `16` | `--apc-block-size` |
 | `APC_NUM_BLOCKS` | unsigned integer | derived from max entries | `--apc-num-blocks` |
@@ -100,6 +102,9 @@ Automatic Prefix Caching is on by default; pass `--apc-enabled=false` or set
 `APC_ENABLED=false` to fall back to whole-prefix matching only (a stored prefix
 is then reusable only when it is fully contained in the new request). The
 `APC_*` names mirror the upstream `mlx-vlm` env surface.
+
+`MLXCEL_ENABLE_VLM_PREFIX_CACHE` opts same-image multimodal follow-up turns into
+prompt-prefix sharing while leaving text-only prompt-cache behavior unchanged.
 
 ## Speculative-decoding variables
 

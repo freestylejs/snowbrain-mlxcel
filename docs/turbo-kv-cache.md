@@ -159,7 +159,10 @@ prefix, and it cannot be truncated to an arbitrary earlier token. For those
 families, `mlxcel-server` has an orthogonal exact-prefix snapshot bucket. Models
 that implement `supports_snapshot_reuse()` can copy their full model-owned
 state at turn end and restore it into a fresh sequence when the next request's
-tokens begin with that exact stored prefix under the same session key.
+tokens begin with that exact stored prefix under the same session key. As of
+v0.2.1, the supported snapshot families are Mamba, Mamba2, Jamba, Nemotron-H,
+Qwen 3.5 / 3.6 text, MoE, and VLM wrappers, and Gemma 4 text, VLM, and Unified
+wrappers.
 
 The snapshot bucket has its own byte cap, entry cap, TTL, LRU counters, and
 hit/miss metrics. `GET /v1/cache/stats` reports `snapshot_*` fields, while

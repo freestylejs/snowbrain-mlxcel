@@ -370,7 +370,7 @@ struct ServerArgs {
     )]
     max_kv_size: usize,
 
-    /// Paged KV-cache pool block budget — `auto` or a byte count (default: unbounded).
+    /// Paged KV-cache pool block budget: `auto` or a byte count (default: unbounded).
     ///
     /// Bounds the unified paged KV cache (epic #116): `auto` derives the cap
     /// from the memory estimate, a raw byte count sets it explicitly. Only
@@ -548,20 +548,23 @@ struct ServerArgs {
     #[arg(long, value_delimiter = ',', value_name = "ADDR")]
     peers: Vec<std::net::SocketAddr>,
 
-    /// Comma-separated prefill-node addresses a decode node receives handoffs
-    /// from (disaggregated serving, #126). Consumed when `--node-role decode`.
+    /// Comma-separated prefill-node addresses. Decode nodes use this to identify
+    /// accepted handoff sources; routers use it to select a prefill target.
+    /// Consumed when `--node-role decode` or `--node-role router`.
     #[arg(long, value_delimiter = ',', value_name = "ADDR")]
     prefill_peers: Vec<std::net::SocketAddr>,
 
-    /// Comma-separated decode-node addresses a prefill node hands off to
-    /// (disaggregated serving, #126). Consumed when `--node-role prefill`.
+    /// Comma-separated decode-node addresses. Prefill nodes hand KV state to one
+    /// of these targets; routers use it to route decode continuations.
+    /// Consumed when `--node-role prefill` or `--node-role router`.
     #[arg(long, value_delimiter = ',', value_name = "ADDR")]
     decode_peers: Vec<std::net::SocketAddr>,
 
     /// This node's own bind address (host:port) for the disaggregated
-    /// serving-role transport (#126). Required for a `--node-role prefill` or
-    /// `--node-role decode` node: the prefill node listens here for request
-    /// frames and the decode node for KV handoffs.
+    /// serving-role transport (#126). Required for `--node-role prefill`,
+    /// `--node-role decode`, and `--node-role router`: prefill nodes receive
+    /// prompt frames, decode nodes receive KV handoffs, and routers receive
+    /// role-result frames.
     #[arg(long, value_name = "ADDR")]
     serving_bind: Option<std::net::SocketAddr>,
 

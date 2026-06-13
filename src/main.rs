@@ -898,15 +898,15 @@ pub(crate) struct ServeArgs {
     )]
     max_kv_size: usize,
 
-    /// Paged KV-cache pool block budget — `auto` or a byte count (default: unbounded).
+    /// Paged KV-cache pool block budget: `auto` or a byte count (default: unbounded).
     ///
     /// Bounds the unified paged KV cache (epic #116) so the server evicts cold
     /// cross-request prompt prefixes (then preempts running sequences) instead
     /// of growing the pool without limit. `auto` derives the cap from the
-    /// memory estimate (`(available − weights − activation) / per-block bytes`);
+    /// memory estimate (`(available - weights - activation) / per-block bytes`);
     /// a raw byte count (e.g. `8589934592` for 8 GiB) sets an explicit cap.
-    /// Only affects pool-backed (Fp16, dense-natural-backend) models — model-
-    /// owned / quantized families keep dense caches and ignore it. Requires
+    /// Only affects pool-backed (Fp16, dense-natural-backend) models. Model-owned
+    /// and quantized families keep dense caches and ignore it. Requires
     /// `--decode-storage-backend paged` to have any effect.
     /// Also reads `MLXCEL_KV_CACHE_BUDGET`.
     #[arg(
@@ -1090,20 +1090,23 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_delimiter = ',', value_name = "ADDR")]
     peers: Vec<std::net::SocketAddr>,
 
-    /// Comma-separated prefill-node addresses a decode node receives handoffs
-    /// from (disaggregated serving, #126). Consumed when `--node-role decode`.
+    /// Comma-separated prefill-node addresses. Decode nodes use this to identify
+    /// accepted handoff sources; routers use it to select a prefill target.
+    /// Consumed when `--node-role decode` or `--node-role router`.
     #[arg(long, value_delimiter = ',', value_name = "ADDR")]
     prefill_peers: Vec<std::net::SocketAddr>,
 
-    /// Comma-separated decode-node addresses a prefill node hands off to
-    /// (disaggregated serving, #126). Consumed when `--node-role prefill`.
+    /// Comma-separated decode-node addresses. Prefill nodes hand KV state to one
+    /// of these targets; routers use it to route decode continuations.
+    /// Consumed when `--node-role prefill` or `--node-role router`.
     #[arg(long, value_delimiter = ',', value_name = "ADDR")]
     decode_peers: Vec<std::net::SocketAddr>,
 
     /// This node's own bind address (host:port) for the disaggregated
-    /// serving-role transport (#126). Required for a `--node-role prefill` or
-    /// `--node-role decode` node: the prefill node listens here for request
-    /// frames and the decode node for KV handoffs.
+    /// serving-role transport (#126). Required for `--node-role prefill`,
+    /// `--node-role decode`, and `--node-role router`: prefill nodes receive
+    /// prompt frames, decode nodes receive KV handoffs, and routers receive
+    /// role-result frames.
     #[arg(long, value_name = "ADDR")]
     serving_bind: Option<std::net::SocketAddr>,
 

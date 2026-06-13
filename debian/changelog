@@ -1,3 +1,18 @@
+mlxcel (0.2.1-1~jammy1) jammy; urgency=medium
+
+  * Added: exact-prefix prompt-cache snapshots now cover model-owned
+    recurrent and mixed-cache families, including Mamba, Mamba2, Jamba,
+    Nemotron-H, and Qwen 3.5 / 3.6 text, MoE, and VLM wrappers (#241).
+  * Added: Gemma 4 text, VLM, and Unified wrappers now donate and restore
+    exact-prefix prompt-cache snapshots for model-owned standard and rotating
+    caches; gemma-4-26b-a4b-it-4bit inserted a 10,568,520-byte snapshot in
+    smoke validation with no oversized rejection (#243).
+  * Docs: align mlxcel serve and mlxcel-server option descriptions for
+    disaggregated peer roles, VLM prefix-cache env settings, paged KV budget
+    settings, and Gemma 4 snapshot-cache support.
+
+ -- Jeongkyu Shin <inureyes@gmail.com>  Sat, 13 Jun 2026 19:45:00 +0900
+
 mlxcel (0.2.0-1~jammy1) jammy; urgency=medium
 
   * Added: unified paged KV cache is live in the batching server (epic

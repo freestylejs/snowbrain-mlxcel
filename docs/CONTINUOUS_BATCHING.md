@@ -39,13 +39,19 @@ roles below build on.
 
 Recurrent and hybrid SSM / linear-attention families cannot safely reuse
 arbitrary KV blocks, so they keep the hybrid-SSM/APC exclusion. Families that
-opt into `supports_snapshot_reuse()` (Mamba, Mamba2, Jamba, Nemotron-H, and
-Qwen 3.5 / Qwen3-Next variants) instead use a separate exact-prefix snapshot
-bucket: on a healthy finish the scheduler copies the model-owned state, and on
-the next turn it restores that state only when the stored token vector is a
-whole prefix of the incoming request in the same session. The unmatched suffix
-is still prefilled normally, with no recurrent state truncation or
-cross-session sharing.
+opt into `supports_snapshot_reuse()` instead use a separate exact-prefix
+snapshot bucket: on a healthy finish the scheduler copies the model-owned
+state, and on the next turn it restores that state only when the stored token
+vector is a whole prefix of the incoming request in the same session. The
+unmatched suffix is still prefilled normally, with no recurrent state
+truncation or cross-session sharing. The supported snapshot families are
+Mamba, Mamba2, Jamba, Nemotron-H, Qwen 3.5 / 3.6 text, MoE, and VLM wrappers,
+and Gemma 4 text, VLM, and Unified wrappers.
+
+For multimodal servers, `--enable-vlm-prefix-cache` opts image requests into
+prompt-prefix reuse across same-session follow-up turns with the same image.
+The default stays off for VLM requests, and text-only prompt-cache behavior is
+unchanged.
 
 ## Disaggregated serving
 
@@ -72,8 +78,8 @@ Networking flags:
 | Flag | Role | Purpose |
 |------|------|---------|
 | `--serving-bind <addr>` | prefill, decode, router | This node's own role-transport listener (`host:port`). |
-| `--decode-peers <addr,...>` | prefill | Decode node(s) a prefill node hands KV off to. |
-| `--prefill-peers <addr,...>` | router | Prefill node(s) the router routes requests to. |
+| `--decode-peers <addr,...>` | prefill, router | Decode node(s) a prefill node hands KV off to; routers also use these addresses for decode continuation routing. |
+| `--prefill-peers <addr,...>` | decode, router | Prefill node(s) accepted by a decode node and selected by a router. |
 
 The handoff transfers the paged block contents (not just metadata) over the
 transport, so the decode node reconstructs the exact KV the prefill node built;
