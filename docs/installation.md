@@ -56,7 +56,23 @@ Prerequisites vary by distribution and CUDA version. At minimum you need:
 - CUDA toolkit with `nvcc`.
 - NVIDIA driver compatible with the selected CUDA toolkit.
 - cuDNN and CUDA runtime libraries required by the pinned MLX build.
-- OpenBLAS and LAPACK development/runtime packages.
+- BLAS and LAPACK development packages, including the C headers. MLX's CMake
+  resolves `cblas.h` and `lapacke.h`, so the `lapacke` headers must be present,
+  not only the runtime libraries.
+
+On Debian/Ubuntu (x86_64 or aarch64) the build packages are:
+
+```bash
+sudo apt-get install -y \
+    build-essential cmake git \
+    libopenblas-dev liblapack-dev liblapacke-dev
+# CUDA toolkit (nvcc) and cuDNN come from NVIDIA's apt repository, e.g.
+#   cuda-toolkit-13-0  cudnn9-cuda-13
+```
+
+`liblapacke-dev` is the package that ships `lapacke.h`; `liblapack-dev` alone
+omits it and the MLX CMake configure step fails with `LAPACK_INCLUDE_DIRS` set
+to `NOTFOUND`.
 
 Example build shape:
 
@@ -94,9 +110,41 @@ MLX_CUDA_ARCHITECTURES=121 cargo build --release --features cuda
 MLX_CUDA_ARCHITECTURES="90a;121" cargo build --release --features cuda
 ```
 
-The repository release workflow currently builds Linux ARM64 CUDA artifacts for
-GB10 (`121`) and GH200 (`90a`) on a self-hosted runner. Treat other GPU/OS
-combinations as source builds that need local validation.
+The repository release workflow builds two Linux CUDA targets on self-hosted
+runners, each as one fat binary: aarch64 covering GH200 (`90a`), GB200 (`100`),
+and GB10 (`121`) in a single build (`90a;100;121`), and x86_64 covering Ampere
+through Blackwell (`80;86;89;90a;100;120`). For each target the `mlxcel` CLI and the
+`mlxcel-server` are published as separate archives (`mlxcel-...` and
+`mlxcel-server-...`, each roughly 347 MB) so a consumer downloads only the one
+it needs. Treat other GPU/OS combinations as source builds that need local
+validation.
+
+### Prebuilt CUDA artifact: runtime requirements
+
+MLX's CUDA backend compiles some kernels (gather and other indexing kernels)
+at runtime with NVRTC the first time they run, so a prebuilt binary needs CUDA
+headers available on the deployment host, not only the runtime libraries:
+
+- **CCCL (libcu++) headers** are bundled inside the prebuilt Linux CUDA
+  archives (both aarch64 and x86_64). Each unpacks to `bin/` + `include/cccl/`,
+  the layout MLX's JIT looks for relative to the executable
+  (`<exe-dir>/../include/cccl`). Keep `mlxcel`/`mlxcel-server` under `bin/` and
+  the `include/cccl/` directory beside it; do not flatten them. Launch the
+  binary by its **absolute path** (`/path/to/bin/mlxcel`, as a service manager
+  or a parent process spawning a subprocess does). MLX resolves the bundled
+  header location from the executable's own path, and a relative launch
+  (`./mlxcel` from inside `bin/`) can defeat that resolution and fail the first
+  kernel JIT. A future `MLXCEL_CCCL_DIR` override will remove this constraint.
+- **CUDA toolkit headers** (`cuda_runtime.h` and friends) come from the host.
+  Install the CUDA toolkit and set `CUDA_HOME` (or `CUDA_PATH`) if it is not at
+  `/usr/local/cuda`. Without them the first NVRTC compile fails with
+  `cannot open source file` errors.
+- An NVIDIA driver matching the CUDA toolkit must be present to run on the GPU.
+
+Compiled kernels are cached on disk (`MLX_PTX_CACHE_DIR`, default under the
+system temp dir), so only the first run of each kernel variant pays the NVRTC
+cost. Point `MLX_PTX_CACHE_DIR` at a persistent path to keep the cache across
+sessions.
 
 ## Runtime environment variables
 
