@@ -403,12 +403,12 @@ impl SparseMoeBlock {
         }
 
         // Apply experts and weighted-sum. Fused single-token decode kernel
-        // (#268 step 2a) when MLXCEL_FUSED_MOE is set; otherwise the proven
-        // SwitchGLU + moe_weighted_sum path (also the fallback when the kernel
-        // does not support the config).
+        // (#268) on by default; MLXCEL_FUSED_MOE=0 forces the proven SwitchGLU +
+        // moe_weighted_sum path (also the automatic fallback when the kernel does
+        // not support the config).
         let result = {
             let fused = if mlxcel_core::array_shape(&x_flat)[0] == 1
-                && std::env::var("MLXCEL_FUSED_MOE").is_ok()
+                && crate::models::switch_layers::fused_moe_enabled()
             {
                 self.experts
                     .forward_fused_kernel(&x_flat, &topk_indices, &scores)
