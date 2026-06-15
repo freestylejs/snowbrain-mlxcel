@@ -1,3 +1,26 @@
+mlxcel (0.3.0-1~jammy1) jammy; urgency=medium
+
+  * Added: nine new model families: BitNet b1.58 (#252), IBM Granite dense
+    (#254) and GraniteMoeHybrid (#259), LFM2 and LFM2-MoE (#255), Falcon-H1
+    (#256), PLaMo 2 with PlamoTokenizer (#257, #264), Apertus (#260),
+    ByteDance Seed-OSS (#261), and dots.llm1 MoE (#263).
+  * Added: Linux x86_64 and aarch64 CUDA release builds with bundled CCCL
+    headers (#262).
+  * Added: configurable allowed-origins for server CORS (#253).
+  * Changed: fused decode-MoE Metal kernel is now on by default
+    (MLXCEL_FUSED_MOE), about 13% faster MoE decode on gemma4 (#285).
+  * Performance: two-kernel fused decode-MoE that beats gather_qmm, extended
+    to 6-bit and mixed-bit experts and wired to dots.llm1, qwen3-next, and
+    gemma4 (#274, #275, #276, #278, #279, #281).
+  * Performance: CCCL header resolution that handles relative invocations and
+    other nodes, plus a persistent PTX kernel cache for the CUDA backend (#270).
+  * Fixed: quantized models stay bf16, fixing a 33-41% M1 Ultra decode
+    regression on bf16-scale checkpoints (#290).
+  * Fixed: infer per-tensor quantization bits for embeddings so
+    mixed-precision exports such as diffusiongemma load (#292).
+
+ -- Jeongkyu Shin <inureyes@gmail.com>  Mon, 15 Jun 2026 12:00:00 +0900
+
 mlxcel (0.2.1-1~jammy1) jammy; urgency=medium
 
   * Added: exact-prefix prompt-cache snapshots now cover model-owned

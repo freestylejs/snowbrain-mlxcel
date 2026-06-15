@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [v0.3.0] - 2026-06-15
+
+### Added
+- **Nine new model families.** BitNet b1.58 (1.58-bit ternary weights, #252), IBM Granite dense (#254) and GraniteMoeHybrid (Mamba2 plus attention hybrid, #259), LFM2 and LFM2-MoE (#255), Falcon-H1 (Mamba2 plus attention parallel hybrid, #256), PLaMo 2 (Mamba plus attention hybrid, #257) with PlamoTokenizer support (#264), Apertus (xIELU, QK-norm, llama3 RoPE scaling, #260), ByteDance Seed-OSS (#261), and dots.llm1 MoE (#263).
+- **Linux x86_64 and aarch64 CUDA release builds** with bundled CCCL headers, so the CUDA artifacts run on nodes that do not have the build-machine CCCL path (#262).
+- Configurable allowed-origins for server CORS, replacing the any-origin default when set (#253).
+
+### Changed
+- **Fused decode-MoE Metal kernel is now on by default** (`MLXCEL_FUSED_MOE`, set to `0` to disable). It speeds up single-token MoE decode across families, with the GeGLU path giving about 13% on gemma4 (#285).
+
+### Performance
+- Two-kernel fused decode-MoE that beats `gather_qmm`, staged across the kernel foundation and the expert decode kernel (#274, #275, #276). Extended to 6-bit and mixed-bit experts for dots.llm1 (#278), wired to qwen3-next / Qwen 3.5 / 3.6 (#279), and given a GeGLU variant for gemma4 (#281); the squared-ReLU kernel stays behind a dedicated flag (#280).
+- Gate the Mamba2 and nemotron_h per-mixer eval to M5 Max so SSM-hybrid decode is not slowed on other Apple Silicon (#266, #271).
+- CCCL header resolution at runtime now handles relative invocations and nodes without the build-machine path, and a persistent PTX kernel cache reuses JIT-compiled kernels across runs (#270).
+
+### Fixed
+- **Quantized models now stay bf16, fixing a 33-41% M1 Ultra decode regression** on bf16-scale checkpoints (qwen3, nemotron, gpt-oss, solar, and others). The blanket bf16-to-f16 quant-scale promotion added with Apertus had created a bf16-activation by f16-scale mismatch in `quantized_matmul` / `gather_qmm` (#290).
+- **Infer per-tensor quantization bits for embeddings**, so mixed-precision exports that store the embedding at a different bit width than the top-level config load instead of aborting in dequant. For example diffusiongemma stores its embedding at 8-bit under a 4-bit default (#292).
+
+### Docs
+- Refreshed the M1 Ultra and M5 Max benchmark results for the 0.3.0 sweep (#295).
+
+### Chore
+- Split `mlx_cxx_bridge.cpp` into domain-specific translation units (#277).
+- Bumped the minor-and-patch dependency group (#288).
+
 ## [v0.2.1] - 2026-06-13
 
 ### Added
@@ -850,6 +876,7 @@ Initial public release of mlxcel.
 - GitHub Actions release workflow for macOS ARM64
 - Profile mode for prefill/decode timing analysis
 
+[v0.3.0]: https://github.com/lablup/mlxcel/compare/v0.2.1...v0.3.0
 [v0.2.1]: https://github.com/lablup/mlxcel/compare/v0.2.0...v0.2.1
 [v0.2.0]: https://github.com/lablup/mlxcel/compare/v0.1.4...v0.2.0
 [v0.1.4]: https://github.com/lablup/mlxcel/compare/v0.1.3...v0.1.4

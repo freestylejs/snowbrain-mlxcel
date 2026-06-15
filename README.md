@@ -6,6 +6,15 @@
 
 High-performance LLM/VLM inference runtime and server for Apple Silicon. The CLI and server are implemented in Rust and execute models through native MLX C++ bindings. Linux/CUDA builds are supported as a secondary target.
 
+## New in v0.3.0
+
+- **Nine new model families.** BitNet b1.58 (1.58-bit ternary), IBM Granite dense and GraniteMoeHybrid, LFM2 / LFM2-MoE, Falcon-H1, PLaMo 2, Apertus, ByteDance Seed-OSS, and dots.llm1 MoE, on top of the existing Llama, Qwen, Gemma, and DeepSeek coverage.
+- **Faster MoE decode, on by default.** The fused decode-MoE Metal kernel beats the previous gather path on single-token decode (about 13% on gemma4) and is now enabled by default. Set `MLXCEL_FUSED_MOE=0` to disable.
+- **Loads newer mixed-precision checkpoints.** mlxcel now reads per-layer mixed bit widths and bf16 quantization scales, so recent mlx-community exports (for example 8-bit embeddings under a 4-bit default) load correctly. A bf16-scale decode regression on M1 Ultra is also fixed.
+- **Linux CUDA release builds.** Prebuilt x86_64 and aarch64 CUDA artifacts ship with bundled CCCL headers and reuse JIT-compiled kernels across runs through a persistent PTX cache.
+
+See the [changelog](CHANGELOG.md) for the full list.
+
 ## Overview
 
 `mlxcel` provides a Rust command-line runtime and an OpenAI-compatible model server for MLX-format checkpoints. Loading, scheduling, and inference stay in one native process while model execution goes through MLX C++ bindings. The project tracks the model coverage of [mlx-lm](https://github.com/ml-explore/mlx-lm) and [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) where practical.
