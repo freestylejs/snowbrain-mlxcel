@@ -64,6 +64,7 @@ use mlxcel::server::{
     about = "llama-server compatible HTTP server for MLX inference on Apple Silicon and CUDA GPUs",
     args_conflicts_with_subcommands = true,
     flatten_help = true,
+    verbatim_doc_comment,
     after_help = "\
 Tensor Parallel Runtime:
   Current multi-rank support: dense Llama, Qwen2/2.5, Qwen3, Qwen3.5 text, Gemma 3 text, Gemma 4 text, ERNIE 4.5, Hunyuan v1 Dense
@@ -365,8 +366,7 @@ struct ServerArgs {
     ///
     /// When set to `N > 0`, the batch scheduler caps each per-sequence plain
     /// `KVCache` to `N` tokens by dropping the oldest entries once `offset`
-    /// exceeds the bound. Mirrors upstream mlx-lm's
-    /// `BatchGenerator(max_kv_size=N)` parameter.
+    /// exceeds the bound.
     ///
     /// Sliding-window models that already build their own `RotatingKVCache`
     /// (Gemma 3/4, Exaone 4, RecurrentGemma, Step 3.5, gpt-oss) are
@@ -715,19 +715,19 @@ struct ServerArgs {
     decode_storage_backend: Option<mlxcel::server::DecodeStorageBackend>,
 
     // llama-server compatibility arguments (accepted but ignored).
-    /// Accepted for llama-server CLI compatibility (ignored — mlxcel has no web UI)
+    /// Accepted for llama-server CLI compatibility (ignored: mlxcel has no web UI)
     #[arg(long, hide = true)]
     _no_webui: bool,
 
-    /// Accepted for llama-server CLI compatibility (ignored — mlxcel always processes templates)
+    /// Accepted for llama-server CLI compatibility (ignored: mlxcel always processes templates)
     #[arg(long, hide = true)]
     _jinja: bool,
 
-    /// Accepted for llama-server CLI compatibility (ignored — mlxcel always uses Metal)
+    /// Accepted for llama-server CLI compatibility (ignored: mlxcel always uses Metal)
     #[arg(long = "n-gpu-layers", hide = true)]
     _n_gpu_layers: Option<i32>,
 
-    /// Accepted for llama-server CLI compatibility (ignored — vision projector loaded automatically)
+    /// Accepted for llama-server CLI compatibility (ignored: vision projector loaded automatically)
     #[arg(long, hide = true)]
     _mmproj: Option<String>,
 
@@ -735,15 +735,15 @@ struct ServerArgs {
     #[arg(long, hide = true)]
     _flash_attn: bool,
 
-    /// Accepted for llama-server CLI compatibility (ignored — not applicable to MLX)
+    /// Accepted for llama-server CLI compatibility (ignored: not applicable to MLX)
     #[arg(long, hide = true)]
     _mlock: bool,
 
-    /// Accepted for llama-server CLI compatibility (ignored — not applicable to MLX)
+    /// Accepted for llama-server CLI compatibility (ignored: not applicable to MLX)
     #[arg(long = "no-mmap", hide = true)]
     _no_mmap: bool,
 
-    /// Accepted for llama-server CLI compatibility (ignored — mlxcel handles batching internally)
+    /// Accepted for llama-server CLI compatibility (ignored: mlxcel handles batching internally)
     #[arg(long, hide = true)]
     _cont_batching: bool,
 
@@ -942,7 +942,11 @@ struct ServerArgs {
     /// Note: `preserve_thinking` quality benefits are validated on Qwen3.6;
     /// Qwen3 / Qwen3.5 accept the flag but were trained on the
     /// rolling-checkpoint convention.
-    #[arg(long = "chat-template-kwargs", value_name = "JSON")]
+    #[arg(
+        long = "chat-template-kwargs",
+        value_name = "JSON",
+        verbatim_doc_comment
+    )]
     chat_template_kwargs: Option<String>,
 
     // cross-request prompt-prefix KV cache knobs.
@@ -1018,7 +1022,7 @@ struct ServerArgs {
     /// automatically disabled at runtime since SSM state cannot be decomposed
     /// into hashable blocks.
     ///
-    /// Also reads `APC_ENABLED` (parity with upstream `mlx-vlm`).
+    /// Also reads `APC_ENABLED`.
     #[arg(
         long = "apc-enabled",
         default_value_t = true,
@@ -1149,7 +1153,7 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
     // also reads them directly, so these helpers are only needed when the CLI
     // flag uses a different default convention (Option<String>). Since we use
     // `env = "..."` on the clap arg definition, these explicit fallback calls
-    // are not strictly necessary here — clap already reads the env vars.
+    // are not strictly necessary here, clap already reads the env vars.
     // We still call them for consistency with the pattern and to allow future
     // warn-on-conflict logic (e.g. if a separate MLXCEL_* alias is added).
     env_fallback_cache_type_k(&mut args.turbo.cache_type_k);
@@ -1281,7 +1285,7 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
         // CLI-vs-env precedence, unparseable-env handling, and the collision
         // INFO log are handled consistently with `mlxcel serve` and with the
         // other LLAMA_ARG_* env fallbacks. (Do NOT put `env = "..."` on the
-        // clap arg — that bypasses our warn-and-ignore policy for unparseable
+        // clap arg, that bypasses our warn-and-ignore policy for unparseable
         // values and would emit a misleading collision warning.)
         reasoning_budget: {
             let mut v = args.reasoning_budget;

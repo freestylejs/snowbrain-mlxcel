@@ -17,7 +17,7 @@ See the [changelog](CHANGELOG.md) for the full list.
 
 ## Overview
 
-`mlxcel` provides a Rust command-line runtime and an OpenAI-compatible model server for MLX-format checkpoints. Loading, scheduling, and inference stay in one native process while model execution goes through MLX C++ bindings. The project tracks the model coverage of [mlx-lm](https://github.com/ml-explore/mlx-lm) and [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) where practical.
+`mlxcel` provides a Rust command-line runtime and an OpenAI-compatible model server for MLX-format checkpoints. Loading, scheduling, and inference stay in one native process while model execution goes through MLX C++ bindings. It runs a broad range of text and vision-language model families directly from [mlx-community](https://huggingface.co/mlx-community) checkpoints, with no conversion step.
 
 The project started as work on structural model fine-tuning and has grown into a general-purpose serving runtime for local and small-cluster inference.
 
@@ -59,11 +59,11 @@ mlxcel run Qwen3.5-0.8B-4bit
 mlxcel run Qwen3.5-0.8B-4bit -p "Hello, world!" -n 100
 
 # No model argument falls back to the default
-# mlx-community/Llama-3.2-3B-Instruct-4bit (mlx-lm parity).
+# mlx-community/gemma-4-e2b-it-4bit.
 mlxcel run
 ```
 
-`generate`, `serve`, and `inspect` take the same model argument via `-m` — a HuggingFace `owner/name` repo-id (auto-downloaded into the store and reused after), a bare name (resolved as `mlx-community/<name>`), or an existing local path. `mlxcel run` is a thin wrapper over `mlxcel generate` and shares its sampling and generation flags.
+`generate`, `serve`, and `inspect` take the same model argument via `-m`, a HuggingFace `owner/name` repo-id (auto-downloaded into the store and reused after), a bare name (resolved as `mlx-community/<name>`), or an existing local path. `mlxcel run` is a thin wrapper over `mlxcel generate` and shares its sampling and generation flags.
 
 ```bash
 # One-off generation.
@@ -83,7 +83,7 @@ mlxcel inspect -m Qwen3.5-0.8B-4bit --max-tokens 32768
 mlxcel generate -m Qwen3.5-0.8B-4bit -p "Hello, world!" -n 32768 --estimate-memory
 ```
 
-Downloaded models land in a location-independent global store at `${MLXCEL_CACHE_DIR:-$HOME/.cache/mlxcel}/models/<owner>/<name>`, shared across every working directory. To relocate the store, write a snapshot to an exact path, change the default org, or tune the memory preflight, see [Environment variables](docs/environment-variables.md) — `MLXCEL_MODELS_DIR` / `--models-dir`, `--local-dir`, `MLXCEL_DEFAULT_ORG`, and `MLXCEL_MEMORY_LIMIT` / `MLXCEL_HEADROOM_FACTOR`.
+Downloaded models land in a location-independent global store at `${MLXCEL_CACHE_DIR:-$HOME/.cache/mlxcel}/models/<owner>/<name>`, shared across every working directory. To relocate the store, write a snapshot to an exact path, change the default org, or tune the memory preflight, see [Environment variables](docs/environment-variables.md), `MLXCEL_MODELS_DIR` / `--models-dir`, `--local-dir`, `MLXCEL_DEFAULT_ORG`, and `MLXCEL_MEMORY_LIMIT` / `MLXCEL_HEADROOM_FACTOR`.
 
 If you build from source instead, use `./target/release/mlxcel` and
 `./target/release/mlxcel-server` in place of the installed commands above.
@@ -99,7 +99,7 @@ mlxcel list
 # Machine-readable output (stable JSON array: repo_id, size_bytes, path, modified).
 mlxcel list --json
 
-# Repo-ids only — pipe-friendly for scripting (e.g. xargs mlxcel rm).
+# Repo-ids only, pipe-friendly for scripting (e.g. xargs mlxcel rm).
 mlxcel list -q
 
 # Restore the absolute path column.
@@ -245,7 +245,7 @@ for the CLI summary, and see [Supported models](docs/supported-models.md) for th
 
 Issues and pull requests are welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the contributor workflow, local quality gates (`cargo fmt`, `clippy`, `cargo test`, `cargo deny check`), and commit conventions. New model architectures, performance work, bug fixes, and documentation improvements are all useful. For larger changes, please open an issue first so the scope and validation plan can be discussed.
 
-For security vulnerabilities, see [`SECURITY.md`](SECURITY.md) — do **not** file these as public issues.
+For security vulnerabilities, see [`SECURITY.md`](SECURITY.md), do **not** file these as public issues.
 
 ## License
 
@@ -253,7 +253,7 @@ Apache License 2.0 unless otherwise noted, see [LICENSE](LICENSE). Third-party a
 
 ## Acknowledgments
 
-- [MLX](https://github.com/ml-explore/mlx) — Apple's machine learning framework
+- [MLX](https://github.com/ml-explore/mlx), Apple's machine learning framework
 - [mlx-lm](https://github.com/ml-explore/mlx-lm) (MIT, Copyright 2023 Apple Inc.) and [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) (MIT, Copyright 2025 Prince Canuma): Python projects whose model coverage and behavior mlxcel ports and mirrors. See [NOTICE](NOTICE).
-- [MLX Community](https://huggingface.co/mlx-community) — pre-converted MLX model checkpoints
+- [MLX Community](https://huggingface.co/mlx-community), pre-converted MLX model checkpoints
 - [turboquant_plus](https://github.com/TheTom/turboquant_plus): TurboQuant KV cache compression algorithms ported in `src/lib/mlxcel-core/src/cache/turbo/` (Apache-2.0, Copyright 2026 Tom Turney). See [NOTICE](NOTICE).
