@@ -655,6 +655,14 @@ jobs:
       - name: Build release binaries
         run: cargo build --release --features cuda --locked
         # MLX_CUDA_ARCHITECTURES is inherited from the job env above.
+        env:
+          # Redistributable asset: pin the C++ bridge and Rust code to the
+          # portable x86-64-v3 baseline (AVX2, ~2013+) instead of inheriting
+          # this build host's native ISA. build.rs defaults the bridge to
+          # -march=native, which on a newer runner could bake in AVX-512 and
+          # SIGILL on older customer CPUs. Set MLXCEL_CXX_MARCH=none to omit.
+          MLXCEL_CXX_MARCH: x86-64-v3
+          RUSTFLAGS: "-C target-cpu=x86-64-v3"
 
       - name: Smoke test (10-token generate on GPU)
         run: |
