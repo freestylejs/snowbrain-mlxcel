@@ -1,3 +1,22 @@
+mlxcel (0.3.1-1~jammy1) jammy; urgency=medium
+
+  * Performance: fused decode-MoE kernel ported to CUDA, so Linux/CUDA GPUs
+    get the fast single-token MoE decode path with byte-identical output;
+    gains of about 10-55%, up to 1.55x on qwen3-moe (#319).
+  * Performance: wired six more MoE families to the fused decode-MoE kernel:
+    qwen2_moe, LFM2, qwen3_vl_moe, Mixtral, Phi-3.5-MoE, and OLMoE (#308,
+    #309, #310, #311, #312, #314). The kernel self-gates by expert size
+    (MLXCEL_FUSED_MOE_MAX_DFF, default 4096).
+  * Performance: BitNet BitLinear ternary matmul ported to CUDA (#322).
+  * Fixed: load non-affine quantized VLM weights with the correct quant mode
+    and group size, so checkpoints such as minicpm-v mxfp4 load (#334).
+  * Fixed: OLMoE applies q_norm/k_norm before the head reshape (#317).
+  * Fixed: report load/run OOM as SKIP:oom, not FAIL:bench (#298).
+  * CI: add MLXCEL_CXX_MARCH override and pin the x86_64 CUDA release asset
+    to x86-64-v3 (#208).
+
+ -- Jeongkyu Shin <inureyes@gmail.com>  Wed, 17 Jun 2026 12:00:00 +0900
+
 mlxcel (0.3.0-1~jammy1) jammy; urgency=medium
 
   * Added: nine new model families: BitNet b1.58 (#252), IBM Granite dense

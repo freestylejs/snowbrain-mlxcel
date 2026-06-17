@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [v0.3.1] - 2026-06-17
+
+### Performance
+- **Fused decode-MoE kernel ported to CUDA.** The fused single-token MoE decode path was Metal-only in 0.3.0; this implements it on CUDA, so Linux/CUDA GPUs get the same fast path with byte-identical greedy output. Measured gains run from about 10% to 55%, up to 1.55x on qwen3-moe (#319).
+- **Wired six more MoE families to the fused decode-MoE kernel**: qwen2_moe (#308), LFM2 (#309), qwen3_vl_moe (#310), Mixtral (#311), Phi-3.5-MoE (#312), and OLMoE (#314). The kernel self-gates by expert size (`MLXCEL_FUSED_MOE_MAX_DFF`, default 4096), so large-expert models such as Mixtral 8x7B and Phi-3.5-MoE keep the gather path with no regression.
+- **BitNet BitLinear ternary matmul ported to CUDA**, so BitNet b1.58 models run on CUDA GPUs (#322).
+
+### Fixed
+- **Load non-affine quantized VLM weights with the correct quant mode and group size.** The loader detects the quant mode from the absence of biases and infers `group_size` from tensor shape, so non-affine VLM checkpoints such as minicpm-v mxfp4 load instead of failing (#334).
+- OLMoE applies `q_norm` / `k_norm` before the head reshape, matching the reference attention order (#317).
+- Report load/run out-of-memory as `SKIP:oom` rather than `FAIL:bench` (#298).
+
+### CI
+- Add an `MLXCEL_CXX_MARCH` override and pin the x86_64 CUDA release asset to `x86-64-v3`, so prebuilt CUDA binaries run on a wider range of hosts (#208).
+
+### Docs
+- First Linux/CUDA (NVIDIA GB10) full benchmark sweep for 0.3.1: 136 of 147 text models pass with no code-level failures (#320, #321, #323, #324, #335, #336).
+- Record fused decode-MoE gains for the newly wired MoE families (#337).
+- Refresh the README performance tables (#300).
+
 ## [v0.3.0] - 2026-06-15
 
 ### Added
@@ -877,6 +897,7 @@ Initial public release of mlxcel.
 - GitHub Actions release workflow for macOS ARM64
 - Profile mode for prefill/decode timing analysis
 
+[v0.3.1]: https://github.com/lablup/mlxcel/compare/v0.3.0...v0.3.1
 [v0.3.0]: https://github.com/lablup/mlxcel/compare/v0.2.1...v0.3.0
 [v0.2.1]: https://github.com/lablup/mlxcel/compare/v0.2.0...v0.2.1
 [v0.2.0]: https://github.com/lablup/mlxcel/compare/v0.1.4...v0.2.0

@@ -6,12 +6,12 @@
 
 High-performance LLM/VLM inference runtime and server for Apple Silicon. The CLI and server are implemented in Rust and execute models through native MLX C++ bindings. Linux/CUDA builds are supported as a secondary target.
 
-## New in v0.3.0
+## New in v0.3.1
 
-- **Nine new model families.** BitNet b1.58 (1.58-bit ternary), IBM Granite dense and GraniteMoeHybrid, LFM2 / LFM2-MoE, Falcon-H1, PLaMo 2, Apertus, ByteDance Seed-OSS, and dots.llm1 MoE, on top of the existing Llama, Qwen, Gemma, and DeepSeek coverage.
-- **Faster MoE decode, on by default.** The fused decode-MoE Metal kernel beats the previous gather path on single-token decode (up to about 19% on Qwen3-VL 30B-A3B and 13% on Gemma 4, M1 Ultra) and is enabled by default across ten MoE families. It self-gates by expert size (`MLXCEL_FUSED_MOE_MAX_DFF`, default 4096): large-expert models such as Mixtral 8x7B and Phi-3.5-MoE keep the proven gather path with no regression. Set `MLXCEL_FUSED_MOE=0` to disable.
-- **Loads newer mixed-precision checkpoints.** mlxcel now reads per-layer mixed bit widths and bf16 quantization scales, so recent mlx-community exports (for example 8-bit embeddings under a 4-bit default) load correctly. A bf16-scale decode regression on M1 Ultra is also fixed.
-- **Linux CUDA release builds.** Prebuilt x86_64 and aarch64 CUDA artifacts ship with bundled CCCL headers and reuse JIT-compiled kernels across runs through a persistent PTX cache.
+- **Fused decode-MoE now runs on CUDA.** The fused single-token MoE decode kernel was Metal-only in 0.3.0; it is now ported to CUDA, so Linux/CUDA GPUs such as NVIDIA GB10 get the same fast path with byte-identical greedy output. Measured gains run from about 10% to 55%, up to 1.55x on qwen3-moe.
+- **Six more MoE families on the fused kernel.** qwen2_moe, LFM2, qwen3_vl_moe, Mixtral, Phi-3.5-MoE, and OLMoE are now wired to the fused decode-MoE path. It self-gates by expert size (`MLXCEL_FUSED_MOE_MAX_DFF`, default 4096), so large-expert models such as Mixtral 8x7B and Phi-3.5-MoE keep the proven gather path with no regression. Set `MLXCEL_FUSED_MOE=0` to disable.
+- **BitNet on CUDA.** The BitLinear b1.58 ternary matmul kernel is ported to CUDA, so BitNet models run on CUDA GPUs.
+- **Loads non-affine quantized VLM checkpoints.** Non-affine VLM weights now load with the correct quant mode and group size, so checkpoints such as minicpm-v mxfp4 work instead of failing.
 
 See the [changelog](CHANGELOG.md) for the full list.
 
