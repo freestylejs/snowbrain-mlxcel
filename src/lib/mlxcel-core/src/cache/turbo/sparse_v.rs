@@ -201,6 +201,21 @@ pub const TURBO4_DEQUANT_SDPA_ENV_VAR: &str = "MLXCEL_TURBO4_DEQUANT_SDPA";
 
 static TURBO4_DEQUANT_SDPA_ENABLED: OnceLock<bool> = OnceLock::new();
 
+/// Environment variable controlling the dequant-first native SDPA strategy for
+/// asymmetric `KVCacheMode::Turbo4Asym` (FP16 K + 4-bit packed V).
+///
+/// Default: **on**. The V side is transiently dequantized to FP16 and fed,
+/// together with the already-FP16 K side, to native MLX SDPA, the same tensor
+/// shape the `int8`, symmetric `Turbo4`, and `Turbo4Delegated` decode routes
+/// use. This is both exact (no per-token attention-weight skipping) and several
+/// times faster than the sparse-V weighted-sum path. Set this to `0`, `false`,
+/// `off`, or `no` to fall back to the lossy sparse-V approximation
+/// (`KVCache::update_and_sparse_v_attention`) for A/B comparison or as a
+/// fallback.
+pub const TURBO4_ASYM_DEQUANT_SDPA_ENV_VAR: &str = "MLXCEL_TURBO4_ASYM_DEQUANT_SDPA";
+
+static TURBO4_ASYM_DEQUANT_SDPA_ENABLED: OnceLock<bool> = OnceLock::new();
+
 fn parse_env_default_on(var_name: &str) -> bool {
     match std::env::var(var_name) {
         Ok(s) => !matches!(
@@ -256,6 +271,19 @@ pub fn turbo4_delegated_dequant_sdpa_enabled() -> bool {
 /// V basis.
 pub fn turbo4_dequant_sdpa_enabled() -> bool {
     *TURBO4_DEQUANT_SDPA_ENABLED.get_or_init(|| parse_env_default_on(TURBO4_DEQUANT_SDPA_ENV_VAR))
+}
+
+/// Returns `true` iff asymmetric `Turbo4Asym` decode should use dequant-first
+/// native SDPA instead of the lossy sparse-V weighted-sum path.
+///
+/// `Turbo4Asym` keeps K in FP16 and packs V into 4-bit PolarQuant indices. This
+/// path transiently dequantizes V to FP16 and runs native SDPA with the FP16 K,
+/// matching how `int8` and symmetric `Turbo4` decode. It is default-on; set
+/// [`TURBO4_ASYM_DEQUANT_SDPA_ENV_VAR`] to a falsy value to fall back to the
+/// sparse-V approximation for A/B comparison.
+pub fn turbo4_asym_dequant_sdpa_enabled() -> bool {
+    *TURBO4_ASYM_DEQUANT_SDPA_ENABLED
+        .get_or_init(|| parse_env_default_on(TURBO4_ASYM_DEQUANT_SDPA_ENV_VAR))
 }
 
 /// Returns `true` iff model attention call sites should route
@@ -893,6 +921,33 @@ pub fn attention_turbo4_dequant_sdpa(
     let k_rot = super::quant::dequantize_k_turbo4_rotated(k_packed, k_norms, params);
     let v_rot = dequantize_v_turbo4_rotated_for_sdpa(v_packed, v_rescale, params);
     let rot_out = crate::layers::attention(&q_rot, &k_rot, &v_rot, scale, mask, 0.0, 0);
+    super::quant::turbo4_v_inverse_rotate(&rot_out, params)
+}
+
+/// Dequant-first SDPA path for `KVCacheMode::Turbo4Asym` (FP16-K + packed-V).
+///
+/// The asymmetric analogue of [`attention_turbo4_dequant_sdpa`]: the K side is
+/// already FP16, so there is no Q rotation and no K dequant. Only V is
+/// transiently dequantized into its rotated codec basis, native SDPA runs
+/// against the FP16 K, and the small `[B, Hq, Tq, D]` output is inverse-rotated
+/// through the V basis. This uses the same identity the delegated path documents
+/// (`SDPA(q, k, rotate(v)) = rotate(SDPA(q, k, v))`, since attention scores
+/// depend only on Q/K) to skip the per-token inverse WHT that the full
+/// [`super::quant::dequantize_v_turbo4`] dequant pays, so the result is exact
+/// (bit-for-bit equivalent to dequant-then-SDPA, up to FP rounding) but far
+/// faster. The persistent cache state stays packed.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_turbo4_asym_dequant_sdpa(
+    q: &MlxArray,
+    k: &MlxArray,
+    v_packed: &MlxArray,
+    v_rescale: &MlxArray,
+    params: &TurboQuantParams,
+    scale: f32,
+    mask: Option<&MlxArray>,
+) -> UniquePtr<MlxArray> {
+    let v_rot = dequantize_v_turbo4_rotated_for_sdpa(v_packed, v_rescale, params);
+    let rot_out = crate::layers::attention(q, k, &v_rot, scale, mask, 0.0, 0);
     super::quant::turbo4_v_inverse_rotate(&rot_out, params)
 }
 
