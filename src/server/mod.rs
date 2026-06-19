@@ -17,6 +17,7 @@
 pub mod anthropic_translator;
 pub mod app;
 pub mod audio_model;
+pub(crate) mod audio_worker;
 pub mod batch;
 mod chat_request;
 pub mod chat_template;
@@ -44,6 +45,7 @@ pub mod structured;
 pub mod thinking_budget;
 pub mod tool_calls;
 pub mod types;
+pub mod whisper_stt;
 
 pub use app::create_app;
 pub use audio_model::{

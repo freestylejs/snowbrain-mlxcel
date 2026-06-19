@@ -81,6 +81,11 @@ pub async fn audio_speech(
     };
 
     let started = std::time::Instant::now();
+    // The provider evaluates its MLX graph on its own dedicated, stream-
+    // initialized thread (see `crate::server::audio_worker`). This call only
+    // forwards the request over the worker's channel and blocks for the reply,
+    // so it does no MLX work itself, but it is still blocking, hence
+    // `spawn_blocking` to keep it off the async executor.
     let synth = tokio::task::spawn_blocking(move || provider.synthesize(input)).await;
     let output = match synth {
         Ok(Ok(output)) => output,
@@ -153,6 +158,11 @@ async fn transcribe(state: AppState, multipart: Multipart, translate: bool) -> R
     };
 
     let started = std::time::Instant::now();
+    // The provider evaluates the Whisper graph on its own dedicated, stream-
+    // initialized thread (see `crate::server::audio_worker`). This call only
+    // forwards the request over the worker's channel and blocks for the reply,
+    // so it does no MLX work itself, but it is still blocking, hence
+    // `spawn_blocking` to keep it off the async executor.
     let result = tokio::task::spawn_blocking(move || provider.transcribe(input)).await;
     let output = match result {
         Ok(Ok(output)) => output,

@@ -1803,6 +1803,33 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
         )))
     };
 
+    // Speech-to-text wiring: when the loaded checkpoint is a Whisper-style ASR
+    // model, populate the audio slot so `/v1/audio/transcriptions` and
+    // `/v1/audio/translations` are served. `WhisperSttProvider::load` hands the
+    // checkpoint path to its own dedicated worker thread, which loads the
+    // weights and evaluates every transcription on that one stream-initialized
+    // thread (MLX work is thread-affine); the load happens off this startup
+    // thread. The chat ModelProvider load above is a no-op for this checkpoint
+    // (the worker logs and returns), matching the single-model "speech-to-text
+    // only" deployment; serving chat and STT simultaneously is out of scope.
+    let audio_model: Option<Arc<dyn crate::server::audio_model::AudioModelProvider>> =
+        match crate::models::get_model_type(&startup.model_path) {
+            Ok(crate::models::ModelType::Whisper) => {
+                tracing::info!(
+                    "Detected Whisper speech-to-text checkpoint; loading audio model for \
+                     /v1/audio/transcriptions and /v1/audio/translations"
+                );
+                match crate::server::whisper_stt::WhisperSttProvider::load(&startup.model_path) {
+                    Ok(provider) => Some(Arc::new(provider)),
+                    Err(err) => {
+                        tracing::error!("Failed to load Whisper speech-to-text model: {err}");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
     let state = AppState::with_observability(
         model_provider,
         config,
@@ -1816,7 +1843,8 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
     .with_pp_tracer(pp_tracer)
     .with_prompt_cache(prompt_cache_store)
     .with_responses_store(responses_store)
-    .with_conversation_store(conversation_store);
+    .with_conversation_store(conversation_store)
+    .with_audio_model(audio_model);
     let app = create_app(state);
 
     if startup.port == 0 {

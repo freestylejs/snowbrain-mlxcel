@@ -54,7 +54,7 @@ use crate::UniquePtr;
 /// to bind its dedicated per-thread stream as the default for
 /// subsequent MLX dispatches on that thread.
 ///
-/// Used by: CxxGenerator, SpeculativeGenerator, BatchScheduler
+/// Used by: CxxGenerator, SpeculativeGenerator, BatchScheduler, AudioWorker
 pub fn new_thread_local_generation_stream() -> Option<UniquePtr<MlxThreadLocalStream>> {
     if ffi::is_gpu_available() {
         Some(ffi::new_thread_local_stream_gpu())
@@ -76,7 +76,7 @@ pub fn new_thread_local_generation_stream() -> Option<UniquePtr<MlxThreadLocalSt
 ///
 /// `None` is a safe no-op for CPU-only builds.
 ///
-/// Used by: CxxGenerator, SpeculativeGenerator, BatchScheduler
+/// Used by: CxxGenerator, SpeculativeGenerator, BatchScheduler, AudioWorker
 pub fn install_thread_local_default_stream(tls: Option<&UniquePtr<MlxThreadLocalStream>>) {
     if let Some(tls) = tls {
         let stream = ffi::stream_from_thread_local_stream(tls);
@@ -96,9 +96,10 @@ pub fn install_thread_local_default_stream(tls: Option<&UniquePtr<MlxThreadLocal
 /// `None` is a safe no-op (matches the CPU-only build path of
 /// [`new_thread_local_generation_stream`]).
 ///
-/// Used by: tests; runtime callers currently rely on the default
-/// stream being installed by [`install_thread_local_default_stream`]
-/// and on per-op `eval` calls for synchronization.
+/// Used by: AudioWorker (after each request); tests. Generation-loop callers
+/// rely on the default stream installed by
+/// [`install_thread_local_default_stream`] and on per-op `eval` for
+/// synchronization.
 pub fn synchronize_thread_local_stream(tls: Option<&UniquePtr<MlxThreadLocalStream>>) {
     if let Some(tls) = tls {
         ffi::synchronize_thread_local_stream(tls);
