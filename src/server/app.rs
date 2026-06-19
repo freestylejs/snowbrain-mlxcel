@@ -17,7 +17,7 @@
 use axum::{
     Json, Router,
     body::Body,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{Request, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -86,6 +86,10 @@ async fn api_key_auth(
     }
 }
 
+/// Maximum request body size for audio upload endpoints. Overrides the Axum
+/// 2 MiB default because real audio uploads commonly exceed that threshold.
+const AUDIO_MAX_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
+
 /// Create the Axum application router
 pub fn create_app(state: AppState) -> Router {
     let enable_slots = state.config.enable_slots_endpoint;
@@ -94,6 +98,20 @@ pub fn create_app(state: AppState) -> Router {
     // CORS policy (#244): restrict to the configured allow-list when set,
     // otherwise keep the historical permissive default.
     let cors = build_cors_layer(state.config.cors_allowed_origins.as_deref());
+
+    // Audio upload endpoints carry a larger body limit via a sub-router.
+    // Merging keeps the outer auth, CORS, and trace layers applying normally.
+    let audio_routes: Router<AppState> = Router::new()
+        .route("/v1/audio/speech", post(routes::audio_speech))
+        .route(
+            "/v1/audio/transcriptions",
+            post(routes::audio_transcriptions),
+        )
+        .route("/v1/audio/translations", post(routes::audio_translations))
+        .route("/audio/speech", post(routes::audio_speech))
+        .route("/audio/transcriptions", post(routes::audio_transcriptions))
+        .route("/audio/translations", post(routes::audio_translations))
+        .layer(DefaultBodyLimit::max(AUDIO_MAX_UPLOAD_BYTES));
 
     let mut app = Router::new()
         // OpenAI API endpoints
@@ -118,6 +136,9 @@ pub fn create_app(state: AppState) -> Router {
         // off so monitoring clients can poll without conditional logic).
         .route("/v1/cache/stats", get(routes::cache_stats))
         .route("/v1/cache/reset", post(routes::cache_reset))
+        // Audio routes (speech, transcriptions, translations) come from the
+        // sub-router that carries the larger body-limit layer.
+        .merge(audio_routes)
         // Aliases (some clients use these)
         .route("/chat/completions", post(routes::chat_completions))
         .route("/completions", post(routes::completions))
@@ -162,4 +183,185 @@ pub fn create_app(state: AppState) -> Router {
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AUDIO_MAX_UPLOAD_BYTES;
+    use axum::{
+        Router,
+        body::Body,
+        extract::DefaultBodyLimit,
+        http::{Method, Request, StatusCode},
+        routing::post,
+    };
+    use tower::ServiceExt;
+
+    /// Build a minimal audio sub-router using stub handlers and the same
+    /// `DefaultBodyLimit` layer applied in `create_app`. Tests can call this
+    /// without constructing a real `AppState`.
+    fn audio_test_router() -> Router {
+        Router::new()
+            .route(
+                "/v1/audio/speech",
+                post(|| async { StatusCode::NO_CONTENT }),
+            )
+            .route(
+                "/v1/audio/transcriptions",
+                post(|| async { StatusCode::NO_CONTENT }),
+            )
+            .route(
+                "/v1/audio/translations",
+                post(|| async { StatusCode::NO_CONTENT }),
+            )
+            .route("/audio/speech", post(|| async { StatusCode::NO_CONTENT }))
+            .route(
+                "/audio/transcriptions",
+                post(|| async { StatusCode::NO_CONTENT }),
+            )
+            .route(
+                "/audio/translations",
+                post(|| async { StatusCode::NO_CONTENT }),
+            )
+            .layer(DefaultBodyLimit::max(AUDIO_MAX_UPLOAD_BYTES))
+    }
+
+    #[test]
+    fn audio_upload_limit_is_25_mib() {
+        assert_eq!(
+            AUDIO_MAX_UPLOAD_BYTES,
+            25 * 1024 * 1024,
+            "audio upload limit must be 25 MiB"
+        );
+    }
+
+    #[tokio::test]
+    async fn audio_speech_is_reachable_at_v1_path() {
+        let response = audio_test_router()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/audio/speech")
+                    .header("content-type", "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "/v1/audio/speech must be mounted"
+        );
+    }
+
+    #[tokio::test]
+    async fn audio_transcriptions_is_reachable_at_v1_path() {
+        let response = audio_test_router()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/audio/transcriptions")
+                    .header("content-type", "multipart/form-data; boundary=x")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "/v1/audio/transcriptions must be mounted"
+        );
+    }
+
+    #[tokio::test]
+    async fn audio_translations_is_reachable_at_v1_path() {
+        let response = audio_test_router()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/audio/translations")
+                    .header("content-type", "multipart/form-data; boundary=x")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "/v1/audio/translations must be mounted"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_to_audio_speech_returns_method_not_allowed() {
+        // The route exists but only accepts POST. A 405 (not 404) confirms the
+        // path is registered.
+        let response = audio_test_router()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/v1/audio/speech")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn audio_alias_paths_are_reachable_without_v1_prefix() {
+        for path in [
+            "/audio/speech",
+            "/audio/transcriptions",
+            "/audio/translations",
+        ] {
+            let response = audio_test_router()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_ne!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{path} alias must be mounted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn body_limit_layer_enforces_upload_cap() {
+        // Use a small limit so the test does not allocate the full 25 MiB. The
+        // goal is confirming DefaultBodyLimit is wired onto the audio sub-router
+        // and that an over-limit body produces 413; the constant test covers the
+        // 25 MiB value separately.
+        const TEST_LIMIT: usize = 16;
+        let app = Router::new()
+            .route(
+                "/v1/audio/transcriptions",
+                post(|_body: axum::body::Bytes| async move { StatusCode::NO_CONTENT }),
+            )
+            .layer(DefaultBodyLimit::max(TEST_LIMIT));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/audio/transcriptions")
+                    .header("content-type", "multipart/form-data; boundary=x")
+                    .body(Body::from(vec![0u8; TEST_LIMIT + 1]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
 }

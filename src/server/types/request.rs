@@ -739,6 +739,57 @@ pub struct DetokenizeRequest {
     pub tokens: Vec<i32>,
 }
 
+// ---------------------------------------------------------------------------
+// Audio API request types (OpenAI-compatible)
+// Used by: routes/audio.rs
+// ---------------------------------------------------------------------------
+
+/// Text-to-speech request (POST /v1/audio/speech).
+///
+/// JSON body mirroring the OpenAI `audio/speech` payload. The response is
+/// binary audio rather than JSON.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AudioSpeechRequest {
+    /// Identifier of the speech model to use.
+    pub model: String,
+    /// Text to synthesize into audio.
+    pub input: String,
+    /// Optional named voice.
+    #[serde(default)]
+    pub voice: Option<String>,
+    /// Optional output container (`wav` today; others are a follow-up).
+    #[serde(default)]
+    pub response_format: Option<String>,
+    /// Optional playback-speed multiplier.
+    #[serde(default)]
+    pub speed: Option<f32>,
+}
+
+/// Speech-to-text request schema (POST /v1/audio/transcriptions and
+/// /v1/audio/translations).
+///
+/// This struct mirrors the OpenAI transcription field schema for reference and
+/// future reuse. The live multipart handler parses the fields directly from the
+/// `multipart/form-data` stream and does not deserialize into this struct.
+/// `Deserialize` is derived to keep field naming aligned with the OpenAI JSON
+/// schema and to support JSON-based deserialization in tests or future contexts
+/// that do not use multipart upload.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AudioTranscriptionRequest {
+    /// Identifier of the speech model to use.
+    #[serde(default)]
+    pub model: String,
+    /// Optional ISO-639-1 source-language hint.
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Optional response container (`json`, `text`, `verbose_json`).
+    #[serde(default)]
+    pub response_format: Option<String>,
+    /// Optional sampling temperature.
+    #[serde(default)]
+    pub temperature: Option<f32>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -795,6 +846,33 @@ mod tests {
         assert_eq!(
             msg.content.image_urls(),
             vec!["data:image/png;base64,AAAA".to_string()]
+        );
+    }
+
+    #[test]
+    fn audio_transcription_request_deserializes_and_defaults() {
+        // All fields present: verify each is captured.
+        let full: AudioTranscriptionRequest = serde_json::from_str(
+            r#"{"model":"test-model","language":"en","response_format":"json","temperature":0.0}"#,
+        )
+        .expect("full form deserializes");
+        assert_eq!(full.model, "test-model");
+        assert_eq!(full.language.as_deref(), Some("en"));
+        assert_eq!(full.response_format.as_deref(), Some("json"));
+        assert_eq!(full.temperature, Some(0.0_f32));
+
+        // Omitted optional fields must default to None.
+        let minimal: AudioTranscriptionRequest =
+            serde_json::from_str(r#"{"model":"m"}"#).expect("minimal form deserializes");
+        assert_eq!(minimal.model, "m");
+        assert!(minimal.language.is_none(), "language defaults to None");
+        assert!(
+            minimal.response_format.is_none(),
+            "response_format defaults to None"
+        );
+        assert!(
+            minimal.temperature.is_none(),
+            "temperature defaults to None"
         );
     }
 }
