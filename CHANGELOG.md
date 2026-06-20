@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [v0.3.2] - 2026-06-20
+
+### Added
+- **Whisper speech-to-text on `/v1/audio/transcriptions` and `/v1/audio/translations`** (#371), and **Kokoro-82M text-to-speech with an iSTFTNet vocoder on `/v1/audio/speech`** (#374), served through new audio request and response plumbing on the `/v1/audio/*` surface (#368).
+- **`reasoning_content` on non-streaming chat completions**, splitting thinking-model output into a separate field that matches the streaming path (#359).
+- Warn at startup when a CPU-only build runs on a host that has an NVIDIA GPU (#372).
+
+### Performance
+- **Hardware-gated `MLX_MAX_OPS_PER_BUFFER` decode default.** Pre-M5 Apple Silicon (M1 to M4) gets a higher command-buffer op cap, raising steady-state decode by about 8 to 12% (gemma3n e2b 82.7 to 92.5 tok/s); M5 keeps the default with no change (#360).
+- **Turbo4Asym decode rerouted through dequant-then-SDPA**, lifting it from about 0.14x to 0.40x of fp16 with byte-exact output instead of the slow sparse-V path (#369).
+- Fuse the batched decode sampler into a single `[B]` dispatch (#339), add incremental per-sequence penalty-state caches (#344), and split batched prefill into compatible cohorts (#346).
+- Adaptive B=1 MTP enable or decline policy chosen from per-model profiling (#348).
+- Generalize the fused QKV+RMSNorm+RoPE path to standard RMSNorm, opt-in behind `MLXCEL_FUSED_QK_NORM` (#341).
+- `--recommend-quant` now suggests a Turbo KV-cache mode per model family and context range, advisory and opt-in only (#343).
+
+### Fixed
+- **Correct an f16/bf16 logprobs crash and corruption** where 2-byte scores were read as 4 bytes (#340).
+- Suppress gemma4_unified multimodal placeholder tokens that leaked into generated output (#351).
+- Reseed the RNG per row at the batched-prefill first-token sample, so a batched request's first token no longer depends on sibling rows (#356).
+
+### Docs
+- Align the Turbo KV `--recommend-quant` advisor, the `bench_kv_cache.sh` gates, and `docs/turbo-kv-cache.md` with the measured four-model decode sweep, and add ADR 0002 on why the split Turbo decode does not reproduce the upstream sparse-V speedup (#376).
+- Record the GB10/CUDA fused QK-norm decode result (#357) and Gemma3n decode profiles on M5 Max (#358, #345).
+
 ## [v0.3.1] - 2026-06-17
 
 ### Performance
@@ -897,6 +921,7 @@ Initial public release of mlxcel.
 - GitHub Actions release workflow for macOS ARM64
 - Profile mode for prefill/decode timing analysis
 
+[v0.3.2]: https://github.com/lablup/mlxcel/compare/v0.3.1...v0.3.2
 [v0.3.1]: https://github.com/lablup/mlxcel/compare/v0.3.0...v0.3.1
 [v0.3.0]: https://github.com/lablup/mlxcel/compare/v0.2.1...v0.3.0
 [v0.2.1]: https://github.com/lablup/mlxcel/compare/v0.2.0...v0.2.1

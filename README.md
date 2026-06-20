@@ -6,21 +6,22 @@
 
 High-performance LLM/VLM inference runtime and server for Apple Silicon. The CLI and server are implemented in Rust and execute models through native MLX C++ bindings. Linux/CUDA builds are supported as a secondary target.
 
-## New in v0.3
+## New in v0.3.2
 
-### v0.3.1
+### v0.3.2
 
-- **Fused decode-MoE now runs on CUDA.** The fused single-token MoE decode kernel was Metal-only in 0.3.0; it is now ported to CUDA, so Linux/CUDA GPUs such as NVIDIA GB10 get the same fast path with byte-identical greedy output. Measured gains run from about 10% to 55%, up to 1.55x on qwen3-moe.
-- **Six more MoE families on the fused kernel.** qwen2_moe, LFM2, qwen3_vl_moe, Mixtral, Phi-3.5-MoE, and OLMoE are now wired to the fused decode-MoE path. It self-gates by expert size (`MLXCEL_FUSED_MOE_MAX_DFF`, default 4096), so large-expert models such as Mixtral 8x7B and Phi-3.5-MoE keep the proven gather path with no regression. Set `MLXCEL_FUSED_MOE=0` to disable.
-- **BitNet on CUDA.** The BitLinear b1.58 ternary matmul kernel is ported to CUDA, so BitNet models run on CUDA GPUs.
-- **Loads non-affine quantized VLM checkpoints.** Non-affine VLM weights now load with the correct quant mode and group size, so checkpoints such as minicpm-v mxfp4 work instead of failing.
+- **Audio in and out.** Whisper speech-to-text and Kokoro-82M text-to-speech serve the OpenAI `/v1/audio/*` endpoints (transcription, translation, and speech), with the request and response plumbing in `mlxcel-server`.
+- **`reasoning_content` on non-streaming chat.** Thinking-model output is split into a separate `reasoning_content` field on non-streaming responses, matching the streaming path.
+- **Faster decode on M1 to M4.** A hardware-gated MLX command-buffer op cap raises steady-state decode on pre-M5 Apple Silicon by about 8 to 12% (gemma3n e2b 82.7 to 92.5 tok/s).
+- **Turbo4Asym decode fixed and re-benchmarked.** The asymmetric Turbo KV decode path was rerouted through dequant-then-SDPA, lifting it from about 0.14x to 0.40x of fp16 with byte-exact output. The `--recommend-quant` advisor, the bench gates, and the docs now reflect the measured trade-off: quantized KV saves memory, it does not speed up decode.
+- **Batched sampling fixes.** Per-row RNG reseed at the batched-prefill first token, a single-dispatch batched sampler, incremental penalty-state caches, and a fix for an f16/bf16 logprobs crash.
 
-### v0.3.0
+### v0.3
 
-- **Nine new model families.** BitNet b1.58 (1.58-bit ternary), IBM Granite dense and GraniteMoeHybrid, LFM2 / LFM2-MoE, Falcon-H1, PLaMo 2, Apertus, ByteDance Seed-OSS, and dots.llm1 MoE, on top of the existing Llama, Qwen, Gemma, and DeepSeek coverage.
-- **Faster MoE decode, on by default.** The fused decode-MoE Metal kernel beats the previous gather path on single-token decode (about 13% on Gemma 4) and is enabled by default.
-- **Loads newer mixed-precision checkpoints.** mlxcel reads per-layer mixed bit widths and bf16 quantization scales, so recent mlx-community exports (for example 8-bit embeddings under a 4-bit default) load correctly. A bf16-scale decode regression on M1 Ultra is also fixed.
-- **Linux CUDA release builds.** Prebuilt x86_64 and aarch64 CUDA artifacts ship with bundled CCCL headers and reuse JIT-compiled kernels across runs through a persistent PTX cache.
+- **Nine new model families.** BitNet b1.58, IBM Granite dense and GraniteMoeHybrid, LFM2 and LFM2-MoE, Falcon-H1, PLaMo 2, Apertus, ByteDance Seed-OSS, and dots.llm1 MoE, on top of the existing Llama, Qwen, Gemma, and DeepSeek coverage.
+- **Fused decode-MoE on Metal and CUDA.** The fused single-token MoE decode kernel is on by default on Metal and ported to CUDA, covering qwen3-moe, qwen2_moe, LFM2, qwen3_vl_moe, Mixtral, Phi-3.5-MoE, and OLMoE with byte-identical greedy output. The BitNet ternary matmul also runs on CUDA.
+- **Linux x86_64 and aarch64 CUDA release builds**, with bundled CCCL headers and a persistent PTX cache that reuses JIT-compiled kernels across runs.
+- **Loads newer mixed-precision and non-affine checkpoints.** Per-layer mixed bit widths, bf16 quantization scales, and non-affine VLM weights load correctly (for example minicpm-v mxfp4). A bf16-scale decode regression on M1 Ultra is also fixed.
 
 See the [changelog](CHANGELOG.md) for the full list.
 

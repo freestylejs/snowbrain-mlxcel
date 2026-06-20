@@ -1,3 +1,22 @@
+mlxcel (0.3.2-1~jammy1) jammy; urgency=medium
+
+  * Added: Whisper speech-to-text (#371) and Kokoro-82M text-to-speech with an
+    iSTFTNet vocoder (#374) on the OpenAI /v1/audio/* endpoints, with the audio
+    request and response plumbing (#368).
+  * Added: reasoning_content on non-streaming chat completions (#359).
+  * Performance: hardware-gated MLX_MAX_OPS_PER_BUFFER decode default raises
+    pre-M5 Apple Silicon decode by about 8-12% (#360).
+  * Performance: Turbo4Asym decode rerouted through dequant-then-SDPA, about
+    0.14x to 0.40x of fp16 with byte-exact output (#369).
+  * Performance: single-dispatch batched sampler (#339), incremental penalty
+    caches (#344), batched-prefill cohorts (#346), adaptive B=1 MTP policy
+    (#348), and the --recommend-quant Turbo KV advisor (#343).
+  * Fixed: f16/bf16 logprobs crash and corruption (#340).
+  * Fixed: suppress gemma4_unified multimodal placeholder tokens (#351).
+  * Fixed: reseed RNG per row at the batched-prefill first-token sample (#356).
+
+ -- Jeongkyu Shin <inureyes@gmail.com>  Sat, 20 Jun 2026 19:31:52 +0900
+
 mlxcel (0.3.1-1~jammy1) jammy; urgency=medium
 
   * Performance: fused decode-MoE kernel ported to CUDA, so Linux/CUDA GPUs
