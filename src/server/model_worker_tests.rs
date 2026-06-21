@@ -24,6 +24,7 @@ use super::{
 use crate::SamplingConfig;
 use crate::server::media::ImageInputLimits;
 use crate::tokenizer::MlxcelTokenizer;
+use crate::worker_failfast::run_core_thread_or_abort;
 
 fn encode_png_bytes() -> Vec<u8> {
     let image = DynamicImage::ImageRgb8(ImageBuffer::from_pixel(1, 1, Rgb([0, 0, 0])));
@@ -383,4 +384,46 @@ fn token_piece_identifies_byte_fallback_tokens() {
 
     // Out-of-vocabulary ID returns None.
     assert_eq!(tokenizer.token_piece(9999), None);
+}
+
+/// `run_core_thread_or_abort` runs a non-panicking body to completion and lets
+/// it observe its side effects, behaving as a transparent wrapper on the happy
+/// path (issue #375).
+///
+/// The abort path (a panicking body calls `std::process::abort()`) cannot be
+/// exercised in-process: `abort` terminates the whole test runner, so a panic
+/// test here would kill every other test. It is verified manually instead, by
+/// forcing a panic on a core worker thread in a release build and observing the
+/// process exit with the "aborting to preserve fail-fast" log line rather than
+/// a hung server. A subprocess re-exec harness could assert the abort, but the
+/// added flakiness is not worth it for a one-line `process::abort`.
+#[test]
+fn run_core_thread_or_abort_runs_body_to_completion() {
+    use std::cell::Cell;
+
+    let ran = Cell::new(false);
+    let mut returned = 0u32;
+    run_core_thread_or_abort("test-core-thread", || {
+        ran.set(true);
+        returned = 7;
+    });
+
+    assert!(ran.get(), "the non-panicking body must run to completion");
+    assert_eq!(
+        returned, 7,
+        "side effects of the body must be observable after the wrapper returns"
+    );
+}
+
+/// A body that returns a recoverable `Err` must not abort: the value is
+/// forwarded unchanged to the caller. Only a panic triggers the abort; a
+/// normal return, including `Err`, is not a panic.
+#[test]
+fn run_core_thread_or_abort_forwards_err_without_aborting() {
+    let result: Result<(), &str> = run_core_thread_or_abort("test-err-fwd", || Err("recoverable"));
+    assert_eq!(
+        result,
+        Err("recoverable"),
+        "a recoverable Err return must be forwarded, not treated as a panic"
+    );
 }
