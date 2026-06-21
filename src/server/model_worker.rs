@@ -574,7 +574,11 @@ fn run_disaggregated_serving_role(
                 bind = %bind_addr, decode_peer = %decode_peer,
                 "Starting the disaggregated prefill serving role"
             );
-            serve_prefill_role_networked_blocking(bind, decode_peer.to_string(), scheduler, None)
+            // Pass the configured decode peers: the first entry is the static
+            // handoff fallback used when the router omits `decode_target`. The
+            // router-target allowlist is read separately from the dedicated
+            // MLXCEL_DECODE_ALLOWLIST env input in the coordinator (issue #389).
+            serve_prefill_role_networked_blocking(bind, decode_peers.to_vec(), scheduler, None)
         }
         ServingMode::DecodeOnly => {
             tracing::info!(bind = %bind_addr, "Starting the disaggregated decode serving role");
