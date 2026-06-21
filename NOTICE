@@ -25,21 +25,25 @@ NOTICE file, as required by Apache License 2.0 Section 4(d):
     (https://github.com/TheTom/turboquant_plus).
 
 
-mlx-lm and mlx-vlm
-------------------
+mlx-lm, mlx-vlm, and mlx-audio
+------------------------------
 
 Portions of mlxcel's model architectures, tokenizer handling, batch
 scheduler, and server API translators are ported from or mirror mlx-lm
 (https://github.com/ml-explore/mlx-lm), Copyright 2023 Apple Inc., and
 mlx-vlm (https://github.com/Blaizzy/mlx-vlm), Copyright 2025 Prince Canuma.
-Both are licensed under the MIT License. The MIT License requires that the
-copyright and permission notices be retained in substantial portions, so
+Portions of mlxcel's audio model coverage and DSP (text-to-speech and
+speech-to-text feature extraction) are ported from or mirror mlx-audio
+(https://github.com/Blaizzy/mlx-audio), Copyright 2024 Prince Canuma.
+All three are licensed under the MIT License. The MIT License requires that
+the copyright and permission notices be retained in substantial portions, so
 they are reproduced below:
 
     MIT License
 
     Copyright © 2023 Apple Inc. (mlx-lm)
     Copyright © 2025 Prince Canuma (mlx-vlm)
+    Copyright © 2024 Prince Canuma (mlx-audio)
 
     Permission is hereby granted, free of charge, to any person obtaining a
     copy of this software and associated documentation files (the
