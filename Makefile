@@ -8,6 +8,23 @@
 CARGO := cargo
 RUSTFLAGS := RUSTFLAGS="-C target-cpu=native"
 
+# ----------------------------------------------------------------------------
+# Release accelerator features (platform-aware)
+#
+# macOS (Apple Silicon) always builds with Metal + Accelerate, matching the CI
+# feature set and the canonical `--features metal,accelerate` build in CLAUDE.md.
+#
+# Linux is intentionally accelerator-neutral: a Linux host may carry any of
+# several accelerators, so we never assume CUDA here. Pick an explicit target
+# (`make release-cuda`, plus future siblings) for the chip you actually have.
+# ----------------------------------------------------------------------------
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+RELEASE_FEATURES := metal,accelerate
+endif
+# Expands to `--features <list>` only when RELEASE_FEATURES is set; empty on Linux.
+RELEASE_FEATURE_FLAG := $(if $(RELEASE_FEATURES),--features $(RELEASE_FEATURES))
+
 # Binary names
 BIN_CLI := mlxcel
 BIN_SERVER := mlxcel-server
@@ -98,21 +115,35 @@ build-server: ## Build only the server binary
 	$(CARGO) build --bin $(BIN_SERVER)
 
 .PHONY: release
-release: ## Build in release mode (optimized)
+release: ## Build in release mode (optimized; macOS adds metal,accelerate)
 	@echo "$(CYAN)Building in release mode...$(RESET)"
-	$(RUSTFLAGS) $(CARGO) build --release
+	$(RUSTFLAGS) $(CARGO) build --release $(RELEASE_FEATURE_FLAG)
 	@echo "$(GREEN)Release build complete!$(RESET)"
 	@echo "Binaries: target/release/$(BIN_CLI), target/release/$(BIN_SERVER)"
 
 .PHONY: release-cli
 release-cli: ## Build CLI in release mode
 	@echo "$(CYAN)Building CLI in release mode...$(RESET)"
-	$(RUSTFLAGS) $(CARGO) build --release --bin $(BIN_CLI)
+	$(RUSTFLAGS) $(CARGO) build --release $(RELEASE_FEATURE_FLAG) --bin $(BIN_CLI)
 
 .PHONY: release-server
 release-server: ## Build server in release mode
 	@echo "$(CYAN)Building server in release mode...$(RESET)"
-	$(RUSTFLAGS) $(CARGO) build --release --bin $(BIN_SERVER)
+	$(RUSTFLAGS) $(CARGO) build --release $(RELEASE_FEATURE_FLAG) --bin $(BIN_SERVER)
+
+# ----------------------------------------------------------------------------
+# Linux accelerator release targets (explicit, opt-in)
+#
+# One target per backend. CUDA is the first; add siblings (e.g. release-rocm,
+# release-vulkan) here as backends land. Each builds both binaries with the
+# matching mlxcel-core feature gate.
+# ----------------------------------------------------------------------------
+.PHONY: release-cuda
+release-cuda: ## Build in release mode with CUDA (Linux/NVIDIA)
+	@echo "$(CYAN)Building in release mode with CUDA...$(RESET)"
+	$(RUSTFLAGS) $(CARGO) build --release --features cuda
+	@echo "$(GREEN)Release (CUDA) build complete!$(RESET)"
+	@echo "Binaries: target/release/$(BIN_CLI), target/release/$(BIN_SERVER)"
 
 .PHONY: debug
 debug: build ## Alias for build (debug mode)
