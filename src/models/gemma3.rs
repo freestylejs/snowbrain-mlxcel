@@ -35,11 +35,48 @@ use mlxcel_core::generate::DecodeBatchContext;
 use mlxcel_core::layers::{
     FusedQKVLinear, GemmaRMSNorm, KVCache, RotatingKVCache, UnifiedEmbedding, UnifiedLinear,
 };
-use mlxcel_core::utils::{create_causal_mask, create_causal_mask_with_window, pipeline_hint};
+use mlxcel_core::utils::{
+    create_causal_mask, create_causal_mask_with_window, create_causal_mask_with_window_full,
+    pipeline_hint,
+};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use std::path::Path;
+
+/// Build the sliding-window prefill mask for a multi-token (`seq_len > 1`) pass.
+///
+/// The full mask is only used for a fresh single-pass prefill
+/// (`sliding_offset == 0`). For a fresh prefill longer than the sliding window
+/// the rotating cache returns ALL `seq_len` prefill keys (it only trims to
+/// `window` on a later append), so a capped `[seq_len, window]` mask would both
+/// fail to broadcast against the full key axis and, where the attention layer
+/// slices K/V to the trailing `window` keys, strand the earliest query rows
+/// (logical position `< seq_len - window`) with no visible key: an all-masked
+/// row that softmaxes to NaN and degenerates the output (issue #401). The full
+/// `[seq_len, seq_len + offset]` windowed mask keeps every query row attending
+/// to its own window. Mirrors mlx-lm's `RotatingKVCache` prefill, where the
+/// window's correctness comes from the mask, not from dropping keys.
+///
+/// For a non-fresh multi-token append (`sliding_offset > 0`) the rotating cache
+/// trims to `window` keys, and Gemma 3 passes the mask directly to attention
+/// with no `trim_mask_to_keys` step (unlike Gemma 4). The clamped
+/// `[seq_len, window]` path is used so the mask stays aligned with the trimmed
+/// key axis: the else branch collapses `effective_offset` to `0` (because
+/// `(window - seq_len).max(0) == 0` when `seq_len > window`) and the windowed
+/// values stay correct since `sliding_offset` cancels in the relative query/key
+/// relation.
+///
+/// The full mask is only taken when `seq_len > window && sliding_offset == 0`;
+/// all other cases use the clamped path.
+fn sliding_prefill_mask(seq_len: i32, sliding_offset: i32, window: i32) -> UniquePtr<MlxArray> {
+    if seq_len > window && sliding_offset == 0 {
+        create_causal_mask_with_window_full(seq_len, sliding_offset, Some(window))
+    } else {
+        let effective_offset = sliding_offset.min((window - seq_len).max(0));
+        create_causal_mask_with_window(seq_len, effective_offset, Some(window))
+    }
+}
 
 // Configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -768,15 +805,10 @@ impl Gemma3Model {
 
             let sliding_mask = if self.sliding_window_pattern > 1 {
                 let sliding_offset = caches[0].as_interface().offset();
-                // Clamp offset so mask shape matches RotatingKVCache output.
-                // The cache returns at most max_size tokens, so the mask's
-                // total_len (= seq_len + offset) must not exceed max_size.
-                let max_cache = self.sliding_window as i32;
-                let effective_offset = sliding_offset.min((max_cache - seq_len).max(0));
-                Some(create_causal_mask_with_window(
+                Some(sliding_prefill_mask(
                     seq_len,
-                    effective_offset,
-                    Some(max_cache),
+                    sliding_offset,
+                    self.sliding_window as i32,
                 ))
             } else {
                 None
@@ -1055,12 +1087,10 @@ impl Gemma3StageModel {
 
             let sliding_mask = if self.first_sliding_cache_index().is_some() {
                 let sliding_offset = caches[self.first_sliding_cache_index().unwrap()].offset();
-                let max_cache = self.sliding_window as i32;
-                let effective_offset = sliding_offset.min((max_cache - seq_len).max(0));
-                Some(create_causal_mask_with_window(
+                Some(sliding_prefill_mask(
                     seq_len,
-                    effective_offset,
-                    Some(max_cache),
+                    sliding_offset,
+                    self.sliding_window as i32,
                 ))
             } else {
                 None
@@ -1318,5 +1348,52 @@ impl mlxcel_core::generate::LanguageModel for Gemma3Wrapper {
 
     fn eos_token_ids(&self) -> Vec<i32> {
         vec![0, 1, 106] // Gemma3: <pad> (0), <eos> (1), <end_of_turn> (106)
+    }
+}
+
+#[cfg(test)]
+mod gemma3_mask_tests {
+    use super::*;
+
+    fn mask_at(mask: &MlxArray, q: i32, k: i32) -> f32 {
+        let scalar = mlxcel_core::slice(mask, &[q, k], &[q + 1, k + 1]);
+        mlxcel_core::item_f32(&scalar)
+    }
+
+    /// Issue #401: a fresh single-pass prefill (`sliding_offset == 0`) longer
+    /// than the sliding window keeps every prefill key, so the mask must span
+    /// the full `[seq_len, seq_len]` key axis and have no fully-masked row.
+    #[test]
+    fn sliding_prefill_mask_fresh_over_window_spans_full_key_axis() {
+        let mask = sliding_prefill_mask(4, 0, 2);
+        mlxcel_core::eval(&mask);
+        assert_eq!(
+            mlxcel_core::array_shape(&mask),
+            vec![4, 4],
+            "fresh over-window prefill mask must span the full key axis"
+        );
+        // Every query row must attend to at least itself (diagonal == 0.0),
+        // proving no all-masked row that would softmax to NaN.
+        for q in 0..4 {
+            assert_eq!(mask_at(&mask, q, q), 0.0, "row {q} must attend to itself");
+        }
+    }
+
+    /// Issue #401 / PR #405 follow-up: a non-fresh multi-token append
+    /// (`sliding_offset > 0`) over the window has its K/V trimmed to `window`
+    /// keys by the rotating cache, and Gemma 3 forwards the mask directly with
+    /// no `trim_mask_to_keys` step. The mask must therefore be clamped to
+    /// `[seq_len, window]` so it broadcasts against the trimmed key axis. The
+    /// pre-fix full mask was `[seq_len, seq_len + sliding_offset]` (here
+    /// `[4, 7]`), which fails to broadcast and crashes.
+    #[test]
+    fn sliding_prefill_mask_nonfresh_over_window_matches_trimmed_cache() {
+        let mask = sliding_prefill_mask(4, 3, 2);
+        mlxcel_core::eval(&mask);
+        assert_eq!(
+            mlxcel_core::array_shape(&mask),
+            vec![4, 2],
+            "non-fresh over-window prefill mask must match the window-trimmed key axis"
+        );
     }
 }
