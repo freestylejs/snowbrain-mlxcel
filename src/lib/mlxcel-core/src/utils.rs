@@ -566,7 +566,7 @@ pub fn create_causal_mask_with_window(
 
 /// Create a sliding-window causal mask sized to the *full* key axis, without
 /// the `min(size + offset, window)` cap applied by [`create_causal_mask_with_window`].
-/// Used by: Gemma 3, Gemma 4 single-pass prefill longer than the sliding window
+/// Used by: Gemma 3, Gemma 4 single-pass prefill longer than the sliding window, Cohere2/Gemma3n/Olmo3 dense prefill (#413)
 ///
 /// # Arguments
 /// * `size` - Size of the query sequence
@@ -648,8 +648,8 @@ pub fn create_causal_mask_with_window_full(
 /// to the trailing window must slice to the mask's key dimension (not blindly
 /// to `window`) so they keep the full key set when this returns the full mask.
 ///
-/// Used by: GptOss, Mellum, Exaone4, ExaoneMoE, Ministral3, Step3P5, Cohere2,
-/// Gemma3n, Olmo3, Gemma3, Gemma4 sliding-window prefill mask construction.
+/// Used by: GptOss, Mellum, Exaone4, ExaoneMoE, Ministral3, Step3P5, Gemma3,
+/// Gemma4 sliding-window prefill mask construction.
 ///
 /// Gemma3 carries the documented `sliding_offset == 0` invariant (no trim step,
 /// so it can legitimately see `sliding_offset > 0` with `size > window` under
@@ -673,6 +673,46 @@ pub fn create_sliding_window_prefill_mask(
         let effective_offset = sliding_offset.min((window - size).max(0));
         create_causal_mask_with_window(size, effective_offset, Some(window))
     }
+}
+
+/// Dense-`KVCache` variant of [`create_sliding_window_prefill_mask`].
+///
+/// A dense `KVCache` retains EVERY key (it never trims to `window`, unlike a
+/// `RotatingKVCache`), and the consumer slices K/V to the mask's key axis. So
+/// the correct prefill mask is ALWAYS the full `[size, size + sliding_offset]`
+/// windowed-causal mask over all retained keys, for every size/offset
+/// combination. There is no clamped branch: the full mask keeps every key and
+/// the window is enforced by the mask, not by physically dropping keys.
+///
+/// For the common within-window prefill (`size + sliding_offset <= window`)
+/// this is byte-identical to [`create_sliding_window_prefill_mask`]: the
+/// clamped builder takes its non-capped path and produces the same
+/// `tril(offset)` intersect `triu(offset - window + 1)` band over `[size,
+/// size + sliding_offset]`, so greedy output there is unchanged. The full mask
+/// fixes the two dense-cache degeneration cases the clamped path caused once
+/// the total exceeded the window:
+///
+/// 1. `size > window` (at any offset): the clamped `[size, window]` mask's
+///    `tril` diagonal `window - size < 0` stranded the earliest query rows
+///    (logical position `< size - window`) with an all-`-inf` row, which
+///    softmaxed to NaN and decoded to `<pad>`.
+/// 2. `size <= window && size + sliding_offset > window`: the clamped path's
+///    trailing-`window` K/V slice dropped the OLDEST in-window keys for the
+///    earliest query rows, silently narrowing their attention window
+///    (coherent-but-wrong output rather than NaN/`<pad>`).
+///
+/// The rotating-cache helper [`create_sliding_window_prefill_mask`] keeps the
+/// clamped path because a `RotatingKVCache` physically returns at most `window`
+/// keys once it has rolled over, so the clamped mask is the matching shape.
+/// See issue #413.
+///
+/// Used by: Cohere2, Gemma3n, Olmo3 sliding-window prefill mask construction.
+pub fn create_sliding_window_prefill_mask_dense(
+    size: i32,
+    sliding_offset: i32,
+    window: i32,
+) -> UniquePtr<MlxArray> {
+    create_causal_mask_with_window_full(size, sliding_offset, Some(window))
 }
 
 /// Create a boolean causal attention mask with optional sliding window.
@@ -1398,6 +1438,169 @@ mod tests {
                 assert_eq!(a.is_finite(), b.is_finite(), "cell ({q},{k}) finiteness");
                 if a.is_finite() {
                     assert_eq!(a, b, "cell ({q},{k}) value");
+                }
+            }
+        }
+    }
+
+    // --- Dense-cache sliding-window prefill mask selector (issue #413) -----
+
+    /// The in-scope fix: a dense `KVCache` over-window prefill at a non-zero
+    /// offset (`size > window && sliding_offset > 0`) must select the full
+    /// `[size, size + offset]` mask so every retained key stays visible and no
+    /// early query row is stranded all-`-inf` (the NaN/`<pad>` failure of the
+    /// old clamped path). Equals `create_causal_mask_with_window_full` exactly.
+    #[test]
+    fn sliding_window_prefill_mask_dense_full_when_rolled_over_window() {
+        let size = 4;
+        let offset = 3;
+        let window = 2;
+        let prefill = create_sliding_window_prefill_mask_dense(size, offset, window);
+        assert_eq!(
+            ffi::array_shape(&prefill),
+            vec![size, size + offset],
+            "dense over-window prefill must use the full [size, size + offset] mask"
+        );
+        let full = create_causal_mask_with_window_full(size, offset, Some(window));
+        let at =
+            |m: &MlxArray, q: i32, k: i32| ffi::item_f32(&ffi::slice(m, &[q, k], &[q + 1, k + 1]));
+        for q in 0..size {
+            for k in 0..(size + offset) {
+                let a = at(&prefill, q, k);
+                let b = at(&full, q, k);
+                assert_eq!(a.is_finite(), b.is_finite(), "cell ({q},{k}) finiteness");
+                if a.is_finite() {
+                    assert_eq!(a, b, "cell ({q},{k}) value");
+                }
+            }
+            // No query row is fully masked: each attends to its own logical
+            // key at column `q + offset`. This is the row the old clamped path
+            // left all-`-inf` for logical position `< size - window`.
+            assert_eq!(
+                at(&prefill, q, q + offset),
+                0.0,
+                "row {q} must attend to its own key at column {}",
+                q + offset
+            );
+        }
+    }
+
+    /// The adjacent latent fix: a within-window chunk (`size <= window`) whose
+    /// offset pushes the total past the window (`size + sliding_offset >
+    /// window`). The dense helper now returns the full `[size, size + offset]`
+    /// mask instead of the clamped `[size, window]` mask, so the earliest query
+    /// rows keep their OLDEST in-window keys instead of having them sliced away
+    /// (coherent-but-wrong output under the old clamped path, not NaN/`<pad>`).
+    #[test]
+    fn sliding_window_prefill_mask_dense_full_when_within_window_over_total() {
+        let size = 2;
+        let offset = 9;
+        let window = 4;
+        let prefill = create_sliding_window_prefill_mask_dense(size, offset, window);
+        assert_eq!(
+            ffi::array_shape(&prefill),
+            vec![size, size + offset],
+            "within-window over-total prefill must use the full [size, size + offset] mask, not the clamped [size, window]"
+        );
+        let full = create_causal_mask_with_window_full(size, offset, Some(window));
+        let at =
+            |m: &MlxArray, q: i32, k: i32| ffi::item_f32(&ffi::slice(m, &[q, k], &[q + 1, k + 1]));
+        for q in 0..size {
+            for k in 0..(size + offset) {
+                let a = at(&prefill, q, k);
+                let b = at(&full, q, k);
+                assert_eq!(a.is_finite(), b.is_finite(), "cell ({q},{k}) finiteness");
+                if a.is_finite() {
+                    assert_eq!(a, b, "cell ({q},{k}) value");
+                }
+            }
+        }
+        // Row 0 holds logical position offset=9; its full window is keys
+        // [6..=9]. The old clamped path sliced K/V to the trailing `window`=4
+        // keys and dropped key 6 (the oldest in-window key) for this row; the
+        // full mask now attends to it.
+        assert_eq!(
+            at(&prefill, 0, 6),
+            0.0,
+            "row 0 must attend oldest in-window key 6"
+        );
+        assert_eq!(at(&prefill, 0, 9), 0.0, "row 0 causal boundary key 9");
+        assert!(
+            !at(&prefill, 0, 5).is_finite(),
+            "row 0 key 5 is below the window"
+        );
+        assert!(
+            !at(&prefill, 0, 10).is_finite(),
+            "row 0 key 10 is in the future"
+        );
+        // Row 1 holds logical position 10; its window is keys [7..=10].
+        assert_eq!(
+            at(&prefill, 1, 7),
+            0.0,
+            "row 1 must attend oldest in-window key 7"
+        );
+        assert_eq!(at(&prefill, 1, 10), 0.0, "row 1 causal boundary key 10");
+        assert!(
+            !at(&prefill, 1, 6).is_finite(),
+            "row 1 key 6 is below the window"
+        );
+    }
+
+    /// A fresh dense over-window prefill (`sliding_offset == 0`) is identical
+    /// to the rotating helper: both build the full `[size, size]` mask.
+    #[test]
+    fn sliding_window_prefill_mask_dense_matches_fresh_over_window() {
+        let dense = create_sliding_window_prefill_mask_dense(4, 0, 2);
+        let rotating = create_sliding_window_prefill_mask(4, 0, 2);
+        assert_eq!(
+            ffi::array_shape(&dense),
+            ffi::array_shape(&rotating),
+            "fresh over-window dense and rotating helpers must match shape"
+        );
+        let at =
+            |m: &MlxArray, q: i32, k: i32| ffi::item_f32(&ffi::slice(m, &[q, k], &[q + 1, k + 1]));
+        for q in 0..4 {
+            for k in 0..4 {
+                let a = at(&dense, q, k);
+                let b = at(&rotating, q, k);
+                assert_eq!(a.is_finite(), b.is_finite(), "cell ({q},{k}) finiteness");
+                if a.is_finite() {
+                    assert_eq!(a, b, "cell ({q},{k}) value");
+                }
+            }
+        }
+    }
+
+    /// For within-total prefills (`size + sliding_offset <= window`) the dense
+    /// helper is byte-identical to the rotating helper: the rotating clamped
+    /// builder takes its non-capped path there, so greedy output for the common
+    /// within-window prefill is unchanged. (The `size + sliding_offset > window`
+    /// cases now diverge on purpose and are covered by the dense-full tests.)
+    #[test]
+    fn sliding_window_prefill_mask_dense_within_window_byte_identical() {
+        let at =
+            |m: &MlxArray, q: i32, k: i32| ffi::item_f32(&ffi::slice(m, &[q, k], &[q + 1, k + 1]));
+        for &(size, offset, window) in &[(3, 0, 8), (3, 2, 8)] {
+            let dense = create_sliding_window_prefill_mask_dense(size, offset, window);
+            let rotating = create_sliding_window_prefill_mask(size, offset, window);
+            assert_eq!(
+                ffi::array_shape(&dense),
+                ffi::array_shape(&rotating),
+                "({size},{offset},{window}) dense and rotating shapes must match"
+            );
+            let cols = ffi::array_shape(&dense)[1];
+            for q in 0..size {
+                for k in 0..cols {
+                    let a = at(&dense, q, k);
+                    let b = at(&rotating, q, k);
+                    assert_eq!(
+                        a.is_finite(),
+                        b.is_finite(),
+                        "({size},{offset},{window}) cell ({q},{k}) finiteness"
+                    );
+                    if a.is_finite() {
+                        assert_eq!(a, b, "({size},{offset},{window}) cell ({q},{k}) value");
+                    }
                 }
             }
         }
