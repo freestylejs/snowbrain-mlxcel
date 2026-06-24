@@ -183,6 +183,12 @@ pub fn sanitize(weights: WeightMap) -> WeightMap {
 
 /// PyTorch conv weights are `(out, in, kH, kW)`; MLX wants NHWC
 /// `(out, kH, kW, in)`. Transpose any 4D `*.conv.weight`.
+///
+/// This runs only inside [`sanitize`], which the caller invokes only when
+/// [`needs_sanitize`] has already determined the checkpoint is raw
+/// HuggingFace (PyTorch) layout, so an unconditional transpose is correct and
+/// a layout guard here would wrongly skip stem convs whose shape is ambiguous
+/// (e.g. a `[out, 3, 3, 3]` RGB 3x3 stem conv).
 fn maybe_transpose_conv(key: &str, value: UniquePtr<MlxArray>) -> UniquePtr<MlxArray> {
     if key.ends_with(".conv.weight") {
         let shape = mlxcel_core::array_shape(&value);
@@ -312,5 +318,31 @@ mod tests {
             mlxcel_core::zeros(&[1], mlxcel_core::dtype::FLOAT32),
         );
         assert!(needs_sanitize(&hf_map));
+    }
+
+    #[test]
+    fn maybe_transpose_conv_transposes_pytorch_layout() {
+        // PyTorch stem conv [out=64, in=3, kH=7, kW=7]; in != kernel makes the
+        // layout unambiguous. transpose[0,2,3,1]: [64, 7, 7, 3].
+        let value = mlxcel_core::ones(&[64, 3, 7, 7], mlxcel_core::dtype::FLOAT32);
+        let out = maybe_transpose_conv("vision.backbone.embedder.0.conv.weight", value);
+        assert_eq!(mlxcel_core::array_shape(&out), vec![64, 7, 7, 3]);
+
+        // PyTorch conv [out=8, in=16, kH=3, kW=3] where in > out also resolves
+        // to PyTorch layout. transpose[0,2,3,1]: [8, 3, 3, 16].
+        let value = mlxcel_core::ones(&[8, 16, 3, 3], mlxcel_core::dtype::FLOAT32);
+        let out = maybe_transpose_conv("vision.backbone.embedder.0.conv.weight", value);
+        assert_eq!(mlxcel_core::array_shape(&out), vec![8, 3, 3, 16]);
+    }
+
+    #[test]
+    fn maybe_transpose_conv_transposes_ambiguous_rgb_stem() {
+        // The ResNet-vd stem first conv is a 3x3 over 3-channel RGB input, so
+        // its PyTorch shape [out, in=3, kH=3, kW=3] has in == kH == kW. This
+        // runs only after needs_sanitize confirmed raw-HF layout, so it must
+        // still be transposed [0,2,3,1] even though the shape looks square.
+        let value = mlxcel_core::ones(&[32, 3, 3, 3], mlxcel_core::dtype::FLOAT32);
+        let out = maybe_transpose_conv("vision.backbone.embedder.0.conv.weight", value);
+        assert_eq!(mlxcel_core::array_shape(&out), vec![32, 3, 3, 3]);
     }
 }
