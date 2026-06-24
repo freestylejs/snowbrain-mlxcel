@@ -649,7 +649,17 @@ pub fn create_causal_mask_with_window_full(
 /// to `window`) so they keep the full key set when this returns the full mask.
 ///
 /// Used by: GptOss, Mellum, Exaone4, ExaoneMoE, Ministral3, Step3P5, Cohere2,
-/// Gemma3n, Olmo3 sliding-window prefill mask construction.
+/// Gemma3n, Olmo3, Gemma3, Gemma4 sliding-window prefill mask construction.
+///
+/// Gemma3 carries the documented `sliding_offset == 0` invariant (no trim step,
+/// so it can legitimately see `sliding_offset > 0` with `size > window` under
+/// chunked prefill or multi-turn reuse and needs the clamped path). Gemma4
+/// routes through `trim_mask_to_keys`: when `size > window && sliding_offset > 0`,
+/// RotatingKVCache trims to exactly `window` keys and `trim_mask_to_keys` crops
+/// the full `[size, size+offset]` mask to its trailing `window` columns, which
+/// is the same band as the clamped output of this helper (`q-size+1 <= k <=
+/// q-size+window`, independent of offset). Old-trimmed equals new for every
+/// input, so the migration is behaviour-preserving (#410).
 ///
 /// [`RotatingKVCache`]: crate::cache::RotatingKVCache
 pub fn create_sliding_window_prefill_mask(
