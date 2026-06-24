@@ -4,10 +4,37 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [v0.3.3] - 2026-06-23
+
+### Added
+- **Multi-node disaggregated routing.** The server drives multi-node disaggregated prefill/decode routing with worker health checks and failover (#388), and the router serves `/v1/completions` alongside the chat and responses endpoints (#386).
+- **Mellum 2 hybrid-attention MoE text model** (#397).
+- **Video input for Gemma 4 Unified** (`gemma4_unified`) (#400).
+- **Phase 1 Python client package over the server** (#411).
+- **MTP speculative decode wired into offline `generate`** (#385).
+- Env-gated sparse-V skip-rate counter to measure KV sparsity (#377, #379).
+
+### Performance
+- **Fused single-launch xIELU Metal kernel for Apertus**, on by default after M5 Max validation (#414, #417). Apertus and Seed-OSS decode were profiled and the xIELU op trimmed (#399).
+- Wire MiniMax to the fused decode-MoE kernel (#390).
+- Bound the audio request queue and add a per-request timeout (#381).
 
 ### Fixed
+- **Sliding-window prefill beyond the window** corrected across models; the gemma3/gemma4 sliding-prefill mask was hoisted to a shared helper (#405, #412, #415).
 - **HTTP 422 from `/v1/messages` for Claude Code >= 2.1.156** (#380). Claude Code interleaves `{"role":"system", ...}` turns inside the `messages` array as mid-conversation reminders. The missing `System` variant in `AnthropicRole` caused `serde_json` to reject those requests before any generation. A new `fold_system_messages` translator pass now relocates mid-conversation system turns into the adjacent user turn (or the head system block) so the text reaches the model under any chat template, including head-only templates (Qwen, Llama 3) that silently drop non-head system messages.
+- OLMoE scores the MoE router with full softmax then gather, not top-k softmax (#391).
+- Preserve the assistant `reasoning` field across turns (#394).
+- Add BitNet to `FAMILY_ORDER` so `family_order_is_exhaustive` passes (#404).
+- Router: harden `/router/stats` disclosure and decode_target trust (#393), and use the worker's authoritative token count for usage (#392).
+- Make audio-path MLX ops fallible at the FFI boundary (#384), and make audio synthesis panic-safe in release via panic=unwind with an explicit core-thread abort (#383).
+
+### Docs
+- Attribute mlx-audio alongside mlx-vlm in README and NOTICE.
+- Record the #370 fused-V attempt regression and keep Turbo4Asym on dequant-SDPA (#378).
+
+### Chore
+- Update dependencies to latest compatible versions (#406).
+- Platform-aware release with an explicit `release-cuda` Makefile target.
 
 ## [v0.3.2] - 2026-06-20
 
@@ -926,6 +953,7 @@ Initial public release of mlxcel.
 - GitHub Actions release workflow for macOS ARM64
 - Profile mode for prefill/decode timing analysis
 
+[v0.3.3]: https://github.com/lablup/mlxcel/compare/v0.3.2...v0.3.3
 [v0.3.2]: https://github.com/lablup/mlxcel/compare/v0.3.1...v0.3.2
 [v0.3.1]: https://github.com/lablup/mlxcel/compare/v0.3.0...v0.3.1
 [v0.3.0]: https://github.com/lablup/mlxcel/compare/v0.2.1...v0.3.0

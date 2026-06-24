@@ -6,22 +6,24 @@
 
 High-performance LLM/VLM inference runtime and server for Apple Silicon. The CLI and server are implemented in Rust and execute models through native MLX C++ bindings. Linux/CUDA builds are supported as a secondary target.
 
-## New in v0.3.2
+## New in v0.3.3
 
-### v0.3.2
+### v0.3.3
 
-- **Audio in and out.** Whisper speech-to-text and Kokoro-82M text-to-speech serve the OpenAI `/v1/audio/*` endpoints (transcription, translation, and speech), with the request and response plumbing in `mlxcel-server`.
-- **`reasoning_content` on non-streaming chat.** Thinking-model output is split into a separate `reasoning_content` field on non-streaming responses, matching the streaming path.
-- **Faster decode on M1 to M4.** A hardware-gated MLX command-buffer op cap raises steady-state decode on pre-M5 Apple Silicon by about 8 to 12% (gemma3n e2b 82.7 to 92.5 tok/s).
-- **Turbo4Asym decode fixed and re-benchmarked.** The asymmetric Turbo KV decode path was rerouted through dequant-then-SDPA, lifting it from about 0.14x to 0.40x of fp16 with byte-exact output. The `--recommend-quant` advisor, the bench gates, and the docs now reflect the measured trade-off: quantized KV saves memory, it does not speed up decode.
-- **Batched sampling fixes.** Per-row RNG reseed at the batched-prefill first token, a single-dispatch batched sampler, incremental penalty-state caches, and a fix for an f16/bf16 logprobs crash.
+- **Multi-node disaggregated routing.** The server drives multi-node disaggregated prefill/decode routing with worker health checks and failover, and the router serves `/v1/completions` alongside the chat and responses endpoints.
+- **Two new model capabilities.** Mellum 2, a hybrid-attention MoE text model, and video input for Gemma 4 Unified (`gemma4_unified`).
+- **Python client package.** A first-phase Python client wraps the server API for use from Python code.
+- **Faster Apertus and Seed-OSS decode.** A fused single-launch xIELU Metal kernel replaces the multi-op activation path and is on by default after M5 Max validation.
+- **Sliding-window prefill correctness.** Prefilling a prompt longer than a model's sliding window is fixed across gemma3, gemma4, and other sliding-window models.
+- **Audio serving hardened.** Audio synthesis is panic-safe in release builds, audio-path MLX ops are fallible at the FFI boundary, and the audio request queue is bounded with a per-request timeout.
 
 ### v0.3
 
 - **Nine new model families.** BitNet b1.58, IBM Granite dense and GraniteMoeHybrid, LFM2 and LFM2-MoE, Falcon-H1, PLaMo 2, Apertus, ByteDance Seed-OSS, and dots.llm1 MoE, on top of the existing Llama, Qwen, Gemma, and DeepSeek coverage.
+- **Audio in and out.** Whisper speech-to-text and Kokoro-82M text-to-speech serve the OpenAI `/v1/audio/*` endpoints (transcription, translation, and speech), and `reasoning_content` is split out on non-streaming chat.
 - **Fused decode-MoE on Metal and CUDA.** The fused single-token MoE decode kernel is on by default on Metal and ported to CUDA, covering qwen3-moe, qwen2_moe, LFM2, qwen3_vl_moe, Mixtral, Phi-3.5-MoE, and OLMoE with byte-identical greedy output. The BitNet ternary matmul also runs on CUDA.
 - **Linux x86_64 and aarch64 CUDA release builds**, with bundled CCCL headers and a persistent PTX cache that reuses JIT-compiled kernels across runs.
-- **Loads newer mixed-precision and non-affine checkpoints.** Per-layer mixed bit widths, bf16 quantization scales, and non-affine VLM weights load correctly (for example minicpm-v mxfp4). A bf16-scale decode regression on M1 Ultra is also fixed.
+- **Faster decode and broader checkpoint loading.** A hardware-gated op cap raises pre-M5 (M1 to M4) decode by about 8 to 12%, and mixed-precision, bf16-scale, and non-affine VLM checkpoints (for example minicpm-v mxfp4) load correctly.
 
 See the [changelog](CHANGELOG.md) for the full list.
 

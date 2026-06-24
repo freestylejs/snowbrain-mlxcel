@@ -1,3 +1,28 @@
+mlxcel (0.3.3-1~jammy1) jammy; urgency=medium
+
+  * Added: multi-node disaggregated prefill/decode routing with health
+    checks and failover (#388), and /v1/completions on the router (#386).
+  * Added: Mellum 2 hybrid-attention MoE text model (#397) and video input
+    for Gemma 4 Unified (#400).
+  * Added: Phase 1 Python client package over the server (#411).
+  * Added: MTP speculative decode wired into offline generate (#385).
+  * Performance: fused single-launch xIELU Metal kernel for Apertus, on by
+    default after M5 Max validation (#414, #417, #399).
+  * Performance: wire MiniMax to the fused decode-MoE kernel (#390); bound
+    the audio request queue with a per-request timeout (#381).
+  * Fixed: sliding-window prefill beyond the window corrected across models,
+    with the gemma3/gemma4 mask hoisted to a shared helper (#405, #412, #415).
+  * Fixed: OLMoE scores the MoE router with full softmax then gather (#391).
+  * Fixed: preserve the assistant reasoning field across turns (#394).
+  * Fixed: router hardening for /router/stats and authoritative usage token
+    counts (#392, #393).
+  * Fixed: audio synthesis panic-safe in release and audio-path FFI ops made
+    fallible (#383, #384).
+  * Fixed: accept system-role turns inside the /v1/messages array (#380).
+  * Chore: update dependencies to latest compatible versions (#406).
+
+ -- Jeongkyu Shin <inureyes@gmail.com>  Tue, 23 Jun 2026 21:41:23 -0700
+
 mlxcel (0.3.2-1~jammy1) jammy; urgency=medium
 
   * Added: Whisper speech-to-text (#371) and Kokoro-82M text-to-speech with an
