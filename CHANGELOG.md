@@ -6,11 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Fixed
-- **Double-transpose crash on mlx-community conv checkpoints (Gemma 4 audio, phi4mm patch-embed, nemotron audio, RT-DETRv2).** Several weight-sanitizer functions transposed conv weights from PyTorch `[out, in, kH, kW]` to MLX channel-last `[out, kH, kW, in]` unconditionally. Pre-converted mlx-community checkpoints already store these weights in channel-last order, so the unconditional transpose double-converted them and produced a corrupted shape. The confirmed crash: loading `mlx-community/gemma-4-e4b-it-qat-4bit` turned the audio subsample conv weight `[128, 3, 3, 1]` into `[128, 3, 1, 3]`, which MLX conv2d rejected because the input C_in=1 did not match the weight C_in=3. All four affected sanitizers now check the tensor shape before transposing: `conv2d_weight_is_channel_last` (already-MLX `[out, kH, kW, in]` skips; PyTorch `[out, in, kH, kW]` transposes) and `conv1d_weight_is_channel_last` (depthwise-only; MLX `[out, kW, 1]` skips; PyTorch `[out, 1, kW]` transposes). Both predicates are idempotent. Resolves #428.
-- **Prefill attention mask sized from the monotonic offset instead of the live window (gemma3, gemma4, exaone_moe).** The multi-token prefill causal and sliding-window masks were sized from the cache's monotonic `offset` rather than its live window (`live_len()`/`seq_len()` = `offset - live_start`). After a `--max-kv-size` `trim_front` advances `live_start`, a mask sized from `offset` is wider than the K/V the cache returns and MLX rejects the broadcast. These three models are not reachable through the trimmable scheduler pool today (gemma3/gemma4 use `ModelOwnedSequenceState`; exaone_moe rebuilds offset-0 caches per forward), so this is a defensive consistency fix that hardens the mask-width invariant and matches the offset-to-live_len migration already applied to cohere2/gemma3n/olmo3 (#419/#420) and mistral4/nemotron_nas/qwen-vl (#421/#422). Byte-identical on the untrimmed path; RoPE and position ids keep the monotonic offset. Resolves #430.
-
-## [v0.3.3] - 2026-06-23
+## [v0.3.3] - 2026-06-25
 
 ### Added
 - **Multi-node disaggregated routing.** The server drives multi-node disaggregated prefill/decode routing with worker health checks and failover (#388), and the router serves `/v1/completions` alongside the chat and responses endpoints (#386).
@@ -19,6 +15,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Phase 1 Python client package over the server** (#411).
 - **MTP speculative decode wired into offline `generate`** (#385).
 - Env-gated sparse-V skip-rate counter to measure KV sparsity (#377, #379).
+- **N-gram loop detection** that breaks degenerate repetition loops at decode, on by default for the Gemma 4 family (#433).
+- **Nemotron-H Nano Omni audio input** wired into server chat audio (#443).
 
 ### Performance
 - **Fused single-launch xIELU Metal kernel for Apertus**, on by default after M5 Max validation (#414, #417). Apertus and Seed-OSS decode were profiled and the xIELU op trimmed (#399).
@@ -33,6 +31,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Add BitNet to `FAMILY_ORDER` so `family_order_is_exhaustive` passes (#404).
 - Router: harden `/router/stats` disclosure and decode_target trust (#393), and use the worker's authoritative token count for usage (#392).
 - Make audio-path MLX ops fallible at the FFI boundary (#384), and make audio synthesis panic-safe in release via panic=unwind with an explicit core-thread abort (#383).
+- **Prefill attention masks sized from the live window, not the monotonic offset.** Multi-token prefill causal and sliding-window masks are now sized from the cache's live length (`offset - live_start`), so a `--max-kv-size` `trim_front` cannot produce a mask wider than the K/V the cache returns. Applied across dense-cache sliding-window models (#418), the general dense path (#420), mistral4/nemotron_nas/qwen-vl (#422), and gemma3/gemma4/exaone_moe (#431, a defensive consistency fix). Byte-identical on the untrimmed path.
+- **Double-transpose crash on mlx-community conv checkpoints (Gemma 4 audio, phi4mm patch-embed, nemotron audio, RT-DETRv2).** Several weight-sanitizer functions transposed conv weights from PyTorch `[out, in, kH, kW]` to MLX channel-last `[out, kH, kW, in]` unconditionally. Pre-converted mlx-community checkpoints already store these weights in channel-last order, so the unconditional transpose double-converted them and produced a corrupted shape. The confirmed crash: loading `mlx-community/gemma-4-e4b-it-qat-4bit` turned the audio subsample conv weight `[128, 3, 3, 1]` into `[128, 3, 1, 3]`, which MLX conv2d rejected because the input C_in=1 did not match the weight C_in=3. All four affected sanitizers now check the tensor shape before transposing: `conv2d_weight_is_channel_last` (already-MLX `[out, kH, kW, in]` skips; PyTorch `[out, in, kH, kW]` transposes) and `conv1d_weight_is_channel_last` (depthwise-only; MLX `[out, kW, 1]` skips; PyTorch `[out, 1, kW]` transposes). Both predicates are idempotent. Resolves #428.
+- **Conv shape faults no longer abort the server.** conv1d/conv2d are fallible at the FFI boundary (#434) and the nemotron omni audio-encoder convs route through the same fallible path (#439), so a bad conv shape returns an error instead of aborting the process.
+- **Gemma 4 audio placed in the user turn.** The CLI resamples audio to 16 kHz and emits the `<|audio|>` marker inside the user turn (#438), and the server emits its `<|audio|>` block inside the user turn (#440).
+- **mistral4 loading and MoE routing.** Mistral3-VLM mistral4 (MLA) text backbones route to the Mistral4 loader (#423/#424), and mistral4 MoE tokens are flattened to 2D before SwitchGLU routing (#425/#426).
 
 ### Docs
 - Attribute mlx-audio alongside mlx-vlm in README and NOTICE.
@@ -41,6 +44,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Chore
 - Update dependencies to latest compatible versions (#406).
 - Platform-aware release with an explicit `release-cuda` Makefile target.
+- Bump actions/checkout from 6 to 7 (#395).
+- Fix clippy `useless_vec`/`identity_op` lints in the nemotron audio encoder test (#441).
 
 ## [v0.3.2] - 2026-06-20
 

@@ -19,9 +19,22 @@ mlxcel (0.3.3-1~jammy1) jammy; urgency=medium
   * Fixed: audio synthesis panic-safe in release and audio-path FFI ops made
     fallible (#383, #384).
   * Fixed: accept system-role turns inside the /v1/messages array (#380).
+  * Added: N-gram loop detection, default-on for the Gemma 4 family (#433),
+    and Nemotron-H Nano Omni audio input in server chat (#443).
+  * Fixed: prefill attention masks sized from the live window under
+    --max-kv-size trim across dense-cache, mistral4, nemotron_nas, qwen-vl,
+    gemma3/gemma4, and exaone_moe (#418, #420, #422, #431).
+  * Fixed: double-transpose crash on mlx-community conv checkpoints (#429).
+  * Fixed: conv1d/conv2d and nemotron audio-encoder convs fallible at the FFI
+    boundary so conv shape faults no longer abort the server (#434, #439).
+  * Fixed: Gemma 4 audio placed in the user turn, CLI resamples to 16 kHz
+    (#438, #440).
+  * Fixed: mistral4 MLA backbone routing and 2D MoE token flattening
+    (#423, #425).
+  * CI: bump actions/checkout from 6 to 7 (#395).
   * Chore: update dependencies to latest compatible versions (#406).
 
- -- Jeongkyu Shin <inureyes@gmail.com>  Tue, 23 Jun 2026 21:41:23 -0700
+ -- Jeongkyu Shin <inureyes@gmail.com>  Thu, 25 Jun 2026 12:18:07 -0700
 
 mlxcel (0.3.2-1~jammy1) jammy; urgency=medium
 
