@@ -14,8 +14,9 @@ High-performance LLM/VLM inference runtime and server for Apple Silicon. The CLI
 - **Two new model capabilities.** Mellum 2, a hybrid-attention MoE text model, and video input for Gemma 4 Unified (`gemma4_unified`).
 - **Python client package.** A first-phase Python client wraps the server API for use from Python code.
 - **Faster Apertus and Seed-OSS decode.** A fused single-launch xIELU Metal kernel replaces the multi-op activation path and is on by default after M5 Max validation.
-- **Sliding-window prefill correctness.** Prefilling a prompt longer than a model's sliding window is fixed across gemma3, gemma4, and other sliding-window models.
-- **Audio serving hardened.** Audio synthesis is panic-safe in release builds, audio-path MLX ops are fallible at the FFI boundary, and the audio request queue is bounded with a per-request timeout.
+- **N-gram loop detection.** Generation can detect and break degenerate n-gram repetition loops, on by default for the Gemma 4 family.
+- **Prefill correctness under KV-cache limits.** Prefilling a prompt longer than a model's sliding window is fixed across gemma3, gemma4, and other sliding-window models, and dense-cache prefill masks are now sized from the live sequence length under `--max-kv-size` trim across mistral4, nemotron_nas, qwen-vl, gemma3/gemma4, and exaone_moe.
+- **Audio serving hardened.** Audio synthesis is panic-safe in release builds, audio-path MLX ops are fallible at the FFI boundary, and the audio request queue is bounded with a per-request timeout. Convolution shape faults (conv1d/conv2d) are likewise caught at the FFI boundary instead of aborting the server.
 
 ### v0.3
 
