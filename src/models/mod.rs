@@ -93,6 +93,7 @@ pub mod olmo;
 pub mod olmo2;
 pub mod olmo3;
 pub mod olmoe;
+pub mod paddleocr_vl;
 pub mod phi;
 pub mod phi3;
 pub mod phi3small;
@@ -187,6 +188,7 @@ pub use olmo::OlmoModel;
 pub use olmo2::OLMo2Model;
 pub use olmo3::OLMo3Model;
 pub use olmoe::OlmoeModel;
+pub use paddleocr_vl::{PaddleOcrTextConfig, PaddleOcrTextModel};
 pub use phi::PhiModel;
 pub use phi3::Phi3Model;
 pub use phi3small::Phi3SmallModel;
@@ -257,6 +259,7 @@ pub enum ModelType {
     Qwen25VL,        // Qwen2.5-VL (windowed ViT + Qwen2 w/ MRoPE)
     Qwen3VL,         // Qwen3-VL (ViT + interleaved MRoPE + DeepStack)
     Qwen3VLMoe,      // Qwen3-VL-MoE (Qwen3-VL + MoE text backbone)
+    PaddleOcrVL,     // PaddleOCR-VL (NaViT vision + ERNIE-4.5 w/ MRoPE)
     Glm4v,           // GLM-4V (GLM-4V ViT + GLM-4 text w/ sectioned MRoPE)
     Glm4vMoe,        // GLM-4V MoE (GLM-4V ViT + GLM-4 MoE text w/ MRoPE)
     YoutuVLM,        // Youtu-VL (SigLIP2 windowed-attn + DeepSeek-V3-style MLA)
@@ -429,6 +432,7 @@ pub const ALL_MODEL_TYPES: &[ModelType] = &[
     ModelType::Qwen25VL,
     ModelType::Qwen3VL,
     ModelType::Qwen3VLMoe,
+    ModelType::PaddleOcrVL,
     ModelType::Glm4v,
     ModelType::Glm4vMoe,
     ModelType::YoutuVLM,
@@ -574,6 +578,7 @@ impl ModelType {
             ModelType::Qwen25VL => ("Qwen2.5-VL", "Qwen VLM"),
             ModelType::Qwen3VL => ("Qwen3-VL", "Qwen VLM"),
             ModelType::Qwen3VLMoe => ("Qwen3-VL MoE", "Qwen VLM"),
+            ModelType::PaddleOcrVL => ("PaddleOCR-VL", "PaddleOCR VLM"),
             ModelType::Glm4v => ("GLM-4V", "GLM VLM"),
             ModelType::Glm4vMoe => ("GLM-4V MoE", "GLM VLM"),
             ModelType::Qwen35VLM => ("Qwen 3.5 VLM", "Qwen VLM"),
@@ -830,6 +835,7 @@ mod metadata_tests {
             Qwen25VL,
             Qwen3VL,
             Qwen3VLMoe,
+            PaddleOcrVL,
             Glm4v,
             Glm4vMoe,
             YoutuVLM,
