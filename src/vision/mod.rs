@@ -53,6 +53,7 @@ pub mod mllama_vl;
 pub mod molmo2_vl;
 pub mod molmo_point_vl;
 pub mod molmo_vl;
+pub mod moondream2_vl;
 pub mod moondream3_vl;
 pub mod nemotron_h_nano_omni_vl;
 pub mod paddleocr_vl;
@@ -80,6 +81,7 @@ pub use mllama_vl::MllamaVLModel;
 pub use molmo_point_vl::MolmoPointVLModel;
 pub use molmo_vl::MolmoVLModel;
 pub use molmo2_vl::Molmo2VLModel;
+pub use moondream2_vl::Moondream2VLModel;
 pub use moondream3_vl::Moondream3VLModel;
 pub use nemotron_h_nano_omni_vl::NemotronHNanoOmniVlModel;
 pub use paddleocr_vl::PaddleOcrVlModel;
@@ -410,3 +412,7 @@ mod tests;
 #[cfg(test)]
 #[path = "moondream3_vl_tests.rs"]
 mod moondream3_vl_tests;
+
+#[cfg(test)]
+#[path = "moondream2_vl_tests.rs"]
+mod moondream2_vl_tests;
