@@ -833,6 +833,21 @@ where
                 preparation,
             }))
         }
+        VlmRuntimeRef::Mllama(mllama) => {
+            // Llama 3.2 Vision keeps image features out of the token stream and
+            // consults them through gated cross-attention. Preprocess the
+            // image(s), run the tower + projector, and stash the resulting
+            // cross-attention states in the model so the subsequent forward()
+            // decode steps attend to them. No merged embeddings are produced
+            // (the `<|image|>` placeholder already sits in the prompt), so
+            // return `None` and let the standard forward path pick up the
+            // stashed state.
+            let _ = active_caches;
+            let _ = image_cache_keys;
+            let inputs = mllama.processor.process(images);
+            mllama.prepare_cross_attention_states(&inputs);
+            Ok(None)
+        }
         VlmRuntimeRef::SmolVLM(smolvlm) => {
             // Each image becomes `tiles` square tiles (a single global tile when
             // splitting is disabled, or a `rows x cols` grid plus a global tile
