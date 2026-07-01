@@ -44,48 +44,50 @@ use crate::emitter::{Config, WeightScheme};
 /// The tensor-name pieces for one [`WeightScheme`]: the top-level embed /
 /// final-norm / (untied) LM-head names, the per-layer prefix stem
 /// (`"{stem}{i}."`), and each per-layer suffix, emitted in the emitter's arg order
-/// by [`weight_names`] under the same config gates as `take_layer_weights`.
-struct SchemeNames {
+/// under the same config gates as `take_layer_weights`. Consumed by both
+/// [`weight_names`] here and [`weight_specs`](crate::weights::weight_specs) in
+/// `weights.rs`, which is the single ordering authority the loader reads.
+pub(crate) struct SchemeNames {
     /// Token-embedding weight name.
-    embed: &'static str,
+    pub(crate) embed: &'static str,
     /// Final RMSNorm weight name.
-    final_norm: &'static str,
+    pub(crate) final_norm: &'static str,
     /// Untied LM-head weight name (used only when `tie_word_embeddings = false`).
-    lm_head: &'static str,
+    pub(crate) lm_head: &'static str,
     /// Per-layer prefix stem; the full prefix is `format!("{stem}{i}.")`.
-    layer_stem: &'static str,
+    pub(crate) layer_stem: &'static str,
     /// MLP down projection.
-    down: &'static str,
+    pub(crate) down: &'static str,
     /// MLP gate projection (the activation input).
-    gate: &'static str,
+    pub(crate) gate: &'static str,
     /// `input_layernorm` (skipped for the OLMo reordered post-norm).
-    input_layernorm: &'static str,
+    pub(crate) input_layernorm: &'static str,
     /// `post_attention_layernorm`.
-    post_attention_layernorm: &'static str,
+    pub(crate) post_attention_layernorm: &'static str,
     /// MLP up projection.
-    up: &'static str,
+    pub(crate) up: &'static str,
     /// Attention key projection.
-    k_proj: &'static str,
+    pub(crate) k_proj: &'static str,
     /// Attention output projection.
-    o_proj: &'static str,
+    pub(crate) o_proj: &'static str,
     /// Attention query projection.
-    q_proj: &'static str,
+    pub(crate) q_proj: &'static str,
     /// Attention value projection.
-    v_proj: &'static str,
+    pub(crate) v_proj: &'static str,
     /// Attention key projection bias (used only for a `qkv_bias` arch).
-    k_bias: &'static str,
+    pub(crate) k_bias: &'static str,
     /// Attention query projection bias (used only for a `qkv_bias` arch).
-    q_bias: &'static str,
+    pub(crate) q_bias: &'static str,
     /// Attention value projection bias (used only for a `qkv_bias` arch).
-    v_bias: &'static str,
+    pub(crate) v_bias: &'static str,
     /// Query RMSNorm weight (used only for a `qk_norm` arch).
-    q_norm: &'static str,
+    pub(crate) q_norm: &'static str,
     /// Key RMSNorm weight (used only for a `qk_norm` arch).
-    k_norm: &'static str,
+    pub(crate) k_norm: &'static str,
     /// Pre-feed-forward norm (used only for the Gemma four-norm layer).
-    pre_ff_norm: &'static str,
+    pub(crate) pre_ff_norm: &'static str,
     /// Post-feed-forward norm (used only for Gemma 2/3 and OLMo 2/3).
-    post_ff_norm: &'static str,
+    pub(crate) post_ff_norm: &'static str,
 }
 
 /// The name pieces for `scheme`. `Llama` reproduces the standard HF layout the
@@ -94,7 +96,7 @@ struct SchemeNames {
 /// checkpoint's `modeling_exaone.py` (gated MLP `c_proj(act(c_fc_0(x)) *
 /// c_fc_1(x))`, so `c_fc_0` is the gate and `c_fc_1` the up projection; attention
 /// under `attn.attention.*` with `out_proj` as o_proj).
-fn scheme_names(scheme: WeightScheme) -> SchemeNames {
+pub(crate) fn scheme_names(scheme: WeightScheme) -> SchemeNames {
     match scheme {
         WeightScheme::Llama => SchemeNames {
             embed: "model.embed_tokens.weight",
@@ -148,54 +150,19 @@ fn scheme_names(scheme: WeightScheme) -> SchemeNames {
 }
 
 /// The checkpoint tensor names in the emitter's exact arg order for `cfg`, matching
-/// `take_lm_head` / `take_layer_weights` in `emitter/model.rs`. The names follow
-/// `cfg.weight_scheme`, and every per-layer knob (the untied head, the conditional
-/// `input_layernorm`, the q/k/v biases, the q/k norms, the feed-forward norms) is
-/// read from `cfg`, so Llama / Qwen2 / Gemma2 stay byte-for-byte unchanged.
+/// `take_lm_head` / `take_layer_weights` in `emitter/model.rs`. This is the flat
+/// name view of the single ordering authority
+/// [`weight_specs`](crate::weights::weight_specs): it maps each spec to the
+/// checkpoint tensor it reads, so the two never drift, and the naming schemes
+/// (`cfg.weight_scheme`) plus every per-layer knob (the untied head, the
+/// conditional `input_layernorm`, the q/k/v biases, the q/k norms, the feed-forward
+/// norms, the #498 biases) come from that one place. A fused (Phi3) checkpoint
+/// lists its fused tensor once per arg that row-slices it.
 pub(crate) fn weight_names(cfg: &Config) -> Vec<String> {
-    let s = scheme_names(cfg.weight_scheme);
-    let mut names = vec![s.embed.to_string(), s.final_norm.to_string()];
-    // Untied LM head: a separate head weight follows `final_norm`, matching the
-    // `params['lm_head']` arg the emitter takes in the same position.
-    if !cfg.tie_word_embeddings {
-        names.push(s.lm_head.to_string());
-    }
-    for i in 0..cfg.n_layers {
-        let p = format!("{}{i}.", s.layer_stem);
-        let mut push = |suf: &str| names.push(format!("{p}{suf}"));
-        push(s.down);
-        push(s.gate);
-        // input_layernorm: present unless the reordered (OLMo) post-norm drops it.
-        if cfg.has_input_norm() {
-            push(s.input_layernorm);
-        }
-        push(s.post_attention_layernorm);
-        push(s.up);
-        push(s.k_proj);
-        push(s.o_proj);
-        push(s.q_proj);
-        push(s.v_proj);
-        // q/k/v projection biases (Qwen2 / Seed-OSS / MiMo / InternLM3), in the same
-        // k/q/v order `take_layer_weights` adds them to the emitted graph args.
-        if cfg.qkv_bias {
-            push(s.k_bias);
-            push(s.q_bias);
-            push(s.v_bias);
-        }
-        // q/k norms (Qwen3 / Gemma3 per-head, OLMo2/3 flat), q then k.
-        if cfg.qk_norm.is_some() {
-            push(s.q_norm);
-            push(s.k_norm);
-        }
-        // Feed-forward norms: Gemma2/3 add pre AND post; OLMo2/3 add post only.
-        if cfg.has_pre_ff_norm() {
-            push(s.pre_ff_norm);
-        }
-        if cfg.has_post_ff_norm() {
-            push(s.post_ff_norm);
-        }
-    }
-    names
+    crate::weights::weight_specs(cfg)
+        .iter()
+        .map(|spec| spec.tensor_name().to_string())
+        .collect()
 }
 
 #[cfg(test)]

@@ -357,27 +357,29 @@ pub(crate) static LLAMA_3_2_1B: ArchFixture = ArchFixture {
     ],
 };
 
-/// One dense-pack family (issue #499). Every listed architecture reuses the
-/// already-proven Llama or Qwen2 forward up to a config / naming delta, so its
-/// emitted graph is a proven graph and the frozen goldens are trusted by
-/// construction (the emit is exercised absolutely by [`LLAMA_3_2_1B`] and
-/// relatively by `dense_pack_families_reuse_proven_graphs`). The fixtures use
-/// small synthetic dims (real switches, tiny hidden / layers) so the goldens stay
-/// small; the real checkpoint `config.json` parsing is covered by the
-/// `config::tests` parse assertions.
+/// A dense-pack fixture: a small synthetic `config.json` and the frozen decode +
+/// prefill goldens for a family. `$sample` selects the graph tail the goldens were
+/// frozen with: `true` returns the on-device argmax token (the issue #499 pack:
+/// Seed-OSS / MiMo / InternLM3 / ExaOne, each reusing an already-proven Llama /
+/// Qwen2 forward up to a config / naming delta), `false` returns the raw logits
+/// (the issue #498 pack: Cohere / Cohere2 / Phi3 / StableLM / StarCoder2 / Granite /
+/// MiniCPM, each proven token-exact against an HF fp32 oracle on the synthetic model
+/// via `spike/openxla/dense_arch_check.py`). Both are trusted goldens the byte-exact
+/// gate then guards against drift; the graph order in the array does not matter (each
+/// fixture is compared to its own golden).
 macro_rules! dense_fixture {
-    ($ident:ident, $arch:literal) => {
+    ($ident:ident, $arch:literal, $sample:expr) => {
         pub(crate) static $ident: ArchFixture = ArchFixture {
             arch: $arch,
             config_json: include_str!(concat!("../assets/", $arch, "/config.json")),
             graphs: &[
                 GraphFixture {
-                    kind: GraphKind::Decode { sample: true },
+                    kind: GraphKind::Decode { sample: $sample },
                     golden_name: "decode.mlir",
                     golden: include_str!(concat!("../assets/", $arch, "/decode.mlir")),
                 },
                 GraphFixture {
-                    kind: GraphKind::Prefill { sample: true },
+                    kind: GraphKind::Prefill { sample: $sample },
                     golden_name: "prefill.mlir",
                     golden: include_str!(concat!("../assets/", $arch, "/prefill.mlir")),
                 },
@@ -386,22 +388,47 @@ macro_rules! dense_fixture {
     };
 }
 
+// issue #498 dense pack (raw-logits goldens, sample = false): the parallel-block
+// and norm-variant families, each proven token-exact on a synthetic model before
+// freezing (`spike/openxla/dense_arch_check.py`).
+dense_fixture!(COHERE, "cohere", false);
+dense_fixture!(COHERE2, "cohere2", false);
+dense_fixture!(PHI3, "phi3", false);
+dense_fixture!(STABLELM, "stablelm", false);
+dense_fixture!(STARCODER2, "starcoder2", false);
+dense_fixture!(GRANITE, "granite", false);
+dense_fixture!(MINICPM, "minicpm", false);
+
+// issue #499 dense pack (argmax-token goldens, sample = true): each reuses an
+// already-proven Llama / Qwen2 forward up to a config / naming delta.
 // Seed-OSS: q/k/v projection bias (from `attention_bias`), untied, `default` rope
 // type served as plain — the proven Qwen2 bias forward with standard names.
-dense_fixture!(SEED_OSS, "seed_oss");
+dense_fixture!(SEED_OSS, "seed_oss", true);
 // MiMo: q/k/v projection bias, untied, plain RoPE; its config `sliding_window` is
 // served globally (as for Qwen2), so it parses to `sliding_window = None`.
-dense_fixture!(MIMO, "mimo");
+dense_fixture!(MIMO, "mimo", true);
 // InternLM3: standard names, untied, `dynamic` rope served as plain (in-context).
-dense_fixture!(INTERNLM3, "internlm3");
+dense_fixture!(INTERNLM3, "internlm3", true);
 // ExaOne 3.x: llama3 RoPE, tied, GPT-2-style names (the `Exaone` weight scheme)
 // and the `num_layers` / `layer_norm_epsilon` alternate config fields.
-dense_fixture!(EXAONE, "exaone");
+dense_fixture!(EXAONE, "exaone", true);
 
 /// Every registered structural fixture. Append a family here to add it to the
 /// byte-exact gate; see the module docs for the freeze workflow.
-pub(crate) static REGISTERED: &[&ArchFixture] =
-    &[&LLAMA_3_2_1B, &SEED_OSS, &MIMO, &INTERNLM3, &EXAONE];
+pub(crate) static REGISTERED: &[&ArchFixture] = &[
+    &LLAMA_3_2_1B,
+    &COHERE,
+    &COHERE2,
+    &PHI3,
+    &STABLELM,
+    &STARCODER2,
+    &GRANITE,
+    &MINICPM,
+    &SEED_OSS,
+    &MIMO,
+    &INTERNLM3,
+    &EXAONE,
+];
 
 /// A golden-less structural fixture (issue #497): a small synthetic `config.json`
 /// for a dense family plus the signature every emitted shared-core graph must
