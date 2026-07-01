@@ -12,6 +12,13 @@
 //! sliding-window schedule (window + pattern period), and a per-layer NoPE mask
 //! (SmolLM3). Llama / Qwen2 / Gemma2 keep their exact previous flag combinations,
 //! so their emitted graphs are byte-for-byte unchanged.
+//!
+//! A second dense pack (issue #499) rides the same flags with a config / naming
+//! delta and no new emit: Seed-OSS / MiMo (the Qwen2 bias forward), InternLM3
+//! (plain / in-context `dynamic` RoPE), and ExaOne 3.x (llama3 RoPE with GPT-2-style
+//! tensor names, selected by [`WeightScheme`]). Out-of-scope deltas an emit would
+//! get wrong (interleaved RoPE, an o_proj / MLP bias, a non-SwiGLU activation, yarn
+//! RoPE) are rejected rather than mis-emitted.
 
 /// How the RoPE inverse-frequency table is computed. Both kinds share the
 /// `outer(pos, inv_freq)` table build (see [`rope`](super::rope)); they differ
@@ -62,6 +69,27 @@ pub struct QkNorm {
     /// `true` uses Gemma's `(1 + weight)` RMSNorm (Gemma3); `false` the raw weight
     /// (Qwen3, OLMo2, OLMo3).
     pub one_plus: bool,
+}
+
+/// The checkpoint tensor-naming scheme (issue #499). Almost every Llama-family
+/// checkpoint uses the standard HF layout
+/// (`model.layers.{i}.self_attn.q_proj.weight`, `model.embed_tokens.weight`,
+/// `model.norm.weight`); ExaOne 3.x instead keeps the original GPT-2-style names
+/// (`transformer.h.{i}.attn.attention.q_proj.weight`, `transformer.wte.weight`,
+/// `transformer.ln_f.weight`, and a `c_fc_0` / `c_fc_1` / `c_proj` gated MLP). The
+/// scheme is a loader-only concern: it maps the emitter's fixed arg order to the
+/// checkpoint's tensor names (`weight_names` in [`weight_names`](crate::weight_names)),
+/// so it never changes an emitted graph and two configs that differ only in scheme
+/// emit byte-for-byte identical StableHLO.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum WeightScheme {
+    /// Standard HF Llama-family names (Llama, Qwen2, Gemma2, ERNIE-4.5, Seed-OSS,
+    /// MiMo, InternLM3, ...).
+    #[default]
+    Llama,
+    /// ExaOne 3.x GPT-2-style names (`transformer.h.{i}...`, gated MLP `c_fc_0` /
+    /// `c_fc_1` / `c_proj`, `out_proj` attention output).
+    Exaone,
 }
 
 /// MLX affine weight quantization (`config.json` `quantization`). The linear /
@@ -138,6 +166,12 @@ pub struct Config {
     /// Per-layer NoPE mask (SmolLM3): `use_rope_layers[li] == false` skips RoPE on
     /// that layer (`no_rope_layers`). `None` applies RoPE on every layer.
     pub use_rope_layers: Option<Vec<bool>>,
+    /// Checkpoint tensor-naming scheme (issue #499). Loader-only: it selects how
+    /// [`weight_names`](crate::weight_names) maps the emitter's arg order onto the
+    /// checkpoint tensors, so it never affects the emitted graph. `Llama` (the
+    /// default) is the standard HF layout; `Exaone` is ExaOne 3.x's GPT-2-style
+    /// names.
+    pub weight_scheme: WeightScheme,
 }
 
 impl Config {
@@ -174,6 +208,7 @@ impl Config {
             sliding_window: None,
             sliding_pattern: 2,
             use_rope_layers: None,
+            weight_scheme: WeightScheme::Llama,
         }
     }
 
@@ -191,6 +226,31 @@ impl Config {
             serde_json::from_str(s).map_err(|e| format!("parse config.json: {e}"))?;
 
         let model_type = v.get("model_type").and_then(serde_json::Value::as_str);
+        let bool_field = |k: &str| v.get(k).and_then(serde_json::Value::as_bool);
+
+        // ExaOne 3.x keeps GPT-2-style tensor names; every other supported family
+        // uses the standard HF Llama layout. Loader-only (see [`WeightScheme`]), so
+        // it never changes the emitted graph.
+        let weight_scheme = if model_type == Some("exaone") {
+            WeightScheme::Exaone
+        } else {
+            WeightScheme::Llama
+        };
+
+        // Interleaved (GPT-J-style) RoPE is a distinct emitter delta from the half-
+        // split RoPE the supported families use: the pairs rotated are (2i, 2i+1),
+        // not (i, i+d/2). ERNIE-4.5 (`rotate_half` over `x[..., 0::2]` /
+        // `x[..., 1::2]`) is such an arch, so despite looking like a plain-RoPE Llama
+        // in config.json it is rejected here rather than mis-emitted (a half-split
+        // emit is close but wrong) pending an interleaved-RoPE variant.
+        if model_type == Some("ernie4_5") {
+            return Err(
+                "the OpenXLA emitter uses half-split RoPE; ERNIE-4.5 (model_type \
+                 ernie4_5) uses interleaved (GPT-J-style) RoPE, which is a follow-up \
+                 (an interleaved-RoPE emit variant or a load-time q/k permutation)"
+                    .to_string(),
+            );
+        }
 
         // Tied (share `embed` for the head) vs untied (separate `lm_head.weight`).
         // HF `PretrainedConfig` defaults this to `true`, so an absent field means
@@ -235,12 +295,26 @@ impl Config {
                 .and_then(serde_json::Value::as_u64)
                 .map(|x| x as usize)
         };
+        // Some arches use alternate field names (ExaOne 3.x: `num_layers`,
+        // `layer_norm_epsilon`), so these read the first present of a key list.
+        let u_any = |keys: &[&str]| -> Result<usize, String> {
+            keys.iter()
+                .find_map(|k| v.get(*k).and_then(serde_json::Value::as_u64))
+                .map(|x| x as usize)
+                .ok_or_else(|| format!("config.json missing integer among {keys:?}"))
+        };
+        let f_any = |keys: &[&str]| -> Result<f64, String> {
+            keys.iter()
+                .find_map(|k| v.get(*k).and_then(serde_json::Value::as_f64))
+                .ok_or_else(|| format!("config.json missing number among {keys:?}"))
+        };
 
         let hidden = u("hidden_size")?;
         let n_q = u("num_attention_heads")?;
         // head_dim is explicit in recent configs; otherwise it is hidden / heads.
         let head_dim = ou("head_dim").unwrap_or(hidden / n_q.max(1));
-        let n_layers = u("num_hidden_layers")?;
+        // ExaOne 3.x uses `num_layers` in place of `num_hidden_layers`.
+        let n_layers = u_any(&["num_hidden_layers", "num_layers"])?;
 
         // Architecture-family flags, defaulted to the Llama baseline and overridden
         // per model_type below.
@@ -271,10 +345,11 @@ impl Config {
             Some("llama") => {
                 // A `llama` checkpoint with attention bias would need the Qwen2 bias
                 // emit, untested here; reject rather than emit an unvalidated graph.
-                if v.get("attention_bias").and_then(serde_json::Value::as_bool) == Some(true) {
+                if bool_field("attention_bias") == Some(true) {
                     return Err(
                         "the OpenXLA emitter does not support a `llama` checkpoint with \
-                         attention_bias = true (only Qwen2 carries a q/k/v bias here)"
+                         attention_bias = true (only the bias-bearing dense arches carry a \
+                         q/k/v bias here)"
                             .to_string(),
                     );
                 }
@@ -375,16 +450,69 @@ impl Config {
                 }
                 rope_local_base = of64("rope_local_base_freq");
             }
+            // issue #499 dense pack: each maps to a proven Llama / Qwen2 forward with
+            // a config / naming delta and no new emit.
+            Some("seed_oss") | Some("mimo") | Some("internlm3") => {
+                // Bias-bearing dense forwards: Seed-OSS / MiMo expose the q/k/v bias
+                // as `attention_bias`, InternLM3 as `qkv_bias`. MiMo's config
+                // `sliding_window` is deliberately not read (served globally, as for
+                // Qwen2); the rope block serves Seed-OSS `default` / InternLM3
+                // `dynamic` as plain RoPE.
+                qkv_bias = bool_field("attention_bias") == Some(true)
+                    || bool_field("qkv_bias") == Some(true);
+            }
+            Some("exaone") => {
+                // ExaOne 3.x: llama3-RoPE Llama with GPT-2-style tensor names (see
+                // `weight_scheme`) and the `num_layers` / `layer_norm_epsilon`
+                // alternate config field names read elsewhere.
+            }
             other => {
                 return Err(format!(
-                    "the OpenXLA emitter supports the Llama, Qwen2, Qwen3, Gemma1/2/3, \
-                     SmolLM3, and OLMo2/3 architectures; config.json model_type = {other:?}"
+                    "the OpenXLA emitter supports the dense architectures Llama, Qwen2, \
+                     Qwen3, Gemma1/2/3, SmolLM3, OLMo2/3, Seed-OSS, MiMo, InternLM3, and \
+                     ExaOne; config.json model_type = {other:?} (MoE / MLA / fused-QKV / \
+                     interleaved-RoPE / novel-activation variants are follow-ups)"
                 ));
             }
         }
 
-        // rope_scaling is optional: absent -> plain RoPE; present -> only the llama3
-        // scheme is supported (yarn, e.g. OLMo3 at full size, is a follow-up).
+        // Out-of-scope deltas an emit would get wrong are rejected rather than
+        // silently dropped (issue #499): the o_proj bias and the MLP bias have no
+        // emit, and a non-SwiGLU activation on a non-GeGLU family would be
+        // mis-emitted. Gemma's GeGLU is driven by its own `mlp_geglu` flag, so the
+        // activation guard skips it.
+        if bool_field("attention_out_bias") == Some(true) {
+            return Err(
+                "the OpenXLA emitter has no attention output (o_proj) bias; \
+                 config.json attention_out_bias = true is a follow-up"
+                    .to_string(),
+            );
+        }
+        if bool_field("mlp_bias") == Some(true) {
+            return Err(
+                "the OpenXLA emitter has no MLP bias; config.json mlp_bias = true is a follow-up"
+                    .to_string(),
+            );
+        }
+        if !mlp_geglu {
+            let act = v
+                .get("hidden_act")
+                .or_else(|| v.get("activation_function"))
+                .and_then(serde_json::Value::as_str);
+            if let Some(a) = act
+                && a != "silu"
+            {
+                return Err(format!(
+                    "the OpenXLA emitter emits a SwiGLU (silu) MLP for this architecture; \
+                     config.json activation = {a:?} is unsupported"
+                ));
+            }
+        }
+
+        // rope_scaling is optional: absent -> plain RoPE (Qwen2.5, plain Llama).
+        // When present, the supported schemes are llama3 (scaled) and, served as
+        // plain RoPE, the `default` (identity) and in-context `dynamic` types;
+        // anything else (e.g. yarn, which OLMo3 uses at full size) is a follow-up.
         let rope = match v.get("rope_scaling") {
             None | Some(serde_json::Value::Null) => RopeScaling::Plain,
             Some(scaling) => {
@@ -392,32 +520,45 @@ impl Config {
                     .get("rope_type")
                     .or_else(|| scaling.get("type"))
                     .and_then(serde_json::Value::as_str);
-                if rope_type != Some("llama3") {
-                    return Err(format!(
-                        "the OpenXLA emitter supports plain RoPE and llama3 RoPE scaling; \
-                         config.json rope_scaling.rope_type = {rope_type:?} (e.g. yarn is a \
-                         follow-up)"
-                    ));
-                }
-                let sf = |k: &str| -> Result<f64, String> {
-                    scaling
-                        .get(k)
-                        .and_then(serde_json::Value::as_f64)
-                        .ok_or_else(|| format!("config.json rope_scaling missing number `{k}`"))
-                };
-                let orig_ctx = scaling
-                    .get("original_max_position_embeddings")
-                    .and_then(serde_json::Value::as_u64)
-                    .map(|x| x as usize)
-                    .ok_or_else(|| {
-                        "config.json rope_scaling missing `original_max_position_embeddings`"
-                            .to_string()
-                    })?;
-                RopeScaling::Llama3 {
-                    factor: sf("factor")?,
-                    low_freq_factor: sf("low_freq_factor")?,
-                    high_freq_factor: sf("high_freq_factor")?,
-                    orig_ctx,
+                match rope_type {
+                    // `default` is HF's identity rope (Seed-OSS). `dynamic` NTK
+                    // (InternLM2/3) is identity within the original context and only
+                    // rescales beyond it, so short / in-context generation is served
+                    // as plain RoPE here (both use `rope_theta`); the long-context
+                    // NTK rescale is a follow-up.
+                    Some("default") | Some("dynamic") => RopeScaling::Plain,
+                    Some("llama3") => {
+                        let sf = |k: &str| -> Result<f64, String> {
+                            scaling
+                                .get(k)
+                                .and_then(serde_json::Value::as_f64)
+                                .ok_or_else(|| {
+                                    format!("config.json rope_scaling missing number `{k}`")
+                                })
+                        };
+                        let orig_ctx = scaling
+                            .get("original_max_position_embeddings")
+                            .and_then(serde_json::Value::as_u64)
+                            .map(|x| x as usize)
+                            .ok_or_else(|| {
+                                "config.json rope_scaling missing \
+                                 `original_max_position_embeddings`"
+                                    .to_string()
+                            })?;
+                        RopeScaling::Llama3 {
+                            factor: sf("factor")?,
+                            low_freq_factor: sf("low_freq_factor")?,
+                            high_freq_factor: sf("high_freq_factor")?,
+                            orig_ctx,
+                        }
+                    }
+                    other => {
+                        return Err(format!(
+                            "the OpenXLA emitter supports plain / default / (in-context) dynamic \
+                             RoPE and llama3 RoPE scaling; config.json rope_scaling.rope_type = \
+                             {other:?} (e.g. yarn is a follow-up)"
+                        ));
+                    }
                 }
             }
         };
@@ -429,7 +570,8 @@ impl Config {
             n_q,
             n_kv: u("num_key_value_heads")?,
             head_dim,
-            eps: f("rms_norm_eps")? as f32,
+            // ExaOne 3.x uses `layer_norm_epsilon` in place of `rms_norm_eps`.
+            eps: f_any(&["rms_norm_eps", "layer_norm_epsilon"])? as f32,
             rope_theta: f("rope_theta")?,
             vocab: u("vocab_size")?,
             rope,
@@ -448,6 +590,7 @@ impl Config {
             sliding_window,
             sliding_pattern,
             use_rope_layers,
+            weight_scheme,
         })
     }
 
@@ -524,5 +667,146 @@ impl Config {
     /// (`post_feedforward_layernorm` in Gemma2/3 and OLMo2/3).
     pub fn has_post_ff_norm(&self) -> bool {
         matches!(self.norm_style, NormStyle::GemmaFf | NormStyle::OlmoPost)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ERNIE-4.5 is rejected with a message naming its interleaved (GPT-J-style)
+    /// RoPE: it looks like a plain-RoPE Llama in config.json but its `rotate_half`
+    /// rotates the (2i, 2i+1) pairs, not the (i, i+d/2) halves the emitter uses, so
+    /// a half-split emit would be wrong. Deferred to an interleaved-RoPE follow-up.
+    #[test]
+    fn rejects_ernie4_5_interleaved_rope() {
+        let j = r#"{"model_type":"ernie4_5","hidden_size":1024,"intermediate_size":3072,
+            "num_hidden_layers":18,"num_attention_heads":16,"num_key_value_heads":2,
+            "head_dim":128,"rms_norm_eps":1e-5,"rope_theta":500000,"vocab_size":103424,
+            "tie_word_embeddings":true,"hidden_act":"silu","use_bias":false}"#;
+        let err = Config::from_json_str(j).expect_err("ernie4_5 is deferred");
+        assert!(
+            err.contains("interleaved"),
+            "names the interleaved-RoPE reason: {err}"
+        );
+    }
+
+    /// Seed-OSS parses to a Qwen2-style bias forward: `attention_bias = true` turns
+    /// on the q/k/v bias, `rope_type = "default"` is served as plain RoPE, and it is
+    /// untied. `attention_out_bias = false` is accepted (only `true` is rejected).
+    #[test]
+    fn parses_seed_oss_as_qkv_bias_default_rope() {
+        let j = r#"{"model_type":"seed_oss","hidden_size":5120,"intermediate_size":27648,
+            "num_hidden_layers":64,"num_attention_heads":80,"num_key_value_heads":8,
+            "head_dim":128,"rms_norm_eps":1e-6,"rope_theta":1e7,"vocab_size":155136,
+            "tie_word_embeddings":false,"attention_bias":true,"attention_out_bias":false,
+            "rope_scaling":{"rope_type":"default"},"hidden_act":"silu"}"#;
+        let c = Config::from_json_str(j).expect("seed_oss parses");
+        assert!(c.qkv_bias, "attention_bias=true -> q/k/v bias");
+        assert_eq!(c.rope, RopeScaling::Plain, "rope_type default -> plain");
+        assert!(!c.tie_word_embeddings, "seed_oss is untied");
+    }
+
+    /// MiMo parses to a Qwen2-style bias forward, and its config `sliding_window`
+    /// is ignored (served globally, as for Qwen2), so it parses to `None`.
+    #[test]
+    fn parses_mimo_qkv_bias_ignores_sliding_window() {
+        let j = r#"{"model_type":"mimo","hidden_size":4096,"intermediate_size":11008,
+            "num_hidden_layers":36,"num_attention_heads":32,"num_key_value_heads":8,
+            "head_dim":128,"rms_norm_eps":1e-5,"rope_theta":640000,"vocab_size":151680,
+            "tie_word_embeddings":false,"attention_bias":true,"sliding_window":32768,
+            "use_sliding_window":true,"hidden_act":"silu"}"#;
+        let c = Config::from_json_str(j).expect("mimo parses");
+        assert!(c.qkv_bias);
+        assert_eq!(c.rope, RopeScaling::Plain);
+        assert_eq!(
+            c.sliding_window, None,
+            "non-gemma2 sliding_window is ignored"
+        );
+    }
+
+    /// InternLM3 parses to a plain-RoPE untied Llama: `rope_type = "dynamic"` is
+    /// served as plain (in-context), and `qkv_bias` drives the bias (false here).
+    #[test]
+    fn parses_internlm3_dynamic_rope_as_plain() {
+        let j = r#"{"model_type":"internlm3","hidden_size":4096,"intermediate_size":10240,
+            "num_hidden_layers":48,"num_attention_heads":32,"num_key_value_heads":2,
+            "head_dim":128,"rms_norm_eps":1e-5,"rope_theta":50000000,"vocab_size":128512,
+            "tie_word_embeddings":false,"qkv_bias":false,
+            "rope_scaling":{"rope_type":"dynamic","factor":6.0},"hidden_act":"silu"}"#;
+        let c = Config::from_json_str(j).expect("internlm3 parses");
+        assert_eq!(c.rope, RopeScaling::Plain, "dynamic -> plain (in-context)");
+        assert!(!c.qkv_bias, "qkv_bias=false");
+        assert!(!c.tie_word_embeddings);
+        // A `qkv_bias = true` internlm3 turns the bias on.
+        let biased = j.replace("\"qkv_bias\":false", "\"qkv_bias\":true");
+        assert!(Config::from_json_str(&biased).unwrap().qkv_bias);
+    }
+
+    /// ExaOne 3.x parses to a llama3-RoPE tied Llama with the ExaOne weight scheme,
+    /// reading the alternate field names (`num_layers`, `layer_norm_epsilon`).
+    #[test]
+    fn parses_exaone_alt_fields_and_scheme() {
+        let j = r#"{"model_type":"exaone","hidden_size":2560,"intermediate_size":7168,
+            "num_layers":30,"num_attention_heads":32,"num_key_value_heads":8,"head_dim":80,
+            "layer_norm_epsilon":1e-5,"rope_theta":1000000,"vocab_size":102400,
+            "tie_word_embeddings":true,"activation_function":"silu",
+            "rope_scaling":{"rope_type":"llama3","factor":8.0,"low_freq_factor":1.0,
+            "high_freq_factor":4.0,"original_max_position_embeddings":8192}}"#;
+        let c = Config::from_json_str(j).expect("exaone parses");
+        assert_eq!(c.weight_scheme, WeightScheme::Exaone);
+        assert_eq!(c.n_layers, 30, "num_layers -> n_layers");
+        assert_eq!(c.eps, 1e-5, "layer_norm_epsilon -> eps");
+        assert_eq!(c.head_dim, 80);
+        assert!(c.tie_word_embeddings);
+        assert!(matches!(c.rope, RopeScaling::Llama3 { factor, .. } if factor == 8.0));
+    }
+
+    /// Unsupported deltas are rejected with a clear message rather than mis-emitted:
+    /// an attention output bias, an MLP bias, a non-SwiGLU activation, an
+    /// unsupported rope type (yarn), and an unsupported `model_type`.
+    #[test]
+    fn rejects_out_of_scope_dense_deltas() {
+        let base = |extra: &str| {
+            format!(
+                r#"{{"model_type":"seed_oss","hidden_size":8,"intermediate_size":16,
+                "num_hidden_layers":2,"num_attention_heads":2,"num_key_value_heads":1,
+                "rms_norm_eps":1e-6,"rope_theta":1e4,"vocab_size":10{extra}}}"#
+            )
+        };
+        assert!(
+            Config::from_json_str(&base(",\"attention_out_bias\":true"))
+                .unwrap_err()
+                .contains("o_proj"),
+            "o_proj bias rejected"
+        );
+        assert!(
+            Config::from_json_str(&base(",\"mlp_bias\":true"))
+                .unwrap_err()
+                .contains("MLP bias"),
+            "mlp bias rejected"
+        );
+        assert!(
+            Config::from_json_str(&base(",\"hidden_act\":\"gelu\""))
+                .unwrap_err()
+                .contains("SwiGLU"),
+            "non-silu activation rejected"
+        );
+        assert!(
+            Config::from_json_str(&base(",\"rope_scaling\":{\"rope_type\":\"yarn\"}"))
+                .unwrap_err()
+                .contains("yarn"),
+            "yarn rope rejected"
+        );
+        // An architecture the emitter cannot reproduce (MoE / MLA glm4 variant).
+        let glm = r#"{"model_type":"glm4_moe_lite","hidden_size":8,"intermediate_size":16,
+            "num_hidden_layers":2,"num_attention_heads":2,"num_key_value_heads":1,
+            "rms_norm_eps":1e-5,"rope_theta":1e4,"vocab_size":10}"#;
+        assert!(
+            Config::from_json_str(glm)
+                .unwrap_err()
+                .contains("model_type"),
+            "unsupported model_type rejected"
+        );
     }
 }

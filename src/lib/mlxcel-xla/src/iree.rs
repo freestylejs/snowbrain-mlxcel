@@ -55,6 +55,11 @@ use safetensors::{Dtype, SafeTensors};
 use crate::emitter::{
     Config, emit_decode_ragged_with, emit_decode_with, emit_prefill_with, resolve_precision,
 };
+// Checkpoint tensor names in the emitter's exact arg order, per the model config's
+// naming scheme (issue #499). Lives in a pure-Rust module so the ordering and each
+// architecture's names are unit-tested without the `iree` feature; the loader
+// below consumes the result unchanged.
+use crate::weight_names::weight_names;
 use crate::weights::{bf16_to_f32, dequantize_affine, f16_to_f32, f32_le_to_f32};
 
 /// Prefill bucket baked into the emitted `prefill` graph (`tensor<256xi32>`,
@@ -123,69 +128,6 @@ unsafe extern "C" {
 /// ragged decode graph for the chosen `b_max` is emitted from the model config at
 /// load (any `b_max` is emittable; the worker selects from this set).
 pub(crate) const RAGGED_B_VALUES: &[usize] = &[4, 8];
-
-/// The weight names in the emitter's exact arg order: embed, final_norm, then —
-/// for an untied checkpoint (`tie_word_embeddings = false`) — `lm_head.weight`,
-/// then per layer the base weights and the arch-conditional extras. The base order
-/// is down, gate, input_layernorm, post_attention_layernorm, up, wk, wo, wq, wv;
-/// then, matching `take_layer_weights` in `emitter/model.rs` exactly, the k/q/v
-/// biases (`qkv_bias`, Qwen2), the q/k norms (`qk_norm`, Qwen3 / Gemma3 / OLMo2/3),
-/// and the feed-forward norms. `input_layernorm` is skipped for the OLMo reordered
-/// post-norm (which has none). Every knob comes from the model config so the buffer
-/// order lines up with the emitted graph args.
-fn weight_names(cfg: &Config) -> Vec<String> {
-    let mut names = vec![
-        "model.embed_tokens.weight".to_string(),
-        "model.norm.weight".to_string(),
-    ];
-    // Untied LM head: a separate `lm_head.weight` follows `final_norm`, matching
-    // the `params['lm_head']` arg the emitter takes in the same position.
-    if !cfg.tie_word_embeddings {
-        names.push("lm_head.weight".to_string());
-    }
-    for i in 0..cfg.n_layers {
-        let p = format!("model.layers.{i}.");
-        names.push(format!("{p}mlp.down_proj.weight"));
-        names.push(format!("{p}mlp.gate_proj.weight"));
-        // input_layernorm: present unless the reordered (OLMo) post-norm drops it.
-        if cfg.has_input_norm() {
-            names.push(format!("{p}input_layernorm.weight"));
-        }
-        for suf in [
-            "post_attention_layernorm.weight",
-            "mlp.up_proj.weight",
-            "self_attn.k_proj.weight",
-            "self_attn.o_proj.weight",
-            "self_attn.q_proj.weight",
-            "self_attn.v_proj.weight",
-        ] {
-            names.push(format!("{p}{suf}"));
-        }
-        // Qwen2 q/k/v projection biases, in the same k/q/v order the emitter adds.
-        if cfg.qkv_bias {
-            for suf in [
-                "self_attn.k_proj.bias",
-                "self_attn.q_proj.bias",
-                "self_attn.v_proj.bias",
-            ] {
-                names.push(format!("{p}{suf}"));
-            }
-        }
-        // q/k norms (Qwen3 / Gemma3 per-head, OLMo2/3 flat), q then k.
-        if cfg.qk_norm.is_some() {
-            names.push(format!("{p}self_attn.q_norm.weight"));
-            names.push(format!("{p}self_attn.k_norm.weight"));
-        }
-        // Feed-forward norms: Gemma2/3 add pre AND post; OLMo2/3 add post only.
-        if cfg.has_pre_ff_norm() {
-            names.push(format!("{p}pre_feedforward_layernorm.weight"));
-        }
-        if cfg.has_post_ff_norm() {
-            names.push(format!("{p}post_feedforward_layernorm.weight"));
-        }
-    }
-    names
-}
 
 /// Locate the IREE distribution: a runtime `IREE_DIST` override first, else the
 /// path baked at build time (the dist whose runtime is linked into this binary).
