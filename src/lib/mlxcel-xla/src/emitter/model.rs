@@ -21,6 +21,7 @@
 
 use super::builder::{Builder, Precision, Ty, Val, precision_from_env};
 use super::config::{Config, NormStyle};
+use super::moe::{self, MoeLayerW, MoeSharedW};
 use super::rope;
 
 const MAX_SEQ: usize = 256;
@@ -46,7 +47,10 @@ const PREFILL_LP: usize = MAX_SEQ;
 /// (`down_bias`/`gate_bias`/`up_bias`, StarCoder2). All are `None` for the Llama
 /// family, so its graphs are byte-identical.
 struct LayerW {
-    down: Val,
+    /// MLP down projection. `None` on a MoE layer (issue #500), whose FFN uses `moe`
+    /// instead; `Some` for every dense layer (all non-MoE models, and the leading
+    /// dense layers of a MoE model), so the dense-MLP op sequence is unchanged.
+    down: Option<Val>,
     gate: Option<Val>,
     /// `input_layernorm` (`None` for OLMo2/3, whose reordered post-norm has no
     /// input norm; the attention projects the raw residual instead).
@@ -55,7 +59,9 @@ struct LayerW {
     /// post-attention norm; Plain uses it as the pre-MLP norm, Gemma2/3 and OLMo2/3
     /// as the post-attn norm).
     post_ln: Option<Val>,
-    up: Val,
+    /// MLP up projection. `None` on a MoE layer (issue #500); `Some` for every dense
+    /// layer, so the dense-MLP op sequence is unchanged.
+    up: Option<Val>,
     wk: Val,
     wo: Val,
     wq: Val,
@@ -84,6 +90,19 @@ struct LayerW {
     down_bias: Option<Val>,
     gate_bias: Option<Val>,
     up_bias: Option<Val>,
+    /// MoE FFN weight handles (issue #500), `Some` on a MoE layer (router, stacked
+    /// experts, optional shared expert); `None` on a dense layer.
+    moe: Option<MoeLayerW>,
+}
+
+impl LayerW {
+    /// The dense MLP weight `w`, present on every dense layer. Panics only if a MoE
+    /// layer reaches a dense-MLP emit path, which the `is_moe_layer` branch guards
+    /// against, so the dense paths are never taken for a MoE layer.
+    fn dense(w: &Option<Val>) -> &Val {
+        w.as_ref()
+            .expect("dense MLP weight taken on a dense layer (MoE layers use `moe`)")
+    }
 }
 
 struct Args {
@@ -178,17 +197,20 @@ fn take_layer_weights(decls: &mut Vec<ArgDecl>, idx: &mut usize, c: &Config, li:
     let p = |k: &str| format!("params['layers'][{}]['{}']", li, k);
     // A dense (non-gated) MLP has no gate projection (StarCoder2); a parallel-block
     // arch has no post-attention layernorm (Cohere/Cohere2). Both are `true` for the
-    // Llama family, so its arg order is unchanged.
+    // Llama family, so its arg order is unchanged. A MoE layer (issue #500) takes no
+    // dense MLP weights (down/gate/up) here; its expert bank is appended last.
     let gated = !c.dense_mlp;
     let has_post = !c.parallel_block;
-    let down = take_arg(decls, idx, Ty::f32(vec![h, inter]), p("down"));
-    let gate = gated.then(|| take_arg(decls, idx, Ty::f32(vec![inter, h]), p("gate")));
+    let moe_layer = c.is_moe_layer(li);
+    let down = (!moe_layer).then(|| take_arg(decls, idx, Ty::f32(vec![h, inter]), p("down")));
+    let gate =
+        (gated && !moe_layer).then(|| take_arg(decls, idx, Ty::f32(vec![inter, h]), p("gate")));
     // input_layernorm: present unless the reordered (OLMo) post-norm drops it.
     let in_ln = c
         .has_input_norm()
         .then(|| take_arg(decls, idx, Ty::f32(vec![h]), p("in_ln")));
     let post_ln = has_post.then(|| take_arg(decls, idx, Ty::f32(vec![h]), p("post_ln")));
-    let up = take_arg(decls, idx, Ty::f32(vec![inter, h]), p("up"));
+    let up = (!moe_layer).then(|| take_arg(decls, idx, Ty::f32(vec![inter, h]), p("up")));
     let wk = take_arg(decls, idx, Ty::f32(vec![kv, h]), p("wk"));
     // o_proj maps `[n_q*head_dim]` -> `[hidden]`, so its weight is `[h, qd]` (HF's
     // `[out, in]`). For Llama / Qwen2 `qd == h`, so this renders the same square
@@ -247,6 +269,10 @@ fn take_layer_weights(decls: &mut Vec<ArgDecl>, idx: &mut usize, c: &Config, li:
     let up_bias = c
         .mlp_bias
         .then(|| take_arg(decls, idx, Ty::f32(vec![inter]), p("up_bias")));
+    // MoE expert bank (issue #500): router, stacked experts, optional shared expert,
+    // appended after the attention weights / biases / FF norms on a MoE layer, in the
+    // same order `weight_specs` (`weights.rs`) lists them so the args line up.
+    let moe = moe_layer.then(|| take_moe_weights(decls, idx, c, li));
     LayerW {
         down,
         gate,
@@ -270,6 +296,55 @@ fn take_layer_weights(decls: &mut Vec<ArgDecl>, idx: &mut usize, c: &Config, li:
         down_bias,
         gate_bias,
         up_bias,
+        moe,
+    }
+}
+
+/// Append a MoE layer's expert-bank args (issue #500): the router `[E, H]`, the
+/// three stacked expert projections `[E, I, H]` / `[E, I, H]` / `[E, H, I]`, and,
+/// when the family has a shared expert, its `[Is, H]` / `[Is, H]` / `[H, Is]` SwiGLU
+/// plus, for a gated shared expert (Qwen2-MoE), its `[1, H]` gate. The order mirrors
+/// `weight_specs` (`weights.rs`) so the loaded buffers line up with the emitted args.
+fn take_moe_weights(decls: &mut Vec<ArgDecl>, idx: &mut usize, c: &Config, li: usize) -> MoeLayerW {
+    let m = c.moe.as_ref().expect("a MoE layer has a MoeConfig");
+    let h = c.hidden;
+    let e = m.n_experts;
+    let i = m.intermediate;
+    let p = |k: &str| format!("params['layers'][{}]['{}']", li, k);
+    let router = take_arg(decls, idx, Ty::f32(vec![e, h]), p("moe_router"));
+    let w_gate = take_arg(decls, idx, Ty::f32(vec![e, i, h]), p("moe_gate"));
+    let w_up = take_arg(decls, idx, Ty::f32(vec![e, i, h]), p("moe_up"));
+    let w_down = take_arg(decls, idx, Ty::f32(vec![e, h, i]), p("moe_down"));
+    let shared = if let Some(sh) = m.shared {
+        let is = sh.intermediate;
+        let gate = take_arg(decls, idx, Ty::f32(vec![is, h]), p("moe_shared_gate"));
+        let up = take_arg(decls, idx, Ty::f32(vec![is, h]), p("moe_shared_up"));
+        let down = take_arg(decls, idx, Ty::f32(vec![h, is]), p("moe_shared_down"));
+        let expert_gate = if sh.gated {
+            Some(take_arg(
+                decls,
+                idx,
+                Ty::f32(vec![1, h]),
+                p("moe_shared_expert_gate"),
+            ))
+        } else {
+            None
+        };
+        Some(MoeSharedW {
+            gate,
+            up,
+            down,
+            expert_gate,
+        })
+    } else {
+        None
+    };
+    MoeLayerW {
+        router,
+        w_gate,
+        w_up,
+        w_down,
+        shared,
     }
 }
 
@@ -365,8 +440,10 @@ fn render_signature(decls: &[ArgDecl]) -> String {
     parts.join(", ")
 }
 
-/// Shared scalar/table constants, emitted once at the top of the body.
-struct Consts {
+/// Shared scalar/table constants, emitted once at the top of the body. Crate-
+/// visible so the sibling `moe` module (issue #500) reads the shared scalars
+/// (`zero`, `one`, `neg_inf`) it needs for the router softmax / top-k masking.
+pub(crate) struct Consts {
     cos_table: Val,
     sin_table: Val,
     /// Gemma3 / OLMo3 local RoPE tables (`Some` only when the config has a local
@@ -375,9 +452,9 @@ struct Consts {
     /// families are byte-identical.
     cos_local: Option<Val>,
     sin_local: Option<Val>,
-    zero: Val,
-    one: Val,
-    neg_inf: Val,
+    pub(crate) zero: Val,
+    pub(crate) one: Val,
+    pub(crate) neg_inf: Val,
     neg_big: Val,
     eps: Val,
     hidden_f: Val,
@@ -747,15 +824,15 @@ fn emit_mlp_body(
 ) -> Val {
     if c.dense_mlp {
         // Dense (StarCoder2): up == c_fc, then gelu, then down == c_proj. No gate.
-        let up = layout.linear(b, hn, &lw.up);
+        let up = layout.linear(b, hn, LayerW::dense(&lw.up));
         let up = layout.add_bias(b, up, lw.up_bias.as_ref());
         let act = gelu_tanh(b, &up);
-        let down = layout.linear(b, &act, &lw.down);
+        let down = layout.linear(b, &act, LayerW::dense(&lw.down));
         return layout.add_bias(b, down, lw.down_bias.as_ref());
     }
     let gate = layout.linear(b, hn, lw.gate.as_ref().expect("gated MLP has a gate"));
     let gate = layout.add_bias(b, gate, lw.gate_bias.as_ref());
-    let up = layout.linear(b, hn, &lw.up);
+    let up = layout.linear(b, hn, LayerW::dense(&lw.up));
     let up = layout.add_bias(b, up, lw.up_bias.as_ref());
     let act = if c.mlp_geglu {
         gelu_tanh(b, &gate)
@@ -763,7 +840,7 @@ fn emit_mlp_body(
         silu(b, k, &gate)
     };
     let act = b.multiply(&act, &up);
-    let down = layout.linear(b, &act, &lw.down);
+    let down = layout.linear(b, &act, LayerW::dense(&lw.down));
     let down = layout.add_bias(b, down, lw.down_bias.as_ref());
     if c.has_post_ff_norm() {
         let w = norm_w(
@@ -776,6 +853,40 @@ fn emit_mlp_body(
         layout.norm(b, c, k, &down, &w, None)
     } else {
         down
+    }
+}
+
+/// The per-layer FFN body over the pre-normed hidden `hn`, returning the FFN output
+/// WITHOUT the residual add (the transformer layer owns the residual): the MoE FFN
+/// block (issue #500, `moe_block` over the routed + optional shared experts) on a
+/// MoE layer, else the dense SwiGLU / GeGLU / dense-MLP body ([`emit_mlp_body`]). On
+/// a dense layer it forwards straight to `emit_mlp_body`, so every dense graph stays
+/// byte-for-byte identical. The MoE primitive is seq-only (`[N, H]`); the single-
+/// token decode rank is `[H]`, so this reshapes `[H]` to `[1, H]` and back there.
+#[allow(clippy::too_many_arguments)]
+fn emit_ffn_body(
+    b: &mut Builder,
+    c: &Config,
+    k: &Consts,
+    layout: &AttnLayout,
+    hn: &Val,
+    lw: &LayerW,
+    li: usize,
+) -> Val {
+    if !c.is_moe_layer(li) {
+        return emit_mlp_body(b, c, k, layout, hn, lw);
+    }
+    let m = c.moe.as_ref().expect("a MoE layer has a MoeConfig");
+    let mw = lw.moe.as_ref().expect("a MoE layer has expert weights");
+    let h = c.hidden;
+    match layout {
+        AttnLayout::Single { .. } => {
+            let hn1 = b.reshape(hn, vec![1, h]);
+            let out = moe::moe_block(b, c, m, mw, k, &hn1, 1);
+            b.reshape(&out, vec![h])
+        }
+        AttnLayout::Ragged { bsz, .. } => moe::moe_block(b, c, m, mw, k, hn, *bsz),
+        AttnLayout::Prefill { lp, .. } => moe::moe_block(b, c, m, mw, k, hn, *lp),
     }
 }
 
@@ -1318,8 +1429,9 @@ fn layer_mask<'a>(mask: &'a Val, mask_local: &'a Option<Val>, c: &Config, li: us
 /// Numerically-stable softmax over `axis` of `scores` (max-subtract, exp,
 /// sum-divide). The keep-dims for the max/sum broadcasts are every axis but
 /// `axis`, so one helper serves the single (`axis 1`), ragged (`axis 2`), and
-/// prefill (`axis 3`) score ranks identically.
-fn attn_softmax(b: &mut Builder, k: &Consts, scores: &Val, axis: usize) -> Val {
+/// prefill (`axis 3`) score ranks identically. Crate-visible: the `moe` module
+/// (issue #500) reuses it for the router softmax over the expert axis.
+pub(crate) fn attn_softmax(b: &mut Builder, k: &Consts, scores: &Val, axis: usize) -> Val {
     let shape = scores.ty.shape.clone();
     let keep: Vec<usize> = (0..shape.len()).filter(|&i| i != axis).collect();
     let m = b.reduce_max(scores, axis, &k.neg_inf);
@@ -1463,7 +1575,7 @@ fn emit_transformer_layer(
         // Parallel: attention and MLP both read the one input_layernorm output;
         // their results are summed into a single residual (Cohere/Cohere2).
         let (hn, attn_out) = emit_attention(b, c, k, lw, li, x, layout, kcache, vcache);
-        let mlp_out = emit_mlp_body(b, c, k, layout, &hn, lw);
+        let mlp_out = emit_ffn_body(b, c, k, layout, &hn, lw, li);
         let s1 = b.add(x, &attn_out);
         b.add(&s1, &mlp_out)
     } else {
@@ -1473,7 +1585,7 @@ fn emit_transformer_layer(
         let attn_out = scale_residual(b, c, attn_out);
         let x1 = b.add(x, &attn_out);
         let hn2 = mlp_pre_norm(b, c, k, layout, &x1, lw);
-        let down = emit_mlp_body(b, c, k, layout, &hn2, lw);
+        let down = emit_ffn_body(b, c, k, layout, &hn2, lw, li);
         let down = scale_residual(b, c, down);
         b.add(&x1, &down)
     }
@@ -1840,28 +1952,46 @@ pub fn emit_decode_batched_with(
         let attn_out = b.linear_seq(&o, &lw.wo); // [B, H]
         x = b.add(&x, &attn_out);
 
-        // MLP: down( silu(x@gate^T) * (x@up^T) ). The superseded uniform-B graph
-        // serves only the gated, sequential Llama family, so `post_ln` / `gate` are
-        // always present (the dense-arch-pack graphs use the ragged serve path).
-        let hn2 = rms_norm_seq(
-            &mut b,
-            &x,
-            lw.post_ln.as_ref().expect("batched decode: post_ln"),
-            &k,
-            bsz,
-            h,
-        );
-        let gate = b.linear_seq(&hn2, lw.gate.as_ref().expect("batched decode: gate")); // [B, inter]
-        let up = b.linear_seq(&hn2, &lw.up); // [B, inter]
-        let neg = b.negate(&gate);
-        let ex = b.exponential(&neg);
-        let one_b = b.broadcast(&k.one, &[], vec![bsz, c.inter]);
-        let denom = b.add(&one_b, &ex);
-        let sig = b.divide(&one_b, &denom);
-        let silu = b.multiply(&gate, &sig);
-        let act = b.multiply(&silu, &up);
-        let down = b.linear_seq(&act, &lw.down); // [B, H]
-        x = b.add(&x, &down);
+        // FFN: the MoE block (issue #500) on a MoE layer, else the dense SwiGLU MLP
+        // `down( silu(x@gate^T) * (x@up^T) )`. The superseded uniform-B graph serves
+        // only the gated, sequential families, so `post_ln` / `gate` are always
+        // present (the dense-arch-pack graphs use the ragged serve path); the dense
+        // branch emits the exact op sequence it did before, so it stays byte-for-byte
+        // identical.
+        if c.is_moe_layer(li) {
+            let m = c.moe.as_ref().expect("a MoE layer has a MoeConfig");
+            let mw = lw.moe.as_ref().expect("a MoE layer has expert weights");
+            let hn2 = rms_norm_seq(
+                &mut b,
+                &x,
+                lw.post_ln.as_ref().expect("batched decode: post_ln"),
+                &k,
+                bsz,
+                h,
+            );
+            let moe_out = moe::moe_block(&mut b, c, m, mw, &k, &hn2, bsz);
+            x = b.add(&x, &moe_out);
+        } else {
+            let hn2 = rms_norm_seq(
+                &mut b,
+                &x,
+                lw.post_ln.as_ref().expect("batched decode: post_ln"),
+                &k,
+                bsz,
+                h,
+            );
+            let gate = b.linear_seq(&hn2, lw.gate.as_ref().expect("batched decode: gate")); // [B, inter]
+            let up = b.linear_seq(&hn2, LayerW::dense(&lw.up)); // [B, inter]
+            let neg = b.negate(&gate);
+            let ex = b.exponential(&neg);
+            let one_b = b.broadcast(&k.one, &[], vec![bsz, c.inter]);
+            let denom = b.add(&one_b, &ex);
+            let sig = b.divide(&one_b, &denom);
+            let silu = b.multiply(&gate, &sig);
+            let act = b.multiply(&silu, &up);
+            let down = b.linear_seq(&act, LayerW::dense(&lw.down)); // [B, H]
+            x = b.add(&x, &down);
+        }
     }
 
     // --- tail: final norm + LM head (tied embed or untied lm_head) -> [B, V],
@@ -2371,5 +2501,53 @@ pub fn emit_prefill_with(c: &Config, sample: bool, precision: Precision) -> Stri
         l = out_val,
         kc = kcache.name,
         vc = vcache.name,
+    )
+}
+
+// ===========================================================================
+// MoE FFN block probe (issue #500): a standalone module for the execution check
+// ===========================================================================
+//
+// `main(moe weights..., hn[N, H]) -> out[N, H]` runs ONLY the MoE FFN block
+// ([`moe::moe_block`]) on an already-normed hidden `hn`, with no attention, no
+// pre-norm, and no residual, so an out-of-crate check (spike/openxla/moe_oracle.py)
+// can compile it with IREE and compare it directly to an HF MoE block's fp32
+// forward. Isolating the block makes the routing / dispatch math the only variable,
+// so the execution check proves it without needing a full model or a real
+// (unsupported-attention) MoE checkpoint. The arg order is the per-layer MoE order
+// `take_moe_weights` / `weight_specs` share, so the probe doubles as a check that
+// the emitted expert-arg schema is what the loader feeds.
+
+/// Emit the MoE FFN block probe for `c` over `n` input rows (default precision).
+pub(crate) fn emit_moe_probe(c: &Config, n: usize) -> String {
+    emit_moe_probe_with(c, n, precision_from_env())
+}
+
+/// Emit the MoE FFN block probe at an explicit contraction precision.
+pub(crate) fn emit_moe_probe_with(c: &Config, n: usize, precision: Precision) -> String {
+    let m = c
+        .moe
+        .as_ref()
+        .expect("emit_moe_probe requires a MoE config");
+    let h = c.hidden;
+
+    let mut decls: Vec<ArgDecl> = Vec::new();
+    let mut idx = 0usize;
+    // The expert bank in the canonical per-layer MoE arg order, then the input.
+    let mw = take_moe_weights(&mut decls, &mut idx, c, 0);
+    let hn = take_arg(&mut decls, &mut idx, Ty::f32(vec![n, h]), "hn".into());
+
+    let mut b = Builder::new().with_precision(precision);
+    let k = emit_consts(&mut b, c);
+    let out = moe::moe_block(&mut b, c, m, &mw, &k, &hn, n);
+
+    let sig = render_signature(&decls);
+    let out_ty = Ty::f32(vec![n, h]).render();
+    format!(
+        "module @moe_probe {{\n  func.func public @main({sig}) -> {out_ty} {{\n{body}    return {o} : {out_ty}\n  }}\n}}\n",
+        sig = sig,
+        out_ty = out_ty,
+        body = b.body(),
+        o = out.name,
     )
 }

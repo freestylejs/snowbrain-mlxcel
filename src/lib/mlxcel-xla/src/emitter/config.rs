@@ -110,6 +110,54 @@ pub struct QuantConfig {
     pub group_size: usize,
 }
 
+/// A Mixture-of-Experts FFN's always-on shared-expert branch (issue #500). A plain
+/// SwiGLU MLP of `intermediate` hidden width, run on every token in parallel with
+/// the routed experts and added to the routed output. Qwen2-MoE additionally gates
+/// it by `sigmoid(x @ Wg^T)` (`gated = true`, a per-token scalar); DeepSeek adds it
+/// ungated (`gated = false`). Mixtral has no shared expert.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SharedExpertConfig {
+    /// The shared expert's SwiGLU intermediate width.
+    pub intermediate: usize,
+    /// Multiply the shared-expert output by `sigmoid(x @ Wg^T)` (Qwen2-MoE). When
+    /// `false` the branch is added ungated (DeepSeek), and no gate weight is taken.
+    pub gated: bool,
+}
+
+/// Mixture-of-Experts FFN parameters (issue #500). The router linear scores the
+/// `n_experts`, a softmax over ALL experts forms routing probabilities, the top
+/// `top_k` are selected, their probabilities are renormalized to sum to one when
+/// `norm_topk_prob`, scaled by `routed_scaling_factor`, and used to combine the
+/// selected experts' SwiGLU outputs (Mixtral / Qwen2-MoE / DeepSeek
+/// `scoring_func = "softmax"`, softmax-before-top-k). Experts are a stacked SwiGLU
+/// of `intermediate` width (mlx-lm `switch_mlp`, one `[n_experts, out, in]` tensor
+/// per projection). `shared` is the shared-expert branch when the family has one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MoeConfig {
+    /// Total number of routed experts (`num_experts` / `num_local_experts`).
+    pub n_experts: usize,
+    /// Experts selected per token (`num_experts_per_tok`).
+    pub top_k: usize,
+    /// Each routed expert's SwiGLU intermediate width (`moe_intermediate_size`;
+    /// Mixtral reuses `intermediate_size`).
+    pub intermediate: usize,
+    /// Renormalize the selected top-k routing probabilities to sum to one
+    /// (`norm_topk_prob`). Mixtral always does; Qwen2-MoE reads the flag.
+    pub norm_topk_prob: bool,
+    /// Scale applied to the routed combine weights (`routed_scaling_factor`, 1.0
+    /// for Mixtral / Qwen2-MoE). Emitted only when not exactly 1.0.
+    pub routed_scaling_factor: f64,
+    /// The shared-expert branch, when the family has one (Qwen2-MoE / DeepSeek).
+    pub shared: Option<SharedExpertConfig>,
+    /// Layers with index `< first_k_dense` are ordinary dense SwiGLU MLP layers
+    /// (DeepSeek `first_k_dense_replace`); 0 for an all-MoE model (Mixtral,
+    /// Qwen2-MoE). A dense layer takes the dense `mlp.{gate,up,down}_proj` weights.
+    pub first_k_dense: usize,
+    /// The checkpoint's per-layer MoE weight-name prefix: `block_sparse_moe`
+    /// (Mixtral) or `mlp` (Qwen2-MoE / DeepSeek). Read by the weight loader only.
+    pub weight_prefix: &'static str,
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub hidden: usize,
@@ -176,6 +224,11 @@ pub struct Config {
     /// Per-layer NoPE mask (SmolLM3): `use_rope_layers[li] == false` skips RoPE on
     /// that layer (`no_rope_layers`). `None` applies RoPE on every layer.
     pub use_rope_layers: Option<Vec<bool>>,
+    /// Mixture-of-Experts FFN parameters (issue #500). `Some` for a MoE
+    /// architecture (Mixtral, Qwen2-MoE); the FFN then routes the top-k of N
+    /// experts instead of a dense MLP. `None` for a dense model, whose graphs are
+    /// byte-for-byte unchanged (no MoE op is emitted).
+    pub moe: Option<MoeConfig>,
     /// Checkpoint tensor-naming scheme (issue #499). Loader-only: it selects how
     /// [`weight_names`](crate::weight_names) maps the emitter's arg order onto the
     /// checkpoint tensors, so it never affects the emitted graph. `Llama` (the
@@ -284,6 +337,7 @@ impl Config {
             sliding_window: None,
             sliding_pattern: 2,
             use_rope_layers: None,
+            moe: None,
             weight_scheme: WeightScheme::Llama,
             layernorm: false,
             norm_bias: false,
@@ -687,13 +741,34 @@ impl Config {
                         .to_string(),
                 );
             }
+            // MoE families (issue #500). The attention flags are set here; the MoE
+            // FFN itself is built by the `moe` block below. Mixtral is Llama-style
+            // attention (no bias, plain RoPE); Qwen2-MoE is Qwen2 attention (q/k/v
+            // bias). Qwen3-MoE (Qwen3 attention + MoE) and DeepSeek (multi-head
+            // latent attention) are #501 follow-ups.
+            Some("mixtral") => {}
+            Some("qwen2_moe") => {
+                qkv_bias = true;
+            }
+            Some("qwen3_moe") => {
+                return Err("Qwen3-MoE (Qwen3 attention + the MoE FFN) is a follow-up \
+                            (#501); the pieces exist but the combination is not yet \
+                            validated here"
+                    .to_string());
+            }
+            Some("deepseek_v2") | Some("deepseek_v3") => {
+                return Err("DeepSeek uses multi-head latent attention, not yet \
+                            reproduced here; it is a follow-up (#501)"
+                    .to_string());
+            }
             other => {
                 return Err(format!(
                     "the OpenXLA emitter supports the dense architectures Llama, Qwen2, \
                      Qwen3, Gemma1/2/3, SmolLM3, OLMo2/3, Seed-OSS, MiMo, InternLM3, ExaOne, \
-                     Cohere, Cohere2, Phi3, StableLM, StarCoder2, Granite, and MiniCPM; \
-                     config.json model_type = {other:?} (MoE / MLA / novel-activation \
-                     variants are follow-ups)"
+                     Cohere, Cohere2, Phi3, StableLM, StarCoder2, Granite, and MiniCPM, plus \
+                     the Mixtral and Qwen2-MoE mixture-of-experts architectures; \
+                     config.json model_type = {other:?} (other MoE / MLA / \
+                     novel-activation variants are follow-ups)"
                 ));
             }
         }
@@ -786,6 +861,44 @@ impl Config {
             }
         };
 
+        // MoE FFN (issue #500). A recognized MoE `model_type` builds a `MoeConfig`;
+        // the FFN then routes the top-k of N experts. The router does a softmax over
+        // ALL experts BEFORE the top-k (`scoring_func = "softmax"`), so the primitive
+        // is shared across Mixtral / Qwen2-MoE (and, once their attention lands,
+        // Qwen3-MoE / DeepSeek). Field names differ per family, so each is read
+        // explicitly rather than guessed.
+        let moe = match model_type {
+            Some("mixtral") => Some(MoeConfig {
+                n_experts: u("num_local_experts")?,
+                top_k: u("num_experts_per_tok")?,
+                // Mixtral's experts use `intermediate_size` (no `moe_intermediate_size`).
+                intermediate: u("intermediate_size")?,
+                // Mixtral always renormalizes the selected top-k routing weights.
+                norm_topk_prob: true,
+                routed_scaling_factor: 1.0,
+                shared: None,
+                first_k_dense: 0,
+                weight_prefix: "block_sparse_moe",
+            }),
+            Some("qwen2_moe") => Some(MoeConfig {
+                n_experts: u("num_experts")?,
+                top_k: u("num_experts_per_tok")?,
+                intermediate: u("moe_intermediate_size")?,
+                norm_topk_prob: v
+                    .get("norm_topk_prob")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                routed_scaling_factor: 1.0,
+                shared: Some(SharedExpertConfig {
+                    intermediate: u("shared_expert_intermediate_size")?,
+                    // Qwen2-MoE gates the shared expert by sigmoid(x @ Wg^T).
+                    gated: true,
+                }),
+                first_k_dense: 0,
+                weight_prefix: "mlp",
+            }),
+            _ => None,
+        };
         // Tied (share `embed` for the head) vs untied (separate `lm_head.weight`).
         // HF `PretrainedConfig` defaults this to `true`, but some arches default
         // untied (`tie_default`); an explicit config field always wins.
@@ -817,6 +930,7 @@ impl Config {
             sliding_window,
             sliding_pattern,
             use_rope_layers,
+            moe,
             weight_scheme,
             layernorm,
             norm_bias,
@@ -929,6 +1043,14 @@ impl Config {
     /// (`post_feedforward_layernorm` in Gemma2/3 and OLMo2/3).
     pub fn has_post_ff_norm(&self) -> bool {
         matches!(self.norm_style, NormStyle::GemmaFf | NormStyle::OlmoPost)
+    }
+
+    /// Whether layer `li` is a MoE FFN layer (issue #500). True for a MoE config on
+    /// every layer at or past `first_k_dense` (the leading dense layers a family
+    /// like DeepSeek keeps as ordinary MLP). A dense config returns `false` for
+    /// every layer, so its graphs emit no MoE op and stay byte-for-byte unchanged.
+    pub fn is_moe_layer(&self, li: usize) -> bool {
+        self.moe.as_ref().is_some_and(|m| li >= m.first_k_dense)
     }
 }
 

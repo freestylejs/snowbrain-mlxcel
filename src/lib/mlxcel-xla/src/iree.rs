@@ -62,10 +62,12 @@ use crate::emitter::{
 // The loader reads the per-architecture checkpoint-weight order from
 // `weights::weight_specs`, which sources its names from `weight_names::scheme_names`
 // (issue #499 naming schemes) and covers the #498 dense pack (LayerNorm / o_proj /
-// MLP biases, the dense StarCoder2 MLP, and the row-sliced fused Phi3 projections).
-// Both are pure-Rust and unit-tested without the `iree` feature.
+// MLP biases, the dense StarCoder2 MLP, and the row-sliced fused Phi3 projections)
+// and the #500 MoE expert bank (the stacked `switch_mlp` weights, dequantized with
+// `dequantize_affine_stacked`). Both are pure-Rust and unit-tested without `iree`.
 use crate::weights::{
-    WeightSpec, bf16_to_f32, dequantize_affine, f16_to_f32, f32_le_to_f32, slice_rows, weight_specs,
+    WeightSpec, bf16_to_f32, dequantize_affine, dequantize_affine_stacked, f16_to_f32,
+    f32_le_to_f32, slice_rows, weight_specs,
 };
 
 /// Prefill bucket baked into the emitted `prefill` graph (`tensor<256xi32>`,
@@ -140,7 +142,9 @@ pub(crate) const RAGGED_B_VALUES: &[usize] = &[4, 8];
 // kept in lock-step with the emitter's arg order). It covers the dense arch pack
 // (issue #498): LayerNorm biases, the o_proj / MLP biases, the dense StarCoder2
 // MLP, and the Phi3 fused `qkv_proj` / `gate_up_proj` (loaded once and row-sliced
-// into the emitter's separate args).
+// into the emitter's separate args); and the MoE expert bank (issue #500): the
+// router and the stacked `switch_mlp` gate/up/down (plus the optional shared
+// expert), appended after each MoE layer's attention weights / norms.
 
 /// Locate the IREE distribution: a runtime `IREE_DIST` override first, else the
 /// path baked at build time (the dist whose runtime is linked into this binary).
@@ -398,22 +402,47 @@ fn load_weights(
                     ));
                 }
                 let shape = t.shape();
-                if shape.len() != 2 {
-                    return Err(format!("quantized weight {name} rank {} != 2", shape.len()));
+                match shape.len() {
+                    // Ordinary `[out, in_packed]` weight (attention, dense MLP,
+                    // shared expert, router when quantized).
+                    2 => {
+                        let (out, in_packed) = (shape[0], shape[1]);
+                        let in_ = in_packed * (32 / qc.bits);
+                        let d = dequantize_affine(
+                            t.data(),
+                            scales.data(),
+                            biases.data(),
+                            out,
+                            in_packed,
+                            qc.bits,
+                            qc.group_size,
+                        )
+                        .map_err(|e| format!("dequantize {name}: {e}"))?;
+                        (d, vec![out, in_])
+                    }
+                    // Stacked `[experts, out, in_packed]` MoE `switch_mlp` weight
+                    // (issue #500); dequantize each expert slab and keep the leading
+                    // expert axis so it feeds the emitter's `[E, out, in]` arg.
+                    3 => {
+                        let (experts, out, in_packed) = (shape[0], shape[1], shape[2]);
+                        let in_ = in_packed * (32 / qc.bits);
+                        let d = dequantize_affine_stacked(
+                            t.data(),
+                            scales.data(),
+                            biases.data(),
+                            experts,
+                            out,
+                            in_packed,
+                            qc.bits,
+                            qc.group_size,
+                        )
+                        .map_err(|e| format!("dequantize stacked {name}: {e}"))?;
+                        (d, vec![experts, out, in_])
+                    }
+                    r => {
+                        return Err(format!("quantized weight {name} rank {r} not in {{2, 3}}"));
+                    }
                 }
-                let (out, in_packed) = (shape[0], shape[1]);
-                let in_ = in_packed * (32 / qc.bits);
-                let d = dequantize_affine(
-                    t.data(),
-                    scales.data(),
-                    biases.data(),
-                    out,
-                    in_packed,
-                    qc.bits,
-                    qc.group_size,
-                )
-                .map_err(|e| format!("dequantize {name}: {e}"))?;
-                (d, vec![out, in_])
             } else {
                 // bf16 and f16 are the common checkpoint dtypes; f32 is a
                 // passthrough. The widening is exact for all three, matching HF's

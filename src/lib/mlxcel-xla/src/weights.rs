@@ -90,14 +90,19 @@ pub(crate) fn weight_specs(cfg: &Config) -> Vec<WeightSpec> {
     }
     for i in 0..cfg.n_layers {
         let p = format!("{}{i}.", s.layer_stem);
+        // A MoE layer (issue #500) takes no dense MLP weights (down/gate/up); its
+        // expert bank is appended after the attention weights / norms instead.
+        let moe_layer = cfg.is_moe_layer(i);
         // down (dense StarCoder2 uses c_proj; else the scheme's down projection).
-        out.push(WeightSpec::Whole(if cfg.dense_mlp {
-            format!("{p}mlp.c_proj.weight")
-        } else {
-            format!("{p}{}", s.down)
-        }));
+        if !moe_layer {
+            out.push(WeightSpec::Whole(if cfg.dense_mlp {
+                format!("{p}mlp.c_proj.weight")
+            } else {
+                format!("{p}{}", s.down)
+            }));
+        }
         // gate (gated MLP only; the first half of gate_up_proj for a fused Phi3).
-        if gated {
+        if gated && !moe_layer {
             if cfg.fused_gate_up {
                 out.push(WeightSpec::Rows {
                     name: format!("{p}mlp.gate_up_proj.weight"),
@@ -120,16 +125,19 @@ pub(crate) fn weight_specs(cfg: &Config) -> Vec<WeightSpec> {
             )));
         }
         // up (c_fc for dense; the second half of gate_up_proj for a fused Phi3).
-        if cfg.fused_gate_up {
-            out.push(WeightSpec::Rows {
-                name: format!("{p}mlp.gate_up_proj.weight"),
-                start: inter,
-                end: 2 * inter,
-            });
-        } else if cfg.dense_mlp {
-            out.push(WeightSpec::Whole(format!("{p}mlp.c_fc.weight")));
-        } else {
-            out.push(WeightSpec::Whole(format!("{p}{}", s.up)));
+        // Skipped on a MoE layer (issue #500), which has no dense up projection.
+        if !moe_layer {
+            if cfg.fused_gate_up {
+                out.push(WeightSpec::Rows {
+                    name: format!("{p}mlp.gate_up_proj.weight"),
+                    start: inter,
+                    end: 2 * inter,
+                });
+            } else if cfg.dense_mlp {
+                out.push(WeightSpec::Whole(format!("{p}mlp.c_fc.weight")));
+            } else {
+                out.push(WeightSpec::Whole(format!("{p}{}", s.up)));
+            }
         }
         // wk, wo, wq, wv (JAX-alphabetical; a fused Phi3 qkv_proj is [Q|K|V] rows).
         if cfg.fused_qkv {
@@ -200,6 +208,41 @@ pub(crate) fn weight_specs(cfg: &Config) -> Vec<WeightSpec> {
             } else {
                 format!("{p}mlp.up_proj.bias")
             }));
+        }
+        // MoE expert bank (issue #500), last in the layer: the router, the stacked
+        // mlx-lm `switch_mlp` gate/up/down, then the optional shared expert (and its
+        // sigmoid gate). `weight_prefix` is `mlp` (Qwen2-MoE) or `block_sparse_moe`
+        // (Mixtral); the order mirrors `take_moe_weights` in `emitter/model.rs` and
+        // the emitted args, so the loaded buffers line up with the graph.
+        if moe_layer {
+            let m = cfg.moe.as_ref().expect("a MoE layer has a MoeConfig");
+            let mp = m.weight_prefix;
+            out.push(WeightSpec::Whole(format!("{p}{mp}.gate.weight")));
+            out.push(WeightSpec::Whole(format!(
+                "{p}{mp}.switch_mlp.gate_proj.weight"
+            )));
+            out.push(WeightSpec::Whole(format!(
+                "{p}{mp}.switch_mlp.up_proj.weight"
+            )));
+            out.push(WeightSpec::Whole(format!(
+                "{p}{mp}.switch_mlp.down_proj.weight"
+            )));
+            if let Some(sh) = m.shared {
+                out.push(WeightSpec::Whole(format!(
+                    "{p}{mp}.shared_expert.gate_proj.weight"
+                )));
+                out.push(WeightSpec::Whole(format!(
+                    "{p}{mp}.shared_expert.up_proj.weight"
+                )));
+                out.push(WeightSpec::Whole(format!(
+                    "{p}{mp}.shared_expert.down_proj.weight"
+                )));
+                if sh.gated {
+                    out.push(WeightSpec::Whole(format!(
+                        "{p}{mp}.shared_expert_gate.weight"
+                    )));
+                }
+            }
         }
     }
     out
@@ -336,6 +379,70 @@ pub(crate) fn dequantize_affine(
                 w[wrow + i] = q * scales[grow + g] + biases[grow + g];
             }
         }
+    }
+    Ok(w)
+}
+
+/// Dequantize a STACKED mlx-lm affine-quantized expert weight (issue #500) to
+/// row-major `[experts, out, in]` f32. The MoE `switch_mlp` projections pack all
+/// `experts` into one `[experts, out, in_packed]` U32 tensor with companion
+/// `[experts, out, in/group_size]` f16 `scales` / `biases`; this dequantizes each
+/// expert's `[out, in_packed]` slab with [`dequantize_affine`] and concatenates
+/// them, so the loader hands the emitter's `[E, out, in]` expert arg one f32
+/// buffer. Byte-for-byte identical to dequantizing each expert separately.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dequantize_affine_stacked(
+    packed: &[u8],
+    scales: &[u8],
+    biases: &[u8],
+    experts: usize,
+    out: usize,
+    in_packed: usize,
+    bits: usize,
+    group_size: usize,
+) -> Result<Vec<f32>, String> {
+    if experts == 0 {
+        return Err("stacked expert weight has 0 experts".to_string());
+    }
+    if !(bits == 4 || bits == 8) {
+        return Err(format!(
+            "unsupported quantization bits {bits} (expected 4 or 8)"
+        ));
+    }
+    let per_u32 = 32 / bits;
+    let in_ = in_packed * per_u32;
+    if group_size == 0 || !in_.is_multiple_of(group_size) {
+        return Err(format!(
+            "quantization group_size {group_size} does not divide in dimension {in_}"
+        ));
+    }
+    let n_groups = in_ / group_size;
+    // Per-expert strides: the U32 weight is 4 bytes/element, the f16 scales/biases
+    // 2 bytes/element. `dequantize_affine` re-validates each slab's exact sizes.
+    let packed_stride = out * in_packed * 4;
+    let sb_stride = out * n_groups * 2;
+    if packed.len() != experts * packed_stride {
+        return Err(format!(
+            "stacked packed weight is {} bytes, expected {} ([{experts}, {out}, {in_packed}] u32)",
+            packed.len(),
+            experts * packed_stride
+        ));
+    }
+    if scales.len() != experts * sb_stride || biases.len() != experts * sb_stride {
+        return Err(format!(
+            "stacked scales/biases have {}/{} bytes, expected {} ([{experts}, {out}, {n_groups}] f16)",
+            scales.len(),
+            biases.len(),
+            experts * sb_stride
+        ));
+    }
+    let mut w = Vec::with_capacity(experts * out * in_);
+    for e in 0..experts {
+        let p = &packed[e * packed_stride..(e + 1) * packed_stride];
+        let s = &scales[e * sb_stride..(e + 1) * sb_stride];
+        let bi = &biases[e * sb_stride..(e + 1) * sb_stride];
+        let slab = dequantize_affine(p, s, bi, out, in_packed, bits, group_size)?;
+        w.extend_from_slice(&slab);
     }
     Ok(w)
 }
@@ -552,5 +659,37 @@ mod tests {
         let packed = [0u8; 4];
         let sb = [0u8; 4];
         assert!(dequantize_affine(&packed, &sb, &sb, 2, 1, 4, 4).is_err());
+    }
+
+    /// The stacked (rank-3) expert dequant is exactly the per-expert dequant
+    /// concatenated: two experts, each the 4-bit hand example, yield that row
+    /// twice. Exercises the `[experts, out, in_packed]` slab strides (issue #500).
+    #[test]
+    fn dequantize_affine_stacked_concatenates_expert_slabs() {
+        // One expert's inputs (the `dequantize_affine_recovers_hand_example` row).
+        let packed1 = [0x21u8, 0x43, 0x65, 0x87];
+        let scales1 = [0x00u8, 0x40, 0x00, 0x38]; // f16 [2.0, 0.5]
+        let biases1 = [0x00u8, 0x49, 0x00, 0xBC]; // f16 [10.0, -1.0]
+        let one = dequantize_affine(&packed1, &scales1, &biases1, 1, 1, 4, 4).unwrap();
+
+        // Stack two identical experts.
+        let packed: Vec<u8> = packed1.iter().chain(&packed1).copied().collect();
+        let scales: Vec<u8> = scales1.iter().chain(&scales1).copied().collect();
+        let biases: Vec<u8> = biases1.iter().chain(&biases1).copied().collect();
+        let stacked = dequantize_affine_stacked(&packed, &scales, &biases, 2, 1, 1, 4, 4).unwrap();
+
+        let mut expected = one.clone();
+        expected.extend_from_slice(&one);
+        assert_eq!(stacked, expected);
+        assert_eq!(stacked.len(), 2 * 8, "two experts x eight recovered values");
+    }
+
+    /// A stacked buffer whose size disagrees with `[experts, out, in_packed]` is
+    /// rejected, so a mis-shaped expert bank fails loudly rather than mis-loading.
+    #[test]
+    fn dequantize_affine_stacked_rejects_size_mismatch() {
+        let packed = [0u8; 4]; // one expert's worth, but experts = 2 declared
+        let sb = [0u8; 4];
+        assert!(dequantize_affine_stacked(&packed, &sb, &sb, 2, 1, 1, 4, 4).is_err());
     }
 }
