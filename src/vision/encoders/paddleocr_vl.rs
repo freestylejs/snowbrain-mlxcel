@@ -28,7 +28,7 @@
 //! (`vision::connectors::paddleocr_vl`), matching the reference module split.
 //!
 //! Used by: PaddleOCR-VL
-//! Reference: mlx-vlm `paddleocr_vl/vision.py`.
+//! Reference: https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/paddleocr_vl/vision.py.
 
 use super::VisionEncoderOutput;
 use super::qwen2_vl::{apply_rotary_pos_emb_vision, concat_many};
@@ -36,6 +36,7 @@ use mlxcel_core::layers::{LayerNorm, UnifiedLinear};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 
 /// PaddleOCR-VL vision encoder configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -185,9 +186,10 @@ impl PositionEmbedding {
 
     /// Bilinearly interpolate the `sqrt(N) x sqrt(N)` learned grid to `[h*w, embed]`.
     ///
-    /// Mirrors mlx-vlm `interpolate_pos_encoding` / `bilinear_interpolate`
-    /// (align_corners=False). Integer indices and weights are derived on the
-    /// host and gathered with `take`, so no device floor/clip is needed.
+    /// Mirrors https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/paddleocr_vl/vision.py
+    /// (`interpolate_pos_encoding`) and the shared `bilinear_interpolate`
+    /// helper (align_corners=False). Integer indices and weights are derived on
+    /// the host and gathered with `take`, so no device floor/clip is needed.
     fn interpolate(&self, h: i32, w: i32) -> UniquePtr<MlxArray> {
         let side = (self.num_positions as f64).sqrt().round() as i32;
         let h_in = side;
@@ -304,6 +306,14 @@ impl VisionRotaryEmbedding {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttentionDispatch {
+    Single,
+    Uniform { segment_len: i32 },
+    Bucketed,
+    Sequential,
+}
+
 // Fused-QKV attention over packed variable-length sequences.
 struct Attention {
     qkv: UnifiedLinear,
@@ -337,6 +347,168 @@ impl Attention {
             head_dim,
             scale: (head_dim as f32).powf(-0.5),
         })
+    }
+
+    fn dispatch_for(cu_seqlens: &[i32]) -> AttentionDispatch {
+        let num_segments = cu_seqlens.len().saturating_sub(1);
+        if num_segments <= 1 {
+            return AttentionDispatch::Single;
+        }
+
+        let mut counts = BTreeMap::<i32, usize>::new();
+        let mut first_len = None;
+        let mut uniform = true;
+        for window in cu_seqlens.windows(2) {
+            let len = window[1] - window[0];
+            if first_len.is_none() {
+                first_len = Some(len);
+            } else if Some(len) != first_len {
+                uniform = false;
+            }
+            *counts.entry(len).or_insert(0) += 1;
+        }
+
+        if uniform {
+            AttentionDispatch::Uniform {
+                segment_len: first_len.unwrap_or(0),
+            }
+        } else if counts.len() < num_segments {
+            AttentionDispatch::Bucketed
+        } else {
+            AttentionDispatch::Sequential
+        }
+    }
+
+    fn attend(&self, q: &MlxArray, k: &MlxArray, v: &MlxArray) -> UniquePtr<MlxArray> {
+        unsafe {
+            mlxcel_core::layers::attention_from_ptr(q, k, v, self.scale, std::ptr::null(), 0.0, 0)
+        }
+    }
+
+    fn slice_attn_segment(&self, x: &MlxArray, start: i32, end: i32) -> UniquePtr<MlxArray> {
+        mlxcel_core::slice(
+            x,
+            &[0, 0, start, 0],
+            &[1, self.num_heads, end, self.head_dim],
+        )
+    }
+
+    fn attend_sequential(
+        &self,
+        q: &MlxArray,
+        k: &MlxArray,
+        v: &MlxArray,
+        cu_seqlens: &[i32],
+    ) -> UniquePtr<MlxArray> {
+        let num_segments = cu_seqlens.len() - 1;
+        let mut outs = Vec::with_capacity(num_segments);
+        for seg in 0..num_segments {
+            let start = cu_seqlens[seg];
+            let end = cu_seqlens[seg + 1];
+            let q_seg = self.slice_attn_segment(q, start, end);
+            let k_seg = self.slice_attn_segment(k, start, end);
+            let v_seg = self.slice_attn_segment(v, start, end);
+            outs.push(self.attend(&q_seg, &k_seg, &v_seg));
+        }
+
+        if outs.len() == 1 {
+            outs.into_iter().next().unwrap()
+        } else {
+            concat_many(&outs, 2)
+        }
+    }
+
+    fn attend_uniform(
+        &self,
+        q: &MlxArray,
+        k: &MlxArray,
+        v: &MlxArray,
+        seq_len: i32,
+        num_segments: i32,
+        segment_len: i32,
+    ) -> UniquePtr<MlxArray> {
+        let pack = |x: &MlxArray| {
+            let x = mlxcel_core::squeeze_axis(x, 0);
+            let x = mlxcel_core::reshape(
+                &x,
+                &[self.num_heads, num_segments, segment_len, self.head_dim],
+            );
+            mlxcel_core::transpose_axes(&x, &[1, 0, 2, 3])
+        };
+
+        let q_batched = pack(q);
+        let k_batched = pack(k);
+        let v_batched = pack(v);
+        let out = self.attend(&q_batched, &k_batched, &v_batched);
+
+        // [segments, heads, segment_len, head_dim] -> [1, heads, seq, head_dim].
+        let out = mlxcel_core::transpose_axes(&out, &[1, 0, 2, 3]);
+        let out = mlxcel_core::reshape(&out, &[self.num_heads, seq_len, self.head_dim]);
+        mlxcel_core::expand_dims(&out, 0)
+    }
+
+    fn stack_bucket_segments(
+        &self,
+        x: &MlxArray,
+        entries: &[(usize, i32, i32)],
+    ) -> UniquePtr<MlxArray> {
+        if entries.len() == 1 {
+            let (_, start, end) = entries[0];
+            return self.slice_attn_segment(x, start, end);
+        }
+
+        let parts: Vec<UniquePtr<MlxArray>> = entries
+            .iter()
+            .map(|&(_, start, end)| {
+                let segment = self.slice_attn_segment(x, start, end);
+                mlxcel_core::squeeze_axis(&segment, 0)
+            })
+            .collect();
+        mlxcel_core::stack_owned(&parts, 0)
+    }
+
+    fn attend_bucketed(
+        &self,
+        q: &MlxArray,
+        k: &MlxArray,
+        v: &MlxArray,
+        cu_seqlens: &[i32],
+    ) -> UniquePtr<MlxArray> {
+        let num_segments = cu_seqlens.len() - 1;
+        let mut buckets = BTreeMap::<i32, Vec<(usize, i32, i32)>>::new();
+        for seg in 0..num_segments {
+            let start = cu_seqlens[seg];
+            let end = cu_seqlens[seg + 1];
+            buckets
+                .entry(end - start)
+                .or_default()
+                .push((seg, start, end));
+        }
+
+        let mut per_segment: Vec<Option<UniquePtr<MlxArray>>> =
+            std::iter::repeat_with(|| None).take(num_segments).collect();
+
+        for (segment_len, entries) in buckets {
+            let q_batched = self.stack_bucket_segments(q, &entries);
+            let k_batched = self.stack_bucket_segments(k, &entries);
+            let v_batched = self.stack_bucket_segments(v, &entries);
+            let bucket_out = self.attend(&q_batched, &k_batched, &v_batched);
+
+            for (batch_idx, &(seg, _, _)) in entries.iter().enumerate() {
+                let batch_idx = batch_idx as i32;
+                per_segment[seg] = Some(mlxcel_core::slice(
+                    &bucket_out,
+                    &[batch_idx, 0, 0, 0],
+                    &[batch_idx + 1, self.num_heads, segment_len, self.head_dim],
+                ));
+            }
+        }
+
+        let ordered: Vec<UniquePtr<MlxArray>> = per_segment
+            .into_iter()
+            .map(|segment| segment.expect("attention bucket produced every segment"))
+            .collect();
+        concat_many(&ordered, 2)
     }
 
     fn forward(
@@ -378,44 +550,19 @@ impl Attention {
         let k = mlxcel_core::expand_dims(&mlxcel_core::transpose_axes(&k, &[1, 0, 2]), 0);
         let v = mlxcel_core::expand_dims(&mlxcel_core::transpose_axes(&v, &[1, 0, 2]), 0);
 
-        let num_segments = cu_seqlens.len() - 1;
-        let mut outs = Vec::with_capacity(num_segments);
-        for seg in 0..num_segments {
-            let start = cu_seqlens[seg];
-            let end = cu_seqlens[seg + 1];
-            let q_seg = mlxcel_core::slice(
+        let output = match Self::dispatch_for(cu_seqlens) {
+            AttentionDispatch::Single | AttentionDispatch::Sequential => {
+                self.attend_sequential(&q, &k, &v, cu_seqlens)
+            }
+            AttentionDispatch::Uniform { segment_len } => self.attend_uniform(
                 &q,
-                &[0, 0, start, 0],
-                &[1, self.num_heads, end, self.head_dim],
-            );
-            let k_seg = mlxcel_core::slice(
                 &k,
-                &[0, 0, start, 0],
-                &[1, self.num_heads, end, self.head_dim],
-            );
-            let v_seg = mlxcel_core::slice(
                 &v,
-                &[0, 0, start, 0],
-                &[1, self.num_heads, end, self.head_dim],
-            );
-            let attn = unsafe {
-                mlxcel_core::layers::attention_from_ptr(
-                    &q_seg,
-                    &k_seg,
-                    &v_seg,
-                    self.scale,
-                    std::ptr::null(),
-                    0.0,
-                    0,
-                )
-            };
-            outs.push(attn);
-        }
-
-        let output = if outs.len() == 1 {
-            outs.into_iter().next().unwrap()
-        } else {
-            concat_many(&outs, 2)
+                seq_len,
+                (cu_seqlens.len() - 1) as i32,
+                segment_len,
+            ),
+            AttentionDispatch::Bucketed => self.attend_bucketed(&q, &k, &v, cu_seqlens),
         };
 
         let output = mlxcel_core::squeeze_axis(&output, 0);
@@ -590,10 +737,15 @@ impl PaddleOcrVisionEncoder {
     ) -> VisionEncoderOutput {
         let mut h = self.patch_embed.forward(pixel_values);
 
-        // Add per-image interpolated learned position embeddings.
+        // Add per-image interpolated learned position embeddings. Cache repeated
+        // dynamic-resolution grids in multi-image OCR batches so identical page
+        // sizes reuse the same interpolation graph instead of rebuilding it.
+        let mut pos_cache = BTreeMap::<(i32, i32), UniquePtr<MlxArray>>::new();
         let mut pos_parts: Vec<UniquePtr<MlxArray>> = Vec::with_capacity(grid_thw.len());
         for &(t, gh, gw) in grid_thw {
-            let per = self.position_embedding.interpolate(gh, gw);
+            let per = pos_cache
+                .entry((gh, gw))
+                .or_insert_with(|| self.position_embedding.interpolate(gh, gw));
             for _ in 0..t {
                 pos_parts.push(mlxcel_core::copy(per.as_ref().unwrap()));
             }
@@ -622,5 +774,100 @@ impl PaddleOcrVisionEncoder {
 impl super::VisionEncoder for PaddleOcrVisionEncoder {
     fn forward(&self, _pixel_values: &MlxArray) -> VisionEncoderOutput {
         panic!("PaddleOCR-VL vision encoder requires grid_thw; use forward_with_grid() instead");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Attention, AttentionDispatch};
+    use mlxcel_core::layers::{Linear, UnifiedLinear};
+    use mlxcel_core::{MlxArray, UniquePtr};
+
+    fn dummy_linear() -> UnifiedLinear {
+        UnifiedLinear::Regular(Linear::new(
+            mlxcel_core::from_slice_f32(&[0.0], &[1, 1]),
+            None,
+        ))
+    }
+
+    fn tiny_attention() -> Attention {
+        Attention {
+            qkv: dummy_linear(),
+            out_proj: dummy_linear(),
+            num_heads: 2,
+            head_dim: 4,
+            scale: 0.5,
+        }
+    }
+
+    fn varied(shape: &[i32], offset: i32) -> UniquePtr<MlxArray> {
+        let n: i32 = shape.iter().product();
+        let data: Vec<f32> = (0..n)
+            .map(|i| ((((i + offset) % 19) as f32) - 9.0) * 0.025)
+            .collect();
+        mlxcel_core::from_slice_f32(&data, shape)
+    }
+
+    fn assert_allclose(actual: &MlxArray, expected: &MlxArray) {
+        let close = mlxcel_core::allclose(actual, expected, 1e-4, 1e-4);
+        assert!(
+            mlxcel_core::item_bool(&close),
+            "fast attention path diverged from sequential packed reference"
+        );
+    }
+
+    #[test]
+    fn attention_dispatch_uses_single_for_one_segment() {
+        assert_eq!(Attention::dispatch_for(&[0, 4]), AttentionDispatch::Single);
+    }
+
+    #[test]
+    fn attention_dispatch_batches_uniform_segments() {
+        assert_eq!(
+            Attention::dispatch_for(&[0, 4, 8, 12]),
+            AttentionDispatch::Uniform { segment_len: 4 }
+        );
+    }
+
+    #[test]
+    fn attention_dispatch_buckets_repeated_variable_segments() {
+        assert_eq!(
+            Attention::dispatch_for(&[0, 4, 10, 14]),
+            AttentionDispatch::Bucketed
+        );
+    }
+
+    #[test]
+    fn attention_dispatch_keeps_unique_variable_segments_sequential() {
+        assert_eq!(
+            Attention::dispatch_for(&[0, 4, 10, 18]),
+            AttentionDispatch::Sequential
+        );
+    }
+
+    #[test]
+    fn uniform_attention_fast_path_matches_sequential_segments() {
+        let attention = tiny_attention();
+        let q = varied(&[1, 2, 8, 4], 0);
+        let k = varied(&[1, 2, 8, 4], 7);
+        let v = varied(&[1, 2, 8, 4], 13);
+        let cu = [0, 4, 8];
+
+        let expected = attention.attend_sequential(&q, &k, &v, &cu);
+        let actual = attention.attend_uniform(&q, &k, &v, 8, 2, 4);
+        assert_allclose(&actual, &expected);
+    }
+
+    #[test]
+    fn bucketed_attention_fast_path_matches_sequential_segments() {
+        let attention = tiny_attention();
+        let q = varied(&[1, 2, 14, 4], 0);
+        let k = varied(&[1, 2, 14, 4], 5);
+        let v = varied(&[1, 2, 14, 4], 11);
+        let cu = [0, 4, 10, 14];
+
+        let expected = attention.attend_sequential(&q, &k, &v, &cu);
+        let actual = attention.attend_bucketed(&q, &k, &v, &cu);
+        assert_allclose(&actual, &expected);
     }
 }
