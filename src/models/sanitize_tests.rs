@@ -354,6 +354,28 @@ fn load_and_sanitize_weights_repacks_nvfp4_gemma4_checkpoint() {
             vec![out_dim as i32, 2i32],
             "Expected native NVFP4 scales shape [2, 2] for group_size=16"
         );
+        // The direct transcode (issue #693) preserves weight_scale_2 as a
+        // per-linear global-scale sidecar instead of folding it into the E4M3
+        // block scales. The scales should be raw E4M3 U8 bytes.
+        let expected_global_scale_key = "language_model.model.layers.0.mlp.gate_proj.global_scale";
+        assert!(
+            weights.contains_key(expected_global_scale_key),
+            "Direct NVFP4 transcode should emit a global_scale sidecar"
+        );
+        assert_eq!(
+            mlxcel_core::array_dtype(scales),
+            dtype::UINT8,
+            "Native NVFP4 block scales should be raw E4M3 U8 bytes"
+        );
+        let global_scale = weights.get(expected_global_scale_key).unwrap();
+        let global_f32 = mlxcel_core::astype(global_scale, dtype::FLOAT32);
+        mlxcel_core::eval(&global_f32);
+        let g = mlxcel_core::array_to_raw_bytes(&global_f32);
+        let g_val = f32::from_le_bytes([g[0], g[1], g[2], g[3]]);
+        assert!(
+            (g_val - 1.0f32).abs() < 1e-6,
+            "Expected weight_scale_2 sidecar 1.0, got {g_val}"
+        );
         unsafe { mlxcel_core::dequantize(w, scales, std::ptr::null(), 16, 4, "nvfp4") }
     } else {
         assert!(
@@ -388,6 +410,109 @@ fn load_and_sanitize_weights_repacks_nvfp4_gemma4_checkpoint() {
             "Expected value close to 1.0 after quantized repack, got {v}"
         );
     }
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Review follow-up for issue #697: `weight_scale_2` must be a single-element
+/// per-tensor scalar (ModelOpt's convention). `item_f32` reinterprets a
+/// tensor's raw buffer without checking cardinality, so a malformed
+/// multi-element tensor must be caught and the triplet skipped, the same
+/// way the other malformed-shape guards in `repack_nvfp4_weights_to_quantized`
+/// fall back instead of reading garbage or throwing across the FFI boundary.
+#[test]
+fn load_and_sanitize_weights_skips_nvfp4_triplet_with_non_scalar_weight_scale_2() {
+    let dir = temp_model_dir("gemma4_nvfp4_bad_scale2");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    std::fs::write(
+        dir.join("config.json"),
+        serde_json::to_vec(&json!({
+            "model_type": "gemma4",
+            "tie_word_embeddings": false,
+            "quantization": {
+                "group_size": 16,
+                "bits": 4,
+                "mode": "nvfp4"
+            },
+            "text_config": {
+                "model_type": "gemma4",
+                "quantization": {
+                    "group_size": 16,
+                    "bits": 4,
+                    "mode": "nvfp4"
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let out_dim: usize = 2;
+    let packed_dim: usize = 16;
+    let weight_data = vec![0x22u8; out_dim * packed_dim];
+
+    let f16_one: [u8; 2] = [0x00, 0x3C];
+    let num_groups = 2usize;
+    let mut scale_data = Vec::with_capacity(out_dim * num_groups * 2);
+    for _ in 0..(out_dim * num_groups) {
+        scale_data.extend_from_slice(&f16_one);
+    }
+
+    // Malformed weight_scale_2: 2 elements instead of the required scalar.
+    let scale2_data: Vec<u8> = vec![0x00, 0x00, 0x80, 0x3F, 0x00, 0x00, 0x80, 0x3F];
+
+    let prefix = "model.language_model.layers.0.mlp.gate_proj";
+    write_safetensors(
+        &dir.join("model.safetensors"),
+        &[
+            (
+                &format!("{prefix}.weight"),
+                OwnedTensor {
+                    dtype: SafeTensorDtype::U8,
+                    shape: vec![out_dim, packed_dim],
+                    data: weight_data,
+                },
+            ),
+            (
+                &format!("{prefix}.weight_scale"),
+                OwnedTensor {
+                    dtype: SafeTensorDtype::F16,
+                    shape: vec![out_dim, num_groups],
+                    data: scale_data,
+                },
+            ),
+            (
+                &format!("{prefix}.weight_scale_2"),
+                OwnedTensor {
+                    dtype: SafeTensorDtype::F32,
+                    shape: vec![2],
+                    data: scale2_data,
+                },
+            ),
+        ],
+    );
+
+    let weights = super::sanitize::load_and_sanitize_weights(&dir).unwrap();
+
+    // The malformed weight_scale_2 must be dropped, and the triplet must not
+    // be repacked into a quantized layout: it falls back exactly like the
+    // other malformed-shape guards in `repack_nvfp4_weights_to_quantized`.
+    let expected_scale2_key = "language_model.model.layers.0.mlp.gate_proj.weight_scale_2";
+    let expected_scales_key = "language_model.model.layers.0.mlp.gate_proj.scales";
+    let expected_global_scale_key = "language_model.model.layers.0.mlp.gate_proj.global_scale";
+    assert!(
+        !weights.contains_key(expected_scale2_key),
+        "orphaned weight_scale_2 must be removed even when malformed"
+    );
+    assert!(
+        !weights.contains_key(expected_scales_key),
+        "a non-scalar weight_scale_2 must prevent the quantized repack"
+    );
+    assert!(
+        !weights.contains_key(expected_global_scale_key),
+        "a non-scalar weight_scale_2 must not produce a global_scale sidecar"
+    );
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
