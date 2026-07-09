@@ -230,8 +230,15 @@ struct ServerArgs {
     )]
     predict: i32,
 
-    /// Number of parallel request slots that share --ctx-size
-    #[arg(long = "parallel", env = "LLAMA_ARG_N_PARALLEL", default_value_t = 1)]
+    /// Number of parallel request slots that share --ctx-size (default: 4)
+    ///
+    /// Sets the maximum concurrent decode batch for multi-client serving:
+    /// weights are read once per decode step regardless of batch size, so
+    /// batched decode raises aggregate throughput and keeps time-to-first-token
+    /// low under concurrent load. The scheduler clamps this to 1 for model
+    /// families that cannot batch (SSM / hybrid / mixed-cache). Use `--parallel
+    /// 1` (or `--no-batch`) to restore single-slot sequential serving.
+    #[arg(long = "parallel", env = "LLAMA_ARG_N_PARALLEL", default_value_t = 4)]
     parallel: usize,
 
     /// API key for authentication
@@ -383,12 +390,15 @@ struct ServerArgs {
     #[arg(long = "preemption-policy", default_value = "longest-first")]
     preemption_policy: String,
 
-    /// Maximum number of requests to batch together for prefill (default: 1)
+    /// Maximum number of requests to batch together for prefill (default: 4)
     ///
     /// When > 1, the scheduler collects up to this many pending requests and
     /// runs a single batched forward pass [batch_size, max_seq_len] for better
-    /// Neural Accelerator utilization. Recommended: 4-8 on M5 Pro/Max hardware.
-    #[arg(long = "max-batch-prefill", default_value_t = 1)]
+    /// Neural Accelerator utilization and lower time-to-first-token under
+    /// concurrent arrivals. Only engages for model families that opt into
+    /// batched prefill (`supports_batched_prefill()`); other families fall back
+    /// to sequential prefill automatically. Set to 1 to disable.
+    #[arg(long = "max-batch-prefill", default_value_t = 4)]
     max_batch_prefill: usize,
 
     /// Maximum KV cache size for plain (non-sliding) caches (0 = unbounded, the default).
@@ -414,16 +424,21 @@ struct ServerArgs {
     )]
     max_kv_size: usize,
 
-    /// Paged KV-cache pool block budget: `auto` or a byte count (default: unbounded).
+    /// Paged KV-cache pool block budget: `auto` (default), a byte count, or `none`.
     ///
     /// Bounds the unified paged KV cache (epic #116): `auto` derives the cap
-    /// from the memory estimate, a raw byte count sets it explicitly. Only
-    /// affects pool-backed (Fp16) models under `--decode-storage-backend paged`.
-    /// Also reads `MLXCEL_KV_CACHE_BUDGET`.
+    /// from the memory estimate, a raw byte count sets it explicitly, and
+    /// `none` / `0` leaves the pool unbounded. Only affects pool-backed (Fp16)
+    /// models under the paged decode backend (the `--parallel > 1` default);
+    /// dense-backend workers ignore it. Defaults to `auto` so the batched-decode
+    /// default cannot run concurrent full-context sequences into an OOM abort;
+    /// admission returns clean backpressure instead. Also reads
+    /// `MLXCEL_KV_CACHE_BUDGET`.
     #[arg(
         long = "kv-cache-budget",
         env = "MLXCEL_KV_CACHE_BUDGET",
-        value_name = "BYTES|auto",
+        value_name = "BYTES|auto|none",
+        default_value = "auto",
         value_parser = parse_kv_cache_budget
     )]
     kv_cache_budget: Option<mlxcel::memory_estimate::PagedBudgetDirective>,
@@ -1003,6 +1018,16 @@ struct ServerArgs {
     )]
     prompt_cache_enabled: bool,
 
+    /// Disable the prompt-prefix KV cache (shorthand for
+    /// `--prompt-cache-enabled=false`).
+    ///
+    /// The prompt cache is on by default; this flag is a clean opt-out that
+    /// overrides `--prompt-cache-enabled` and the `MLXCEL_PROMPT_CACHE_ENABLED`
+    /// / `LLAMA_ARG_CACHE_REUSE` env vars. When set, repeated shared prefixes
+    /// (for example a long system prompt) are re-prefilled every request.
+    #[arg(long = "no-prompt-cache")]
+    no_prompt_cache: bool,
+
     /// Maximum byte budget for the prompt-prefix KV cache (default: 2 GiB).
     ///
     /// Inserts that would push total cache size above this threshold after LRU
@@ -1334,7 +1359,9 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
         },
         chat_template_kwargs: args.chat_template_kwargs,
         // prompt-cache knobs already resolved via env-var fallbacks above.
-        prompt_cache_enabled: args.prompt_cache_enabled,
+        // `--no-prompt-cache` is the highest-precedence opt-out: it wins over
+        // both `--prompt-cache-enabled` and the env-var fallbacks.
+        prompt_cache_enabled: args.prompt_cache_enabled && !args.no_prompt_cache,
         prompt_cache_capacity_bytes: args.prompt_cache_capacity_bytes,
         prompt_cache_max_entries: args.prompt_cache_max_entries,
         prompt_cache_ttl_seconds: args.prompt_cache_ttl,
@@ -1434,6 +1461,106 @@ mod tests {
         let input = build_startup_input(args).expect("repo-id should resolve from override store");
 
         assert_eq!(input.model_path, expected);
+    }
+
+    #[test]
+    fn serving_throughput_defaults_are_on_out_of_the_box() {
+        // #628: shipped defaults enable multi-client batching machinery.
+        let args = parse_server_args(&["mlxcel-server", "-m", "models/foo"]);
+        assert_eq!(args.parallel, 4, "batched decode should default to 4 slots");
+        assert_eq!(
+            args.max_batch_prefill, 4,
+            "batched prefill should default to 4"
+        );
+        assert!(
+            args.prompt_cache_enabled,
+            "prompt cache should be on by default"
+        );
+        assert!(
+            !args.no_prompt_cache,
+            "no-prompt-cache opt-out defaults off"
+        );
+    }
+
+    #[test]
+    fn parallel_one_escape_hatch_still_parses() {
+        // #628: `--parallel 1` remains a full single-slot escape hatch.
+        let args = parse_server_args(&["mlxcel-server", "-m", "models/foo", "--parallel", "1"]);
+        assert_eq!(args.parallel, 1);
+    }
+
+    #[test]
+    fn no_prompt_cache_flag_disables_prompt_cache() {
+        // #628: `--no-prompt-cache` overrides the default-on prompt cache.
+        let tmp = tempfile::tempdir().unwrap();
+        let local_model = tmp.path().join("local-model");
+        fs::create_dir_all(&local_model).unwrap();
+        let local_model_arg = local_model.to_string_lossy().to_string();
+
+        let on = build_startup_input(parse_server_args(&[
+            "mlxcel-server",
+            "-m",
+            &local_model_arg,
+        ]))
+        .expect("default args should build");
+        assert!(on.prompt_cache_enabled, "prompt cache on by default");
+
+        let off = build_startup_input(parse_server_args(&[
+            "mlxcel-server",
+            "-m",
+            &local_model_arg,
+            "--no-prompt-cache",
+        ]))
+        .expect("--no-prompt-cache args should build");
+        assert!(
+            !off.prompt_cache_enabled,
+            "--no-prompt-cache must disable the prompt cache"
+        );
+    }
+
+    #[test]
+    fn kv_cache_budget_defaults_to_auto() {
+        // #628: the batched-decode default pairs with an `auto` paged KV budget
+        // guard so admission sheds load instead of OOMing.
+        use mlxcel::memory_estimate::PagedBudgetDirective;
+        let args = parse_server_args(&["mlxcel-server", "-m", "models/foo"]);
+        assert_eq!(args.kv_cache_budget, Some(PagedBudgetDirective::Auto));
+    }
+
+    #[test]
+    fn kv_cache_budget_explicit_disable_and_bytes_parse() {
+        // #628: escape hatches. `none` and `0` disable the guard (unbounded);
+        // an explicit byte count sets a hard cap.
+        use mlxcel::memory_estimate::PagedBudgetDirective;
+        let none = parse_server_args(&[
+            "mlxcel-server",
+            "-m",
+            "models/foo",
+            "--kv-cache-budget",
+            "none",
+        ]);
+        assert_eq!(none.kv_cache_budget, Some(PagedBudgetDirective::Disabled));
+
+        let zero = parse_server_args(&[
+            "mlxcel-server",
+            "-m",
+            "models/foo",
+            "--kv-cache-budget",
+            "0",
+        ]);
+        assert_eq!(zero.kv_cache_budget, Some(PagedBudgetDirective::Disabled));
+
+        let bytes = parse_server_args(&[
+            "mlxcel-server",
+            "-m",
+            "models/foo",
+            "--kv-cache-budget",
+            "8589934592",
+        ]);
+        assert_eq!(
+            bytes.kv_cache_budget,
+            Some(PagedBudgetDirective::Bytes(8_589_934_592))
+        );
     }
 
     #[test]

@@ -291,7 +291,8 @@ pub struct ServerConfig {
     /// [`crate::cli::speculative_args::default_block_size_for_kind`].
     pub draft_block_size: Option<u32>,
     /// Maximum number of sequences in the active decode batch.
-    /// Defaults to `n_parallel` (typically 1) for backwards compatibility.
+    /// Defaults to `n_parallel` (4 as of #628); the worker clamps it to 1 for
+    /// model families that cannot batch (`supports_batching() == false`).
     pub max_batch_size: usize,
     /// Maximum number of requests waiting in the prefill queue.
     pub max_queue_depth: usize,
@@ -510,7 +511,10 @@ impl Default for ServerConfig {
             timeout_seconds: 600,
             model_alias: None,
             context_size: 0,
-            n_parallel: 1,
+            // Serving-throughput default: admit up to 4 concurrent decode
+            // sequences so weight reads amortize across the batch (#628). The
+            // worker clamps this to 1 for non-batching model families.
+            n_parallel: 4,
             enable_slots_endpoint: true,
             enable_props_endpoint: false,
             enable_metrics_endpoint: false,
@@ -535,7 +539,9 @@ impl Default for ServerConfig {
             // `SpeculativeGenerator` path runs when no drafter is set.
             draft_kind: None,
             draft_block_size: None,
-            max_batch_size: 1,
+            // Serving-throughput default: batched decode up to 4 sequences
+            // (#628). Clamped to 1 by the worker for non-batching families.
+            max_batch_size: 4,
             max_queue_depth: 1024,
             audio_queue_depth: DEFAULT_AUDIO_QUEUE_DEPTH,
             audio_request_timeout_secs: DEFAULT_AUDIO_REQUEST_TIMEOUT_SECS,
@@ -543,7 +549,9 @@ impl Default for ServerConfig {
             enable_preemption: false,
             preemption_policy: PreemptionPolicy::default(),
             no_batch: false,
-            max_batch_prefill: 1,
+            // Serving-throughput default: batched prefill of up to 4 pending
+            // requests (#628). No-ops for families without batched prefill.
+            max_batch_prefill: 4,
             decode_storage_backend: DecodeStorageBackend::Auto,
             pipeline_parallel_runtime: None,
             remote_pipeline_stage: None,
@@ -556,7 +564,10 @@ impl Default for ServerConfig {
             kv_cache_mode: mlxcel_core::cache::KVCacheMode::Fp16,
             batch_kv_quant: mlxcel_core::cache::BatchKvQuantConfig::default(),
             max_kv_size: None,
-            kv_cache_budget: None,
+            // Serving-throughput default guard (#628): pair the batched-decode
+            // default with an `auto` paged KV budget so admission sheds load
+            // instead of OOMing. Disable with `--kv-cache-budget none`.
+            kv_cache_budget: Some(crate::memory_estimate::PagedBudgetDirective::Auto),
             enable_vlm_prefix_cache: false,
             cors_allowed_origins: None,
             serving_mode: crate::distributed::disaggregated::ServingMode::Hybrid,
