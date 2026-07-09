@@ -2236,6 +2236,7 @@ impl BatchScheduler {
         match req {
             ModelRequest::Generate {
                 prompt,
+                prompt_token_ids,
                 options,
                 images,
                 audio,
@@ -2245,6 +2246,7 @@ impl BatchScheduler {
             } => {
                 self.enqueue_request(
                     prompt,
+                    prompt_token_ids,
                     options,
                     images,
                     audio,
@@ -2264,6 +2266,7 @@ impl BatchScheduler {
     fn enqueue_request(
         &mut self,
         prompt: String,
+        prompt_token_ids: Option<Vec<i32>>,
         options: ServerGenerateOptions,
         images: Vec<Vec<u8>>,
         audio: Vec<Vec<u8>>,
@@ -2271,16 +2274,24 @@ impl BatchScheduler {
         response_tx: mpsc::Sender<GenerateEvent>,
         cancelled: Arc<AtomicBool>,
     ) {
-        let add_special = !prompt.starts_with("<bos>") && !prompt.starts_with("<s>");
-        let token_ids = match self.tokenizer.encode(&prompt, add_special) {
-            Ok(ids) => ids,
-            Err(err) => {
-                let _ =
-                    response_tx.send(GenerateEvent::Error(format!("Tokenization error: {err}")));
-                return;
-            }
+        // Prefer the ids tokenized on the request-dispatch thread (issue #633);
+        // fall back to scheduler-side tokenization when the dispatcher had no
+        // pre-tokenizer. `tokenize_prompt_for_generation` is the shared
+        // `add_special` convention so both paths are byte-identical.
+        let mut prompt_tokens: Vec<i32> = match prompt_token_ids {
+            Some(ids) => ids,
+            None => match crate::server::model_provider::tokenize_prompt_for_generation(
+                &self.tokenizer,
+                &prompt,
+            ) {
+                Ok(ids) => ids,
+                Err(err) => {
+                    let _ = response_tx
+                        .send(GenerateEvent::Error(format!("Tokenization error: {err}")));
+                    return;
+                }
+            },
         };
-        let mut prompt_tokens: Vec<i32> = token_ids.iter().map(|&x| x as i32).collect();
 
         // Empty-prompt guard (null/empty-cache safety):
         //
@@ -4033,7 +4044,13 @@ impl BatchScheduler {
             {
                 tracing::error!("State transition error: {err}");
             }
-            seq.decode_state.flush(&self.tokenizer);
+            // Forward any tail the incremental detokenizer held back (a final
+            // token carrying complete text plus a trailing incomplete UTF-8
+            // byte) as one last token event before Done, so streaming clients
+            // receive it (issue #633).
+            if let Some(tail) = seq.decode_state.flush(&self.tokenizer) {
+                let _ = seq.response_tx.send(GenerateEvent::Token(tail));
+            }
             let cached = seq.already_cached_tokens;
             let result = seq.decode_state.finish_with_cache(
                 seq.created_at,
@@ -4956,7 +4973,12 @@ impl BatchScheduler {
             if let Some(mut seq) = self.active_batch.remove(id) {
                 let tokens_generated = seq.generated_tokens.len();
 
-                seq.decode_state.flush(&self.tokenizer);
+                // Forward the incremental detokenizer's held tail as one final
+                // token event before Done, so streaming clients are not missing
+                // text the non-streaming result.text still carries (issue #633).
+                if let Some(tail) = seq.decode_state.flush(&self.tokenizer) {
+                    let _ = seq.response_tx.send(GenerateEvent::Token(tail));
+                }
                 let cached = seq.already_cached_tokens;
                 let result = seq.decode_state.finish_with_cache(
                     seq.created_at,
