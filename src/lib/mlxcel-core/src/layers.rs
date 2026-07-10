@@ -3275,14 +3275,18 @@ pub enum PagedDecodeDispatch {
     Gather,
 }
 
-/// Compute backend the pooled decode runs on. The fused kernel is a Metal JIT
-/// kernel and ADR 0001's regime table was measured on Apple Silicon Metal, so
-/// only [`PagedDecodeBackend::Metal`] is ever a native candidate.
+/// Compute backend the pooled decode runs on. The fused kernel has a Metal JIT
+/// body (ADR 0001, measured on Apple Silicon) and a CUDA JIT body (#634). Both
+/// are native candidates; the selector applies backend-specific thresholds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PagedDecodeBackend {
-    /// Apple Silicon Metal (the fused kernel's home).
+    /// Apple Silicon Metal (the fused kernel's original home).
     Metal,
-    /// Anything else (CUDA/CPU): no fused-kernel evidence, always gather.
+    /// NVIDIA CUDA (the ported fused kernel, #634). The kernel reads scattered
+    /// pool blocks with no gather pass, so its advantage grows with context;
+    /// the Metal-measured batch/context ceilings do not apply.
+    Cuda,
+    /// Anything else (CPU): no fused kernel, always gather.
     Other,
 }
 
@@ -3314,9 +3318,9 @@ const NATIVE_MAX_SLABS: usize = 1;
 /// Pure regime selector for the pooled paged-attention decode (issue #331).
 ///
 /// Library-only: this selector governs [`paged_decode_attention_pooled`], which
-/// #710 retired to a library-only API. It is not on the `mlxcel-server` decode
-/// path; it is kept for external mlxcel-core consumers and
-/// `examples/paged_attention_kernel_bench.rs`. See ADR 0001 (#710).
+/// #720 retired to a library-only API (ADR 0001, resolving issue #710). It is
+/// not on the `mlxcel-server` decode path; it is kept for external mlxcel-core
+/// consumers and `examples/paged_attention_kernel_bench.rs`. See ADR 0001.
 ///
 /// Returns [`PagedDecodeDispatch::Native`] only inside the island where ADR 0001
 /// Phase 6 measured the fused kernel winning: Apple Silicon Metal, batched
@@ -3335,10 +3339,23 @@ pub fn select_pooled_paged_dispatch(
     slab_count: usize,
     backend: PagedDecodeBackend,
 ) -> PagedDecodeDispatch {
-    let native = backend == PagedDecodeBackend::Metal
-        && slab_count <= NATIVE_MAX_SLABS
-        && batch_size >= NATIVE_MIN_BATCH
-        && visible_len <= NATIVE_MAX_VISIBLE_LEN;
+    let native = match backend {
+        // Apple Silicon Metal: only the ADR 0001 Phase 6 win island (batched,
+        // moderate context, single-slab).
+        PagedDecodeBackend::Metal => {
+            slab_count <= NATIVE_MAX_SLABS
+                && batch_size >= NATIVE_MIN_BATCH
+                && visible_len <= NATIVE_MAX_VISIBLE_LEN
+        }
+        // CUDA (#634): the fused kernel reads the scattered pool blocks in-place
+        // with no gather copy, so it is the default wherever it can serve the
+        // layer. The kernel reads one contiguous pool buffer per side, so it
+        // still declines multi-slab layers ([`NATIVE_MAX_SLABS`]); the
+        // Metal-measured batch and context ceilings do not apply because the
+        // CUDA win grows with context rather than eroding at long context.
+        PagedDecodeBackend::Cuda => slab_count <= NATIVE_MAX_SLABS,
+        PagedDecodeBackend::Other => false,
+    };
     if native {
         PagedDecodeDispatch::Native
     } else {
@@ -3422,18 +3439,21 @@ fn resolve_dispatch_decision(
 
 /// The backend the fused kernel would run on, cached for the decode hot path.
 ///
-/// The fused kernel is a Metal JIT kernel, so it is a candidate only when Metal
-/// is available at runtime ([`crate::metal_is_available`], the same gate the
-/// model dispatch paths use). This correctly falls to gather for a non-Metal
-/// build (CUDA/CPU), a macOS build without the `metal` feature, and a machine
-/// with no usable Metal device, none of which a compile-time `target_os` check
-/// would catch. Detection is process-static, so it is read once.
-fn paged_decode_backend() -> PagedDecodeBackend {
+/// The fused kernel has a Metal JIT body and a CUDA JIT body (#634), so it is a
+/// native candidate whenever either backend is available at runtime
+/// ([`crate::metal_is_available`] / [`crate::cuda_is_available`], the same gates
+/// the model dispatch and C++ kernel selection use). This correctly falls to
+/// gather only for a CPU-only build or a machine with no usable GPU, neither of
+/// which a compile-time `target_os` check would catch. Metal is probed first so
+/// the Apple path is unchanged. Detection is process-static, so it is read once.
+pub(crate) fn paged_decode_backend() -> PagedDecodeBackend {
     use std::sync::OnceLock;
     static BACKEND: OnceLock<PagedDecodeBackend> = OnceLock::new();
     *BACKEND.get_or_init(|| {
         if crate::metal_is_available() {
             PagedDecodeBackend::Metal
+        } else if crate::cuda_is_available() {
+            PagedDecodeBackend::Cuda
         } else {
             PagedDecodeBackend::Other
         }
@@ -3459,17 +3479,18 @@ struct PagedDispatchCache {
 }
 
 /// Sentinel value that never collides with a real packed cell: real cells pack
-/// three `u16`-bounded fields plus the backend bit into bits `0..=48` (see
-/// [`PagedDispatchCache::pack_key`]) and the decision into bit `49`, so bits
-/// `50..=63` stay zero and the all-ones sentinel is unambiguous.
+/// three `u16`-bounded fields plus a 2-bit backend tag into bits `0..=49` (see
+/// [`PagedDispatchCache::pack_key`]) and the decision into bit `50`, so bits
+/// `51..=63` stay zero and the all-ones sentinel is unambiguous.
 const PAGED_DISPATCH_CACHE_EMPTY: u64 = u64::MAX;
 
 impl PagedDispatchCache {
     /// Bit carrying the decision alongside the packed key: set means
     /// [`PagedDecodeDispatch::Native`], clear means [`PagedDecodeDispatch::Gather`].
-    /// The key uses bits `0..=48` ([`Self::pack_key`]), so bit `49` is free.
-    const DECISION_BIT: u64 = 1u64 << 49;
-    /// Mask covering the packed-key bits (`0..=48`), used to compare a cell's
+    /// The key uses bits `0..=49` ([`Self::pack_key`]: the backend tag now needs
+    /// two bits for the Metal/Cuda/Other trichotomy), so bit `50` is free.
+    const DECISION_BIT: u64 = 1u64 << 50;
+    /// Mask covering the packed-key bits (`0..=49`), used to compare a cell's
     /// key half against a freshly packed key while ignoring the decision bit.
     const KEY_MASK: u64 = Self::DECISION_BIT - 1;
 
@@ -3495,7 +3516,8 @@ impl PagedDispatchCache {
         let s = slab_count.min(u16::MAX as usize) as u64;
         let k = match backend {
             PagedDecodeBackend::Metal => 0u64,
-            PagedDecodeBackend::Other => 1u64,
+            PagedDecodeBackend::Cuda => 1u64,
+            PagedDecodeBackend::Other => 2u64,
         };
         b | (v << 16) | (s << 32) | (k << 48)
     }
@@ -3556,27 +3578,30 @@ fn resolve_pooled_paged_dispatch(
 /// Adaptive pooled paged decode attention (epic #116 Phase 6, #123; adaptive
 /// selector #331).
 ///
-/// **Library-only (not on the `mlxcel-server` decode path).** #710 retired this
-/// entry point to a library API. The in-server decode routes pool-backed layers
-/// through the per-sequence `update_and_fetch` pool intercept (gather + standard
-/// SDPA, `src/models/llama3.rs` `is_paged_backed()`), and production models call
+/// **Library-only (not on the `mlxcel-server` decode path).** #720 retired this
+/// entry point to a library API (ADR 0001, resolving issue #710). The in-server
+/// decode routes pool-backed layers through the per-sequence `update_and_fetch`
+/// pool intercept (gather + standard SDPA, `src/models/llama3.rs`
+/// `is_paged_backed()`), and production models call
 /// [`paged_decode_attention_dense_compat`] / [`paged_decode_attention_dense_fallback`],
 /// never this function. It is kept and tested for external mlxcel-core consumers
-/// and `examples/paged_attention_kernel_bench.rs`. ADR 0001 (#710) records the
+/// and `examples/paged_attention_kernel_bench.rs`. ADR 0001 records the
 /// occupancy derivation: the selector's single-slab batched island (`B>=4`, at
 /// most ~256 tokens per sequence at `block_size` 32) is unreachable under the
 /// shipped serving defaults and transient even when entered, so a scheduler
 /// wire-in is not worth its cross-family blast radius.
 ///
 /// The per-config `use_native_paged_kernel` flag marks the caller as *willing*
-/// to run the fused Metal kernel
+/// to run the fused kernel
 /// ([`crate::cache::PagedBlockPool::paged_decode_fused`], ADR 0001 strategy B).
-/// The actual dispatch is then decided by [`select_pooled_paged_dispatch`],
-/// which only picks the kernel inside the regime ADR 0001 Phase 6 measured it
-/// winning (Metal, `batch >= 4`, `visible_len <= 4096`, single-slab layer) and
-/// otherwise uses [`paged_decode_attention_pooled_fallback`], the
-/// gather-then-SDPA reference (strategy A). This keeps the long-context and
-/// `b=1` regimes on gather, where the ADR shows the kernel loses.
+/// The actual dispatch is then decided by [`select_pooled_paged_dispatch`]. On
+/// Metal it picks the kernel only inside the regime ADR 0001 Phase 6 measured it
+/// winning (`batch >= 4`, `visible_len <= 4096`, single-slab layer), keeping the
+/// long-context and `b=1` regimes on gather where the ADR shows Metal loses. On
+/// CUDA (#634) the ported kernel reads scattered pool blocks with no gather pass,
+/// so it is the default for any single-slab layer regardless of batch/context.
+/// Everything else uses [`paged_decode_attention_pooled_fallback`], the
+/// gather-then-SDPA reference (strategy A).
 ///
 /// `MLXCEL_PAGED_ATTENTION_NATIVE` overrides the selector both ways: the
 /// original force-on values (`1`/`true`/`on`/`yes`) still pin the kernel, and
@@ -5160,8 +5185,9 @@ mod tests {
     // single-slab, and loses at b=1, ctx 16384, or a multi-slab layer.
 
     use super::{
-        NativePagedOverride, PagedDecodeBackend, PagedDecodeDispatch, PagedDispatchCache,
-        parse_native_paged_override, resolve_dispatch_decision, select_pooled_paged_dispatch,
+        NativePagedOverride, PAGED_DISPATCH_CACHE_EMPTY, PagedDecodeBackend, PagedDecodeDispatch,
+        PagedDispatchCache, parse_native_paged_override, resolve_dispatch_decision,
+        select_pooled_paged_dispatch,
     };
 
     #[test]
@@ -5231,6 +5257,30 @@ mod tests {
                 select_pooled_paged_dispatch(b, 4096, 1, PagedDecodeBackend::Other),
                 PagedDecodeDispatch::Gather,
                 "b={b} on a non-Metal backend must stay on gather"
+            );
+        }
+    }
+
+    #[test]
+    fn selector_cuda_backend_native_on_single_slab_only() {
+        // CUDA (#634): the ported kernel is the default wherever it can serve
+        // the layer, independent of the Metal-measured batch/context ceilings.
+        // Single-slab -> native across batch and context, including the b=1 and
+        // long-context regimes Metal routes to gather.
+        for &(b, ctx) in &[(1usize, 128usize), (1, 65536), (4, 4096), (16, 131072)] {
+            assert_eq!(
+                select_pooled_paged_dispatch(b, ctx, 1, PagedDecodeBackend::Cuda),
+                PagedDecodeDispatch::Native,
+                "CUDA single-slab b={b} ctx={ctx} must select native"
+            );
+        }
+        // Multi-slab -> gather: the kernel reads one contiguous pool buffer per
+        // side and declines past NATIVE_MAX_SLABS regardless of batch/context.
+        for &slabs in &[2usize, 3, 8] {
+            assert_eq!(
+                select_pooled_paged_dispatch(1, 128, slabs, PagedDecodeBackend::Cuda),
+                PagedDecodeDispatch::Gather,
+                "CUDA multi-slab (slabs={slabs}) must decline to gather"
             );
         }
     }
@@ -5378,5 +5428,70 @@ mod tests {
             cache.select(1, 1 << 20, 9, PagedDecodeBackend::Metal),
             PagedDecodeDispatch::Gather
         );
+    }
+
+    #[test]
+    fn dispatch_cache_cuda_tag_does_not_alias_metal_or_other() {
+        // The backend tag widened to two bits (#634). A single-slab shape that
+        // differs only by backend must key three distinct cells: Metal at b=1
+        // gathers (needs b>=4), CUDA natives (single-slab default), Other
+        // gathers (no kernel). If the CUDA tag aliased Metal's or Other's cell,
+        // the second/third lookup would return the first's cached decision.
+        let cache = PagedDispatchCache::new();
+
+        // Prime CUDA (native), then query the same shape on Metal (gather) and
+        // Other (gather). No aliasing means each returns its own decision.
+        assert_eq!(
+            cache.select(1, 512, 1, PagedDecodeBackend::Cuda),
+            PagedDecodeDispatch::Native,
+            "CUDA single-slab b=1 must be native"
+        );
+        assert_eq!(
+            cache.select(1, 512, 1, PagedDecodeBackend::Metal),
+            PagedDecodeDispatch::Gather,
+            "Metal b=1 must be gather (not the aliased CUDA native)"
+        );
+        assert_eq!(
+            cache.select(1, 512, 1, PagedDecodeBackend::Other),
+            PagedDecodeDispatch::Gather,
+            "Other must be gather (no kernel)"
+        );
+        // Re-query CUDA: still native, proving the Metal/Other writes did not
+        // clobber the CUDA cell (each backend keeps its own last-key cell only
+        // for the most recent distinct key, so this also confirms recompute
+        // agrees with the pure selector rather than returning a stale hit).
+        assert_eq!(
+            cache.select(1, 512, 1, PagedDecodeBackend::Cuda),
+            PagedDecodeDispatch::Native,
+            "CUDA cell must recompute to native after Metal/Other queries"
+        );
+    }
+
+    #[test]
+    fn dispatch_cache_cuda_pack_key_roundtrips_without_collision() {
+        // The 2-bit backend tag (Metal=0, Cuda=1, Other=2) must produce three
+        // distinct packed keys for one identical shape, and each must stay clear
+        // of the decision bit and the empty sentinel.
+        let shape = (4usize, 4096usize, 1usize);
+        let k_metal =
+            PagedDispatchCache::pack_key(shape.0, shape.1, shape.2, PagedDecodeBackend::Metal);
+        let k_cuda =
+            PagedDispatchCache::pack_key(shape.0, shape.1, shape.2, PagedDecodeBackend::Cuda);
+        let k_other =
+            PagedDispatchCache::pack_key(shape.0, shape.1, shape.2, PagedDecodeBackend::Other);
+        assert_ne!(k_metal, k_cuda, "Metal and CUDA keys must differ");
+        assert_ne!(k_cuda, k_other, "CUDA and Other keys must differ");
+        assert_ne!(k_metal, k_other, "Metal and Other keys must differ");
+        for k in [k_metal, k_cuda, k_other] {
+            assert_eq!(
+                k & PagedDispatchCache::DECISION_BIT,
+                0,
+                "packed key must not touch the decision bit"
+            );
+            assert_ne!(
+                k, PAGED_DISPATCH_CACHE_EMPTY,
+                "packed key must never equal the empty sentinel"
+            );
+        }
     }
 }
