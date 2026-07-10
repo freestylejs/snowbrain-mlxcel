@@ -3,6 +3,14 @@
 
 #include "mlx_cxx_internal.h"
 
+#include "mlx/primitives.h"
+
+#include <cstdint>
+#include <map>
+#include <sstream>
+#include <unordered_set>
+#include <utility>
+
 namespace mlx_cxx {
 
 using namespace mlx::core;
@@ -4346,6 +4354,91 @@ void export_to_dot_pair(rust::Str path, const MlxArray& a, const MlxArray& b) {
     mlx::core::export_to_dot(os, arrs);
 }
 
+namespace {
+    inline const char* astype_dtype_short_name(int32_t d) {
+        switch (d) {
+            case 0: return "bool";
+            case 1: return "u8";
+            case 2: return "u16";
+            case 3: return "u32";
+            case 4: return "u64";
+            case 5: return "i8";
+            case 6: return "i16";
+            case 7: return "i32";
+            case 8: return "i64";
+            case 9: return "f16";
+            case 10: return "f32";
+            case 11: return "f64";
+            case 12: return "bf16";
+            case 13: return "c64";
+            default: return "?";
+        }
+    }
+
+    // Depth-first walk over the unevaluated graph rooted at `outputs`,
+    // deduplicated by array id(). Counts AsType primitive nodes, the total
+    // node count, and a per (src_dtype -> dst_dtype) AsType breakdown.
+    void collect_astype_stats(
+        const std::vector<array>& outputs,
+        uint64_t& astype_count,
+        uint64_t& total_nodes,
+        std::map<std::pair<int32_t, int32_t>, uint64_t>& breakdown) {
+        std::unordered_set<std::uintptr_t> visited;
+        std::vector<array> stack(outputs.begin(), outputs.end());
+        while (!stack.empty()) {
+            array a = stack.back();
+            stack.pop_back();
+            if (!visited.insert(a.id()).second) {
+                continue;
+            }
+            total_nodes++;
+            if (a.has_primitive()) {
+                if (std::strcmp(a.primitive().name(), "AsType") == 0) {
+                    astype_count++;
+                    int32_t dst = from_dtype(a.dtype());
+                    int32_t src = a.inputs().empty()
+                        ? -1
+                        : from_dtype(a.inputs()[0].dtype());
+                    breakdown[std::make_pair(src, dst)]++;
+                }
+                for (const auto& in : a.inputs()) {
+                    stack.push_back(in);
+                }
+            }
+        }
+    }
+}  // namespace
+
+// Count AsType (dtype-conversion) nodes in the unevaluated graph that produces
+// the given pair of arrays. This is the "done" metric for the single-dtype
+// decode graph work (issue #636): a decode step traced with a consistent dtype
+// produces zero (or near-zero) AsType nodes. Traversal only; no eval.
+uint64_t count_astype_nodes_pair(const MlxArray& a, const MlxArray& b) {
+    std::vector<array> outs = {a.inner, b.inner};
+    uint64_t astype_count = 0;
+    uint64_t total_nodes = 0;
+    std::map<std::pair<int32_t, int32_t>, uint64_t> breakdown;
+    collect_astype_stats(outs, astype_count, total_nodes, breakdown);
+    return astype_count;
+}
+
+// Human-readable AsType breakdown for the same graph: a header line with the
+// AsType and total node counts, followed by one line per src->dst dtype pair.
+rust::String astype_breakdown_pair(const MlxArray& a, const MlxArray& b) {
+    std::vector<array> outs = {a.inner, b.inner};
+    uint64_t astype_count = 0;
+    uint64_t total_nodes = 0;
+    std::map<std::pair<int32_t, int32_t>, uint64_t> breakdown;
+    collect_astype_stats(outs, astype_count, total_nodes, breakdown);
+    std::ostringstream os;
+    os << "astype_nodes=" << astype_count << " total_nodes=" << total_nodes;
+    for (const auto& kv : breakdown) {
+        os << "\n  " << astype_dtype_short_name(kv.first.first) << "->"
+           << astype_dtype_short_name(kv.first.second) << " : " << kv.second;
+    }
+    return rust::String(os.str());
+}
+
 // Set default stream for subsequent operations
 void set_default_stream(const MlxStream& stream) {
     mlx::core::set_default_stream(stream.inner);
@@ -4361,16 +4454,26 @@ bool is_gpu_available() {
 // which causes "CumSum cannot infer output shapes" when used inside
 // mlx::core::compile with shapeless=true.
 namespace {
-    array top_p_filter(const array& x, float top_p) {
+    // `single_dtype_scalars` is true on non-Metal backends (issue #636): build
+    // the comparison/fill scalars in the working dtype so the CUDA bf16
+    // promotion patch inserts no per-step AsType on the scalar. On Metal it is
+    // false, keeping the bare `array(f32)` scalars exactly as before so the
+    // unpatched f16+f32 rule upcasts the chain to an f32 softmax unchanged.
+    array top_p_filter(const array& x, float top_p, bool single_dtype_scalars) {
         auto probs = mlx::core::softmax(x, -1);
         auto sorted_indices = mlx::core::argsort(mlx::core::negative(probs), -1);
         auto sorted_probs = mlx::core::take_along_axis(probs, sorted_indices, -1);
         auto cum_probs = mlx::core::cumsum(sorted_probs, -1, false, true);
         auto shifted_cum = cum_probs - sorted_probs;
-        auto mask = mlx::core::less_equal(shifted_cum, mlx::core::array(top_p));
+        auto top_p_scalar = single_dtype_scalars
+            ? mlx::core::array(top_p, shifted_cum.dtype())
+            : mlx::core::array(top_p);
+        auto fill_scalar = single_dtype_scalars
+            ? mlx::core::array(std::numeric_limits<float>::lowest(), x.dtype())
+            : mlx::core::array(std::numeric_limits<float>::lowest());
+        auto mask = mlx::core::less_equal(shifted_cum, top_p_scalar);
         auto sorted_logits = mlx::core::take_along_axis(x, sorted_indices, -1);
-        auto filtered_sorted = mlx::core::where(
-            mask, sorted_logits, mlx::core::array(std::numeric_limits<float>::lowest()));
+        auto filtered_sorted = mlx::core::where(mask, sorted_logits, fill_scalar);
         auto unsort_indices = mlx::core::argsort(sorted_indices, -1);
         return mlx::core::take_along_axis(filtered_sorted, unsort_indices, -1);
     }
@@ -4380,15 +4483,23 @@ namespace {
 namespace {
     static std::function<std::vector<array>(const std::vector<array>&)>
     get_compiled_min_p_filter() {
-        auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
+        // Backend is process-constant, so capture the gate once at build time.
+        // Non-Metal fills the sentinel in x's dtype so no per-step AsType is
+        // inserted on the scalar under the CUDA bf16 promotion patch (issue
+        // #636); Metal keeps the bare f32 sentinel exactly as before.
+        const bool single_dtype_scalars = !mlx::core::metal::is_available();
+        auto fn = [single_dtype_scalars](
+                      const std::vector<array>& inputs) -> std::vector<array> {
             const auto& x = inputs[0];
             const auto& min_p_arr = inputs[1];
             auto probs = mlx::core::softmax(x, -1);
             auto max_prob = mlx::core::max(probs, -1, true);
             auto threshold = mlx::core::multiply(max_prob, min_p_arr);
             auto mask = mlx::core::greater_equal(probs, threshold);
-            return {mlx::core::where(mask, x,
-                mlx::core::array(std::numeric_limits<float>::lowest()))};
+            auto fill_scalar = single_dtype_scalars
+                ? mlx::core::array(std::numeric_limits<float>::lowest(), x.dtype())
+                : mlx::core::array(std::numeric_limits<float>::lowest());
+            return {mlx::core::where(mask, x, fill_scalar)};
         };
         return mlx::core::compile(fn, true);
     }
@@ -4417,9 +4528,28 @@ std::unique_ptr<MlxArray> fused_sample(
         return std::make_unique<MlxArray>(mlx::core::argmax(x, -1, false));
     }
 
+    // Build sampler scalars in the logit dtype on non-Metal backends only
+    // (issue #636). On CUDA the bf16 promotion patch keeps bf16 op boundaries
+    // in bf16, but a bare `array(f32)` scalar against a bf16/f16 logit tensor
+    // still forces an AsType conversion on the scalar every decode step;
+    // constructing each scalar in `x.dtype()` keeps the fused sampler chain
+    // single-dtype (bit-identical for bf16 logits since the old path cast the
+    // f32 scalar to bf16 anyway). Metal is left exactly as before: dtype.cpp
+    // deliberately leaves f16+f32 -> f32 unpatched there, so a bare f32 scalar
+    // upcasts the chain to an f32 softmax, and issue #636 requires Metal
+    // numerics untouched. `single_dtype_scalars` uses the same runtime
+    // `!metal::is_available()` selection as the fused-kernel ports in
+    // mlx_cxx_kernels.cpp (first use of that gate in this file).
+    const bool single_dtype_scalars = !mlx::core::metal::is_available();
+    const auto logit_dtype = x.dtype();
+    auto sampler_scalar = [&](float value) {
+        return single_dtype_scalars ? mlx::core::array(value, logit_dtype)
+                                     : mlx::core::array(value);
+    };
+
     // Temperature scaling
     if (temperature > 0.0f && temperature != 1.0f) {
-        x = x / mlx::core::array(temperature);
+        x = x / sampler_scalar(temperature);
     }
 
     // Top-k filtering: keep only the k highest-probability tokens
@@ -4438,18 +4568,19 @@ std::unique_ptr<MlxArray> fused_sample(
         auto kth_idx = mlx::core::slice(indices, start, stop);
         auto threshold = mlx::core::take_along_axis(x, kth_idx, -1);
         auto mask = mlx::core::greater_equal(x, threshold);
-        x = mlx::core::where(mask, x, mlx::core::array(std::numeric_limits<float>::lowest()));
+        x = mlx::core::where(
+            mask, x, sampler_scalar(std::numeric_limits<float>::lowest()));
     }
 
     // Top-p (nucleus) filtering
     if (top_p > 0.0f && top_p < 1.0f) {
-        x = top_p_filter(x, top_p);
+        x = top_p_filter(x, top_p, single_dtype_scalars);
     }
 
     // Min-p filtering — compiled kernel
     if (min_p > 0.0f && min_p < 1.0f) {
         static auto compiled_fn = get_compiled_min_p_filter();
-        auto result = compiled_fn({x, mlx::core::array(min_p)});
+        auto result = compiled_fn({x, sampler_scalar(min_p)});
         x = std::move(result[0]);
     }
 

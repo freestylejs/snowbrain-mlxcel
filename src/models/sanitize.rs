@@ -1670,7 +1670,17 @@ pub fn load_text_weights<P: AsRef<std::path::Path>>(
     // attributed to bf16 scales (Apertus-2509) was actually a separate xIELU
     // read_scalar bf16 bug, fixed in the apertus loader; Apertus, Seed-OSS, and
     // every other bf16-scale quant decode correctly with no scale promotion.
-    if should_convert_bf16_to_f16() && !is_bitnet && !is_quantized {
+    //
+    // On CUDA the base policy keeps bf16 (native bf16 ALUs, and the merged
+    // patches-cuda/dtype.cpp promotion patch already yields a 0-AsType,
+    // single-dtype bf16 decode graph). Issue #636 adds an opt-in load-time
+    // bf16 -> f16 normalization for the fixed-topology / CUDA-graph-reuse
+    // experiment, gated by MLXCEL_CUDA_F16_NORMALIZE and skipped for
+    // f16-fragile families (see `cuda_f16_normalize_for_config`). The default
+    // stays bf16 so bf16 models remain available unchanged.
+    let convert_bf16 =
+        should_convert_bf16_to_f16() || cuda_f16_normalize_for_config(parsed_config.as_ref());
+    if convert_bf16 && !is_bitnet && !is_quantized {
         let had_bf16 = if keep_gemma3n_mlp_bf16 {
             convert_bf16_weights_with_keep(&mut weights, gemma3n_language_mlp_bf16_key)
         } else {
@@ -1682,6 +1692,86 @@ pub fn load_text_weights<P: AsRef<std::path::Path>>(
     }
 
     Ok(weights)
+}
+
+/// True when opt-in CUDA load-time bf16 -> f16 normalization applies to this
+/// model (issue #636).
+///
+/// CUDA-only and default-off. Metal / Apple Silicon is driven by
+/// [`should_convert_bf16_to_f16`] and is unaffected. Returns true only when:
+/// - the MLX CUDA backend is active at runtime, and
+/// - `MLXCEL_CUDA_F16_NORMALIZE` is set to a truthy value (opt-in; unset or a
+///   falsy value keeps bf16 so bf16 models remain available), and
+/// - the model is not on the conservative f16-fragile exception list.
+fn cuda_f16_normalize_for_config(config: Option<&Value>) -> bool {
+    if !mlxcel_core::cuda_is_available() {
+        return false;
+    }
+    if !env_flag_enabled("MLXCEL_CUDA_F16_NORMALIZE") {
+        return false;
+    }
+    !config.is_some_and(is_f16_fragile_family)
+}
+
+/// Parse a boolean-ish environment flag. Unset, empty, `0`, `false`, `off`, and
+/// `no` (any case) are false; anything else is true.
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name).ok().is_some_and(|raw| {
+        let v = raw.trim();
+        !(v.is_empty()
+            || v == "0"
+            || v.eq_ignore_ascii_case("false")
+            || v.eq_ignore_ascii_case("off")
+            || v.eq_ignore_ascii_case("no"))
+    })
+}
+
+/// Conservative f16-fragile family check for CUDA f16 normalization.
+///
+/// f16's narrow dynamic range (max ~65504) clips wide-range activations and
+/// softcapped logits, so these families keep bf16 even when normalization is
+/// requested. Detection is heuristic (softcap/logit-scale config keys plus a
+/// known-family substring list): families it does not recognize are treated
+/// as healthy and normalized, which is why the whole path stays opt-in and
+/// default-off. Extend the list when a new fragile family surfaces.
+fn is_f16_fragile_family(config: &Value) -> bool {
+    // Softcap / logit-scaling config keys imply wide dynamic range. Checked
+    // at the top level and under `text_config`, mirroring the `model_type`
+    // fallback below, so nested multimodal configs are not a blind spot.
+    for key in [
+        "attn_logit_softcapping",
+        "final_logit_softcapping",
+        "logit_softcapping",
+        "logits_soft_cap",
+        "logit_scale",
+    ] {
+        let capped = |c: &Value| {
+            c.get(key)
+                .and_then(Value::as_f64)
+                .is_some_and(|v| v != 0.0 && v != 1.0)
+        };
+        if capped(config) || config.get("text_config").is_some_and(capped) {
+            return true;
+        }
+    }
+    let model_type = config
+        .get("model_type")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            config
+                .get("text_config")
+                .and_then(|c| c.get("model_type"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("");
+    // Gemma (norms + softcap), Cohere/Command-R (logit scale), Apertus (xIELU
+    // x^2), and gpt-oss (wide dynamic range) are the known-fragile families.
+    const FRAGILE_SUBSTRINGS: &[&str] = &[
+        "gemma", "cohere", "command", "apertus", "gpt_oss", "gpt-oss",
+    ];
+    FRAGILE_SUBSTRINGS
+        .iter()
+        .any(|needle| model_type.contains(needle))
 }
 
 /// Returns true when bf16 tensors should be cast to f16 at load time.
@@ -2576,6 +2666,53 @@ mod tests {
             weights.contains_key("model.layers.1.self_attn.k_proj.weight"),
             "Non-shared layer must not be stripped"
         );
+    }
+
+    /// Issue #636 / security-review follow-up (c1d1c33): the f16-fragile guard
+    /// must catch known-fragile `model_type`s, a top-level softcap/logit_scale
+    /// key, and the same softcap key nested under `text_config` (the
+    /// multimodal-checkpoint blind spot the review flagged), while leaving a
+    /// plain healthy family unaffected.
+    #[test]
+    fn is_f16_fragile_family_covers_model_type_and_softcap_cases() {
+        let cases: &[(Value, bool, &str)] = &[
+            (
+                serde_json::json!({ "model_type": "gemma2" }),
+                true,
+                "gemma model_type is on the known-fragile substring list",
+            ),
+            (
+                serde_json::json!({
+                    "model_type": "llama",
+                    "final_logit_softcapping": 30.0
+                }),
+                true,
+                "top-level softcap key implies wide dynamic range",
+            ),
+            (
+                serde_json::json!({
+                    "model_type": "llama",
+                    "text_config": {
+                        "final_logit_softcapping": 30.0
+                    }
+                }),
+                true,
+                "softcap nested under text_config must not slip past the guard",
+            ),
+            (
+                serde_json::json!({ "model_type": "llama" }),
+                false,
+                "plain llama with no softcap/logit_scale is not fragile",
+            ),
+        ];
+
+        for (config, expected, label) in cases {
+            assert_eq!(
+                is_f16_fragile_family(config),
+                *expected,
+                "{label}: {config:?}"
+            );
+        }
     }
 
     #[test]
