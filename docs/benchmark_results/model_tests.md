@@ -71,7 +71,7 @@ The table below summarizes the current cross-hardware decode readings for select
 | Gemma-3-1B | 1B | 227.38 | 395.02 | 278.52 |
 | EXAONE-3.5-2.4B | 2.4B | 199.11 | 287.66 | 141.83 |
 | SmolLM3-3B | 3B | 131.45 | 234.21 | 104.24 |
-| Nemotron-H-30B | 30B | 91.75 | 176.95 | 79.94¶ |
+| Nemotron-H-30B | 30B | 91.75 | 176.95 | 87.41¶ |
 | Qwen3-MoE-30B | 30B | 83.42 | 175.48 | 89.06† |
 | Llama-3.1-8B | 8B | 106.63 | 117.46 | 50.53 |
 | Qwen2.5-7B | 7B | 108.47 | 126.20 | 54.56 |
@@ -82,11 +82,11 @@ The table below summarizes the current cross-hardware decode readings for select
 *Qwen3-0.6B on GB10 again stopped at 9 tokens before EOS (2026-07-12); the 283.90 tok/s figure is from that short window and is not directly comparable to full-length runs.
 †Qwen3-MoE-30B (`qwen3-moe-4bit`) **failed** on GB10 at 0.3.0 (Metal-only fused-MoE kernel aborted on CUDA); the CUDA fused decode-MoE kernel (#319) restored it at 0.3.1, and at 89.06 tok/s it stays ahead of M1 Ultra (83.75).
 §GPT-OSS-120B and Solar-Open-100B were excluded from the 2026-07-12 GB10 sweep by the memory gate (weights > ~51 GiB, `SKIP:oom_estimate`); their figures are carried from the 2026-06-17 / 0.3.1 sweep.
-¶Nemotron-H-30B doubled vs both earlier GB10 records (40.32 on 2026-06-17) with no SSM-related code change in between; the whole SSM/hybrid cluster reads 2-3x higher on 2026-07-12 and should be re-verified after a fresh boot (see the GB10 file's notable-changes list).
+¶Nemotron-H-30B doubled vs the 2026-06-17 record (40.32) because the fused single-token SSM decode kernel was ported to CUDA on 2026-07-10 (#727); the post-reboot re-verification (#755) confirmed the gain on a fresh host (87.41, post-reboot single). The whole SSM/hybrid cluster carries the same attribution (see the GB10 file's notable-changes list).
 
 M1 Ultra column is from 2026-07-12 with mlxcel 0.4.0-rc.1 / MLX pin `57c66cac` / `--cooldown 30 --big-cooldown 30`, using the `mlxcel-bench-decode` same-process harness.
 M5 Max column is from the 2026-07-11/12 full re-sweep with mlxcel 0.4.0-rc.1 / MLX pin `57c66cac` / `--cooldown 30 --big-cooldown 30`, same-process `mlxcel-bench-decode` harness.
-GB10 column is from 2026-07-12 with mlxcel 0.4.0-rc.1 / MLX pin `57c66cac` (0.32.1) / CUDA 13.0 (SM 12.1) / `--cooldown 15 --big-cooldown 45`, using the `mlxcel-bench-decode` same-process warm harness, except the two `§`-marked memory-gated rows carried from 2026-06-17 / 0.3.1.
+GB10 column is from 2026-07-12 with mlxcel 0.4.0-rc.1 / MLX pin `57c66cac` (0.32.1) / CUDA 13.0 (SM 12.1) / `--cooldown 15 --big-cooldown 45`, using the `mlxcel-bench-decode` same-process warm harness, except the two `§`-marked memory-gated rows carried from 2026-06-17 / 0.3.1 and the `¶`-marked Nemotron-H row, which is the post-reboot single from the same day (#755, `--cooldown 30`).
 All three columns now share mlxcel 0.4.0-rc.1 and the MLX pin `57c66cac`, so the Apple Silicon gap reflects hardware delta. M5 Max stays roughly 1.73x faster than M1 Ultra on the selected 16 rows (avg ~1.73x, median ~1.77x). The largest MoE rows show the M5 Max advantage: qwen3-moe-30b runs at 175.48 vs 83.42 tok/s (2.10x), gpt-oss-120b at 113.90 vs 59.29 (1.92x), and solar-open-100b at 65.40 vs 35.02 (1.87x). On GB10 the CUDA fused decode-MoE kernel (#319) keeps qwen3-moe-30b (89.06) just ahead of M1 Ultra (83.42).
 For Qwen2.5-0.5B the 4-bit row is the directly comparable cross-hardware figure; the bf16 variant runs at 295.65 tok/s on M1 Ultra and 401.49 tok/s on M5 Max.
 
