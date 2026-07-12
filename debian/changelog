@@ -1,3 +1,43 @@
+mlxcel (0.4.0-1~jammy1) jammy; urgency=medium
+
+  * Added: experimental OpenXLA / IREE compiler backend, opt-in and default-off
+    behind the xla-backend / xla-iree features, with a Rust-native StableHLO
+    emitter, IREE execution on Metal and CUDA, dense/MoE architecture packs, and
+    a continuous-batching serving path (#449 and follow-ups).
+  * Added: ComputeBackend seam abstracting the forward-execution engine (#338).
+  * Added: vision-language families Qwen3-Omni thinker + talker speech output
+    (#664, #677), Llama 3.2 Vision cross-attention (#596), GLM-4V and GLM-4V MoE
+    (#594, #598), Hunyuan-VL (#663), ERNIE-4.5 MoE VL (#662), DeepSeek-VL2
+    (#660), Kimi-VL / 2.5 (#597), FastVLM (#661), Moondream2 (#599), Idefics2
+    (#639), SmolVLM (#593), LFM2-VL (#645), Granite Vision and Granite 4 Vision
+    (#647, #649).
+  * Added: OCR families DeepSeek-OCR and DeepSeek-OCR 2 (#655, #656), dots.ocr
+    (#657), GLM-OCR (#646), and PaddleOCR-VL (#595).
+  * Added: LLaDA-2 MoE masked-diffusion LLM (#659), DeepSeek-V3.2 / GLM-MoE DSA
+    lightning indexer (#583), phi3-small blocksparse attention (#581), and
+    qwen3-next pipeline-parallel stages (#580).
+  * Changed: server and CLI enable batched decode (--parallel 4), batched
+    prefill (--max-batch-prefill 4), and the prompt-prefix cache by default,
+    with an auto KV-cache budget guard (#628).
+  * Performance: CUDA/GB10 kernel parity: native paged-attention decode (#731),
+    fused SSM decode (#727), MoE prefill sorted grouped GEMM (#726), Blackwell
+    sm_120/121 qmm tile (#723), single-dtype decode graph (#732), and multirow
+    qmv (#740).
+  * Performance: tick-cooperative speculative decoding (#745), pipelined
+    scheduler decode with lookahead async_eval (#729), and NVFP4 direct
+    transcode to native MLX (#697, #706).
+  * Performance: cap the batched-prefill transient memory by token budget
+    (#715).
+  * Fixed: interrupted downloads are detected and re-fetched at load instead of
+    failing with a bare "Weight not found" (#465).
+  * Fixed: GPT-OSS Harmony tool calls parsed into structured calls (#658), plus
+    real-checkpoint loading fixes across moondream2, kimi-vl, paddleocr-vl,
+    smolvlm, mllama, glm4-moe, and qwen3-next.
+  * Chore: bump MLX pin to 0.32.1 (#704); align member crates to Rust edition
+    2024 (#445).
+
+ -- Jeongkyu Shin <inureyes@gmail.com>  Sun, 12 Jul 2026 12:00:00 -0700
+
 mlxcel (0.3.3-1~jammy1) jammy; urgency=medium
 
   * Added: multi-node disaggregated prefill/decode routing with health

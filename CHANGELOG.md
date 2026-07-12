@@ -4,25 +4,83 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [v0.4.0] - 2026-07-12
 
 ### Added
+
+#### Backends
+
 - **ComputeBackend seam for the forward-execution engine.** A `ComputeBackend` abstraction at the model-load boundary lets a future non-MLX engine host `LanguageModel::forward` without routing through the MLX bridge. The existing MLX path moves behind `MlxBackend` as a behavior-preserving refactor (temp-0 output is byte-identical before and after). Under default features the selection folds to the single MLX backend at compile time with no runtime dispatch on the hot path; a default-off `experimental-backend` feature reserves the plug-in slot. No non-MLX kernels are implemented (#338).
+- **Experimental OpenXLA / IREE compiler backend (issue #449, opt-in, default off).** A second forward-execution engine built on a Rust-native StableHLO emitter and the IREE runtime, selectable with `MLXCEL_BACKEND=xla` behind the `xla-backend` / `xla-iree` build features. Apple Silicon and CUDA shipping binaries compile none of it. The track landed end to end:
+  - Bring-up: export-route and Rust-native StableHLO emitter spikes for Llama-3.2-1B (#453, #455, #457, #451), int4 dequant-in-graph spike (#454), GPU decode throughput on GB10 (#456), and the backend crate/seam scaffold (#458).
+  - Runtime: Rust→IREE FFI proven on aarch64 via the prebuilt dist and wired into `mlxcel-xla` and the CLI (#459, #460), executing on CUDA (GB10) via a source-built IREE runtime (#461) and on macOS with a Metal HAL device defaulted on Apple Silicon (#506, #508), with device-index-aware device/stream bindings (#505).
+  - Loading and precision: emit graphs from `config.json` at load (#480), load sharded and f16/f32 checkpoints (#484), dequantize MLX 4/8-bit checkpoints in the loader (#490), f16/bf16 precision modes for the emitter with a per-device default and an accuracy gate (#553, #557), int8/int4 packed weight quantization (#568), and f16-resident weights for a fusion-free bandwidth win (#577).
+  - Architecture packs: Qwen2 (plain RoPE + QKV bias) (#480 line), Gemma2 sliding-window local/global attention (#555), qk-norm and Gemma-family dense pack (#558), Seed-OSS/MiMo/InternLM3/ExaOne and parallel-block/norm-variant dense packs (#560, #561), the MoE FFN graph primitive (router + top-k dispatch) with Qwen3-MoE and OLMoE (#559, #563).
+  - Serving: uniform-B batched decode graph (#462), ragged continuous-batching decode graph (#466), continuous-batching scheduler (#468) productized into a serving engine (#469) and served through the batching engine (#470), plus sampling (#471), history penalties (#479), stop strings (#478), untied LM heads (#482), and `/metrics` (#485). Gemma2 serves single-sequence and batched on this path (#491).
+  - Guards: fail fast on `MLXCEL_XLA_PRECISION=bf16` and `MLXCEL_XLA_QUANT=packed` for Metal targets (#615, #617).
+
+#### New model families
+
+- **Vision-language models.** Qwen3-Omni MoE thinker (Qwen3-VL-MoE + audio tower) and talker + code2wav speech output (#664, #677), Llama 3.2 Vision (`mllama`) cross-attention VLM (#596), GLM-4V (sectioned MRoPE) and GLM-4V MoE (half-split MRoPE) (#594, #598), Hunyuan-VL (ViT + perceive merger + XD-RoPE) (#663), ERNIE-4.5 MoE VL (DFNRope ViT + modality-split MoE + 3D MRoPE) (#662), DeepSeek-VL2 (#660), Kimi-VL / Kimi-VL 2.5 (MoonViT encoder) (#597), FastVLM (FastViTHD + Qwen2) (#661), Moondream2 (Moondream3 ViT + dense Phi) (#599), Idefics2 (SigLIP + perceiver resampler + Mistral) (#639), SmolVLM (SigLIP + pixel-shuffle + SmolLM2, also loads Idefics3) (#593, #606), LFM2-VL (packed-patch SigLIP2 + pixel-unshuffle + LFM2 hybrid) (#645), Granite Vision (SigLIP multi-tap + AnyRes) and Granite 4 Vision (window-QFormer + Granite-4 hybrid) (#647, #649).
+- **OCR models.** DeepSeek-OCR and DeepSeek-OCR 2 (SAM + Qwen2 query resampler), including the SAM + CLIP encoder hooks (#651, #655, #656), dots.ocr (`dots_vit` + Qwen2) (#657), GLM-OCR (ViT + GLM-4) (#646), PaddleOCR-VL (NaViT + ERNIE-4.5 MRoPE) (#595).
+- **Diffusion LLM.** LLaDA-2 MoE masked-diffusion LLM (`llada2_moe`) (#659).
+- **Text architectures and attention.** DeepSeek-V3.2 / GLM-MoE DSA lightning indexer (#583), phi3-small blocksparse attention (#581), qwen3-next pipeline-parallel stage support (#580).
+
+#### Server and CLI
+
+- MTP speculative burst reuses an adopted APC prompt-cache prefix (#591).
+- `enable_thinking` aliased to the bare `thinking` flag for `deepseek_v32` (#579).
+- The default output-token cap follows llama.cpp: `-1` resolves to the context window (#477).
+- Detect an incomplete download snapshot and re-fetch on load (#604), formalized below under Fixed.
 
 ### Changed
+
 - **Serving-throughput defaults enable the batching machinery out of the box.** `mlxcel-server` and `mlxcel serve` now default to `--parallel 4` (batched decode of up to 4 concurrent sequences, clamped to 1 for SSM / hybrid / mixed-cache families that cannot batch) and `--max-batch-prefill 4` (batched prefill for families that support it), and add `--no-prompt-cache` as a clean opt-out for the already-default-on prompt-prefix cache. The batched-decode default is paired with a default `--kv-cache-budget auto` memory guard so the #122 paged block-budget admission bounds KV for the concurrent batch and returns backpressure instead of an OOM abort; the guard is inert on the dense decode backend and can be disabled with `--kv-cache-budget none` (or `0`). On Apple M1 Ultra (`meta-llama-3.1-8b-instruct-4bit`), 4 concurrent clients get 1.90x the single-client aggregate throughput and ~17x lower time-to-first-token under load, with single-client throughput unchanged. `--parallel 1`, `--no-batch`, `--max-batch-prefill 1`, `--no-prompt-cache`, and `--kv-cache-budget none` restore the previous single-client behavior. Migration note: an explicit small `--ctx-size` is now divided across 4 slots, so a value that gives fewer than 512 tokens per slot fails startup with a clear error (raise `--ctx-size` or lower `--parallel`); `--ctx-size 0`, the default, uses the model window per slot and is unaffected. GB10 numbers (including the >= 2.5x-at-4-clients target) are pending a CUDA measurement session; see `docs/benchmark_results/serving-throughput-defaults-m1u-2026-07-09.md` (#628).
+- The CLI prefill path now defaults to chunked, and rotating-cache chunked prefill was unbroken in the same change (#679).
+- The CLI routes through an MLX inference-session seam, a behavior-preserving refactor that gives the OpenXLA path a symmetric entry point (#450).
+- Both drafter flag spellings are accepted on `serve` and `server` (#602).
 
 ### Performance
+
 - **Cap the batched-prefill transient memory.** With `--max-batch-prefill 4` now the default (#628), the server's padded batched-prefill path engaged out of the box for `supports_batched_prefill()` families and, for mixed-length prompts, ran a single unchunked `[B, padded_len]` forward that materialized a stacked `[B, L, L]` FP32 attention mask, an `O(B*L^2)` transient that ignored `--prefill-chunk-size` (four concurrent 8k prompts built a ~1 GiB mask and could abort the server on OOM, an availability edge the `--kv-cache-budget` guard does not model). The drained batched window is now bounded by total padded tokens via the new `--max-batch-prefill-tokens` flag (and `MLXCEL_MAX_BATCH_PREFILL_TOKENS`): a cohort of `B >= 2` rows padded to `L` keeps `B*L` within the budget, so the mask stays within `~2*budget^2` bytes; rows past the budget spill to the next tick and prefill via the chunked single-sequence path, and a head prompt too long to batch skips the batched path entirely. The default budget is derived (`2 * max_batch_prefill * prefill_chunk_size`, the shipped `2 * 4 * 512 = 4096`; the 2x headroom keeps a full batch of slightly-over-chunk-sized prompts in one window), bounding the FP32 mask to about 34 MiB while keeping short-prompt concurrency batching unchanged; `0` disables the cap for the pre-#715 unbounded behavior (#715).
+- **CUDA / GB10 kernel parity.** Native paged-attention decode kernel ported to CUDA (#731) with an adaptive selector for it (#709); fused SSM decode kernel ported to CUDA (#727); MoE prefill collapse fixed via sorted grouped GEMM (#726); `sm_120/121` qmm CTA tile (M=128) for Blackwell prefill (#723); single-dtype decode graph to eliminate per-token `AsType` (#732); small-M quantized matmul amortized with a multirow qmv path (#740); `sdpa_vector` decode kernels extended to head_dim 256/288 via an MLX overlay (#681); backend-aware default for the fused decode-MoE Dff threshold (#643); `MLXCEL_CACHE_LIMIT` added and the periodic decode cache-clear disabled on CUDA (#696); chunked parallel prefill for gated-delta on non-Metal backends (#590).
+- **Speculative decoding.** Tick-cooperative speculative decoding removes the burst head-of-line block (#745); the adaptive MTP policy is settled from measured round cost (#742); CUDA pairing matrix and burst HOL observability added (#733).
+- **Server decode loop.** Pipeline the scheduler decode with lookahead `async_eval` (#729); incremental detokenization and streaming-overhead cuts (#713).
+- **NVFP4 quantization (Blackwell).** Direct-transcode ModelOpt NVFP4 triplets to MLX native (#697), default Metal NVFP4 to native transcode (#705, #706), opt-in native repack override for non-CUDA builds (#699); gemma4 folds NVFP4 global scales into the fused MLP kernel (#701) and cuts decode-path primitive count on CUDA (#680, #682).
+- **Vision.** `mllama` builds cross-attention states from real tiles only (#622) and caches cross-attention K/V across decode steps (#621); PaddleOCR-VL batches vision attention segments (#700).
+- Record the CUDA fused-MoE Dff cap provenance and its decline test (#711); long-prompt prefill ladder plus serving telemetry benches (#641).
 
 ### Fixed
+
 - **Interrupted model downloads are detected and re-fetched instead of failing at load.** An interrupted `mlxcel run <repo-id>` (also `mlxcel serve` and `mlxcel-server` auto-download) previously reused the partial snapshot and died with a bare `Weight not found`. The load/resolve path now verifies the full weight set against the snapshot's own `model.safetensors.index.json` (every shard present and non-zero), not just `config.json` presence, so a partial snapshot is resumed through the shared downloader (re-fetching only the missing files, with a forced clean re-download as a fallback) before the model loads. Repackaged mlx-community quants whose stale full-precision index no longer matches the on-disk files are still reused without a re-fetch (#465).
+- **CUDA.** Restore `lfm2-350m-8bit` decode via an elementwise short conv (#751); correct the Int8 KV per-token scale (#717); chunk long-prompt qmm launches to avoid `gridDim > 65535` and int overflow (#652); bound long-prompt prefill memory for flash-ineligible models (#676); repack ModelOpt NVFP4 to the native MLX layout (#692).
+- **Gemma 4.** Bind the gemma-4 NVFP4 vision tower so image input works (#750); honor per-module MLP quant overrides (#690) and diagnose malformed ones (#695); disable CUDA graphs for the decode graph-race collapse (#688, #689); render the thinking-off closed channel to fix chat pad-collapse (#686, #687).
+- **DeepSeek.** `deepseek_v32` causal-mask fallback so maskless prefill is not bidirectional (#667); deepseek-v3 restores the last layer, causal prefill, and f16 clip (#618) and corrects the MoE reshape for 3D forward input (#614).
+- **VLM loading against real checkpoints.** moondream2 weight/contract pairing and EOS/prompt resolution (#616, #609); kimi-vl nullable text-config field (#608); paddleocr-vl `language_model.*` / `visual.*` key remap (#607); smolvlm idefics3 checkpoint detection (#606); mllama vision-tower key mapping (#610); glm4-moe fuses separate `switch_mlp` gate/up experts at load (#620); DeepStack and MRoPE-section loops capture the functional `slice_update` return (#666).
+- **Qwen.** qwen3.5-moe sanitizes toward the gate/up/down expert names `SparseMoeBlock` loads and stacks per-expert weights (#671, #587); qwen3-next real checkpoints load and run (#588) with per-sequence (`SequenceId`) cache isolation (#601).
+- **Tool calls.** Parse GPT-OSS Harmony tool calls into structured calls (#658); strip the leading namespace from tool-call names before filtering (#586).
+- **Server / routing.** Emit usage on the disaggregated `/v1/chat/completions` responses (#707); reject model-owned paged families from the prefill handoff (#716).
+- longcat n-gram raw slice uses a `-1` stop on axis 0 (#589); offload `download_repo` to a dedicated thread when a Tokio runtime is active (#668); validate the external quant scheme and surface unclosed thinking (#605); load bf16 affine quant scales in the OpenXLA weight loader (#569); repair three `mlxcel-core` tests after the MLX pin bump (#644).
 
 ### Docs
+
 - Finalize the per-backend `MLXCEL_FUSED_QK_NORM` default decision: CUDA (GB10) was measured and is also slower than the graph path, so the fused QK-norm decode path stays opt-in (default off) on every backend; `docs/environment-variables.md` updated to drop the CUDA-pending rationale and record the determinism nuance (#355).
+- Document all cargo build features and the XLA backend env vars (#747).
+- OpenXLA design record: ADR 0004 compute-backend seam + StableHLO/MLIR direction (#447), Phase 1 outcome (#452), performance table and transferable-precision decision (#562), multimodal/VLM track scope (#567), SSM/hybrid/recurrent track scope (#565), low-precision validation on Metal + oracle dumper (#611), packed-int8 fusion spike findings (#578).
+- Benchmarks: refresh M5 Max (#756) and M1 Ultra (#754) for 0.4.0-rc.1 (cooldown 30), M1 Ultra full refresh post VLM-port (#673), GB10 full sweep (2026-07-12), attribute the GB10 decode drops via a post-reboot re-measurement (#757), and link the GB10 findings and decode drops to issues #748, #749, #755.
+- Speculative: cross-check Gemma 4 MTP acceptance on M5 Max (#737) and correct the GB10 MTP regression framing to the small-M qmv kernel gap (#739).
+- CUDA/Blackwell batched-decode does not amortize (#724); re-validate the CUDA fused-MoE Dff cap on MLX 0.32.1 (#721); retire pooled paged-attention decode to a library-only API (#720); record the Metal NVFP4 native benchmark (#702); document Idefics3 support routing to the SmolVLM runtime (#640).
 
 ### Chore
-- Bump the `mlxcel-core` and `mlxcel-surgery` member crates to Rust edition 2024 and align their versions to the root crate at 0.3.3, per the release-versioning rule (#272).
+
+- Version bumped to `0.4.0-rc.1`.
+- Bump the `mlxcel-core` and `mlxcel-surgery` member crates to Rust edition 2024 and align their versions to the root crate, per the release-versioning rule (#445, #272).
+- MLX pin bumped to 0.32.1 (#703, #704) and earlier to `e9463bb` with the CUDA overlays rebased (#625, #642).
+- Reproducible IREE runtime toolchain via make targets (#576); requantization script and perplexity harness (#683, #685).
+- Refactors: share the per-layer attention core across emitter graph kinds (#554) and the seq MLP across serve graphs (#492); share the short-conv decode helper and audit L=1 conv dispatch across SSM/hybrid decode paths (#753).
+- Tests: reusable per-architecture XLA validation harness (#556); backend-conditional wired-limit expectation (#743); preserve MoE expert stack ordering.
+- Microbench: qmm GEMV effective-bandwidth harness and GB10 results (#684).
+- CI: bump `actions/checkout` 6 to 7 (#473), `actions/cache` 5 to 6 (#472), `actions/setup-python` 5 to 6 (#474); dependency group updates (#483, #669).
 
 ## [v0.3.3] - 2026-06-25
 
@@ -982,6 +1040,7 @@ Initial public release of mlxcel.
 - GitHub Actions release workflow for macOS ARM64
 - Profile mode for prefill/decode timing analysis
 
+[v0.4.0]: https://github.com/lablup/mlxcel/compare/v0.3.3...v0.4.0
 [v0.3.3]: https://github.com/lablup/mlxcel/compare/v0.3.2...v0.3.3
 [v0.3.2]: https://github.com/lablup/mlxcel/compare/v0.3.1...v0.3.2
 [v0.3.1]: https://github.com/lablup/mlxcel/compare/v0.3.0...v0.3.1

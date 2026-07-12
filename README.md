@@ -6,25 +6,16 @@
 
 High-performance LLM/VLM inference runtime and server for Apple Silicon. The CLI and server are implemented in Rust and execute models through native MLX C++ bindings. Linux/CUDA builds are supported as a secondary target.
 
-## New in v0.3.3
+## New in v0.4.0
 
-### v0.3.3
-
-- **Multi-node disaggregated routing.** The server drives multi-node disaggregated prefill/decode routing with worker health checks and failover, and the router serves `/v1/completions` alongside the chat and responses endpoints.
-- **Two new model capabilities.** Mellum 2, a hybrid-attention MoE text model, and video input for Gemma 4 Unified (`gemma4_unified`).
-- **Python client package.** A first-phase Python client wraps the server API for use from Python code.
-- **Faster Apertus and Seed-OSS decode.** A fused single-launch xIELU Metal kernel replaces the multi-op activation path and is on by default after M5 Max validation.
-- **N-gram loop detection.** Generation can detect and break degenerate n-gram repetition loops, on by default for the Gemma 4 family.
-- **Prefill correctness under KV-cache limits.** Prefilling a prompt longer than a model's sliding window is fixed across gemma3, gemma4, and other sliding-window models, and dense-cache prefill masks are now sized from the live sequence length under `--max-kv-size` trim across mistral4, nemotron_nas, qwen-vl, gemma3/gemma4, and exaone_moe.
-- **Audio serving hardened.** Audio synthesis is panic-safe in release builds, audio-path MLX ops are fallible at the FFI boundary, and the audio request queue is bounded with a per-request timeout. Convolution shape faults (conv1d/conv2d) are likewise caught at the FFI boundary instead of aborting the server.
-
-### v0.3
-
-- **Nine new model families.** BitNet b1.58, IBM Granite dense and GraniteMoeHybrid, LFM2 and LFM2-MoE, Falcon-H1, PLaMo 2, Apertus, ByteDance Seed-OSS, and dots.llm1 MoE, on top of the existing Llama, Qwen, Gemma, and DeepSeek coverage.
-- **Audio in and out.** Whisper speech-to-text and Kokoro-82M text-to-speech serve the OpenAI `/v1/audio/*` endpoints (transcription, translation, and speech), and `reasoning_content` is split out on non-streaming chat.
-- **Fused decode-MoE on Metal and CUDA.** The fused single-token MoE decode kernel is on by default on Metal and ported to CUDA, covering qwen3-moe, qwen2_moe, LFM2, qwen3_vl_moe, Mixtral, Phi-3.5-MoE, and OLMoE with byte-identical greedy output. The BitNet ternary matmul also runs on CUDA.
-- **Linux x86_64 and aarch64 CUDA release builds**, with bundled CCCL headers and a persistent PTX cache that reuses JIT-compiled kernels across runs.
-- **Faster decode and broader checkpoint loading.** A hardware-gated op cap raises pre-M5 (M1 to M4) decode by about 8 to 12%, and mixed-precision, bf16-scale, and non-affine VLM checkpoints (for example minicpm-v mxfp4) load correctly.
+- **Experimental OpenXLA / IREE backend (opt-in).** A second forward-execution engine built on a Rust-native StableHLO emitter and the IREE runtime, selectable with `MLXCEL_BACKEND=xla` behind the `xla-backend` / `xla-iree` build features. It runs on Metal and CUDA and serves through a continuous-batching engine. Default builds do not compile it, and the MLX path is unchanged.
+- **Over 20 new vision-language and OCR families.** Qwen3-Omni (with talker speech output), Llama 3.2 Vision, GLM-4V and GLM-4V MoE, Hunyuan-VL, ERNIE-4.5 MoE VL, DeepSeek-VL2, Kimi-VL, FastVLM, Moondream2, Idefics2, SmolVLM, LFM2-VL, and Granite Vision, plus the OCR set DeepSeek-OCR and DeepSeek-OCR 2, dots.ocr, GLM-OCR, and PaddleOCR-VL.
+- **Batching on by default.** `mlxcel-server` and `mlxcel serve` default to batched decode (`--parallel 4`), batched prefill (`--max-batch-prefill 4`), and the prompt-prefix cache, guarded by an automatic KV-cache budget. On M1 Ultra, 4 concurrent clients reach 1.90x the single-client aggregate throughput and about 17x lower time-to-first-token, with single-client speed unchanged. Restore the old behavior with `--parallel 1 --no-batch --no-prompt-cache`.
+- **CUDA / GB10 kernel parity.** Native paged-attention decode, fused SSM decode, and MoE prefill (sorted grouped GEMM) kernels are ported to CUDA, alongside a Blackwell (sm_120/121) quantized-matmul tile and a single-dtype decode graph.
+- **Speculative decoding overhaul.** Tick-cooperative scheduling removes the burst head-of-line block, and the MTP accept/decline policy is set from measured round cost.
+- **NVFP4 (Blackwell).** ModelOpt NVFP4 checkpoints transcode directly to the native MLX layout, with Metal defaulting to the native path.
+- **New attention paths.** DeepSeek-V3.2 / GLM-MoE DSA lightning indexer, phi3-small blocksparse attention, and qwen3-next pipeline-parallel stages.
+- **Interrupted downloads recover.** A partial model snapshot is detected against its own weight index and re-fetched at load instead of failing with a bare `Weight not found`.
 
 See the [changelog](CHANGELOG.md) for the full list.
 
@@ -40,10 +31,10 @@ The project started as work on structural model fine-tuning and has grown into a
 - **Simple deployment artifact.** `mlxcel` and `mlxcel-server` build as native executables, which makes packaging, service supervision, and upgrades straightforward. Platform runtime libraries are still required: for example macOS frameworks on Apple Silicon, and CUDA/OpenBLAS/LAPACK components for Linux builds.
 - **`llama-server`-style operation.** `mlxcel-server` accepts many `llama-server`-compatible flags and `LLAMA_ARG_*` environment variables, which makes migration from llama.cpp-based scripts simpler. Treat this as compatibility-oriented, not a guarantee that every llama.cpp option has identical behavior.
 - **OpenAI-compatible HTTP API subset.** The server supports SSE streaming and the `/v1/chat/completions`, `/v1/completions`, and `/v1/responses` endpoints.
-- **Serving features for real deployments.** Continuous batching, prompt-prefix caching, automatic prefix caching, speculative decoding, and KV-cache compression are available for supported model/runtime combinations.
+- **Serving features for real deployments.** Continuous batching, prompt-prefix caching, and automatic prefix caching are on by default; speculative decoding and KV-cache compression are available for supported model/runtime combinations.
 - **Differentiated runtime controls.** Default builds expose first-class YAML load-time model surgery through `--surgery` / `MLXCEL_SURGERY`, with operations such as `scale`, `add`, `prune`, `replace`, and `interpolate` for reproducible weight-space changes without retraining or writing converted checkpoints.
 - **Multi-device and distributed modes.** Tensor parallelism and pipeline parallelism are implemented for selected model families, including zero-config pipeline startup with static or mDNS-based discovery.
-- **Broad model-family coverage.** The runtime includes loaders for Llama, Qwen, Gemma, Phi, Mistral/Mixtral, DeepSeek, Cohere, InternLM, GLM, ExaOne, OLMo, ERNIE, Hunyuan, Mamba/RWKV/Jamba, Nemotron, MiniMax, Step, Kimi, and multiple VLM families. See [Supported models](docs/supported-models.md) for the maintained list.
+- **Broad model-family coverage.** The runtime includes loaders for Llama, Qwen, Gemma, Phi, Mistral/Mixtral, DeepSeek, Cohere, InternLM, GLM, ExaOne, OLMo, ERNIE, Hunyuan, Mamba/RWKV/Jamba, Nemotron, MiniMax, Step, and Kimi, plus a broad vision-language and OCR set (Qwen3-Omni, GLM-4V, Llama 3.2 Vision, Hunyuan-VL, ERNIE-4.5 VL, DeepSeek-VL2, DeepSeek-OCR, PaddleOCR-VL, and more). See [Supported models](docs/supported-models.md) for the maintained list.
 
 ## Quick start
 
@@ -184,21 +175,21 @@ averaged **98%** of `mlx-vlm` with a **98%** median.
 | VLM | `mlx-vlm` | 24 | 98% | **98%** | 18 / 24 (75%) | 10 / 24 (42%) | 59%-121% |
 
 Representative decode throughput is shown below in tokens per second. The
-mlxcel columns are the 2026-06-15 sweep on each host (v0.3.0, including the fix
-to a quantized-decode regression on bf16-scale checkpoints that mostly affected
-M1 Ultra). The M5 Max `mlx-lm` / `mlx-vlm` reference columns are retained from
-the earlier same-host campaign, so each ratio is mlxcel (2026-06-15) over that
-retained reference; a fresh same-host mlx-lm / mlx-vlm run validated that the
-reference is stable. M1 Ultra values are mlxcel-only capacity references. After
-that sweep the fused decode-MoE kernel was wired into more MoE families
-(qwen2_moe, lfm2, qwen3_vl_moe), so the Qwen3-VL 30B-A3B text-path M1 Ultra figure
-here is the refreshed post-wiring number (69 to 82 tok/s, +19%, `--profile`
-decode, median of 3); the M5 Max columns predate that wiring and are conservative
-for that row. Mixtral 8x7B stays on the gather path via the expert-size guard, so
-its figures are unchanged. Absolute results depend on model family, quantization,
-prompt shape, decode
-length, and hardware. See
-[Benchmark results](docs/benchmark_results/benchmark-report.md) and
+mlxcel columns are the 2026-06-15 v0.3.0 sweep on each host. The 0.4.0 sweep on
+2026-07-12 (MLX 0.32.1 pin `57c66cac`, `--cooldown 30`) re-measured every model
+on M1 Ultra, M5 Max, and GB10 and closely tracks these figures: MoE families are
+faster after the fused decode-MoE wiring, and a few small fast models read a few
+percent lower under the cooldown-30 thermal protocol. The M5 Max `mlx-lm` /
+`mlx-vlm` reference columns are retained from the same-host campaign and were not
+re-run at 0.4.0, so each ratio is mlxcel over that retained reference and the
+prefill and decode parity summaries above are the last full same-host comparison.
+M1 Ultra values are mlxcel-only capacity references. Per-model 0.4.0 numbers for
+all three hardware targets, including GB10 (DGX Spark) CUDA decode, are in
+[Benchmark results](docs/benchmark_results/model_tests.md). Mixtral 8x7B stays on
+the gather path via the expert-size guard, so its figures are unchanged. Absolute
+results depend on model family, quantization, prompt shape, decode length, and
+hardware. See
+[Benchmark report](docs/benchmark_results/benchmark-report.md) and
 [Benchmarks](docs/benchmarks.md) for methodology and caveats.
 
 | Text model | M1 Ultra mlxcel | M5 Max mlxcel | M5 Max mlx-lm | mlxcel / mlx-lm |
@@ -254,10 +245,12 @@ denoising passes and is not directly comparable to the autoregressive decode
 rows above. No M5 Max figure is listed because that comparison was not run on
 the same-host campaign.
 
-The M5 Max sweep covers 98 text model directories and a matching 98-entry VLM
-mode pass. Ratio summaries include only rows where both mlxcel and the Python
-reference produced comparable decode measurements; unsupported checkpoints and
-benchmark-configuration failures are tracked in the benchmark notes. VLM rows
+The 0.4.0 M5 Max sweep covers 175 text model directories (160 with decode
+numbers) and a 75-row VLM-mode pass. The Linux/CUDA GB10 (DGX Spark) sweep
+covers 159 directories, 142 measured with no code-level failures and 7
+memory-gated skips. Ratio summaries include only rows where both mlxcel and the
+Python reference produced comparable decode measurements; unsupported checkpoints
+and benchmark-configuration failures are tracked in the benchmark notes. VLM rows
 should be read separately because vision preprocessing, processor setup, and
 prompt construction differ by family. Re-run the benchmark suite on your target
 hardware before using these numbers for capacity planning.
