@@ -99,6 +99,14 @@ fn should_align_prefill() -> bool {
 
 pub(crate) const DEFAULT_PAGED_BLOCK_SIZE: usize = 32;
 
+/// Number of leading tokens pinned as an attention sink when `--max-kv-size`
+/// front-trims a dense `KVCache` (issue #718). A transformer dumps its excess
+/// attention onto the first few tokens; dropping them along with the rest of
+/// the old window collapses decode into degenerate repetition. Mirrors
+/// upstream mlx-lm `RotatingKVCache(max_size=max_kv_size, keep=4)`
+/// (https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/cache.py#L37).
+const MAX_KV_SIZE_SINK_KEEP: i32 = 4;
+
 /// Environment override for the #715 batched-prefill token budget.
 const MAX_BATCH_PREFILL_TOKENS_ENV: &str = "MLXCEL_MAX_BATCH_PREFILL_TOKENS";
 
@@ -288,21 +296,26 @@ pub struct BatchScheduler {
     /// When `Some(N)`, the scheduler enforces a hard cap on the **live KV
     /// window** of each per-layer plain `KVCache`: after every prefill
     /// chunk (full prefill, chunked prefill start, chunked prefill
-    /// continuation) and every decode step, [`KVCache::trim_front`] is
-    /// invoked on each cache whose `live_len()` exceeds `N`, dropping the
-    /// oldest excess tokens. **Crucially, the cache's monotonic `offset`
-    /// is never decremented** — `trim_front` advances `live_start` so
-    /// RoPE relative positions stay correct (see [`KVCache::trim_front`] for the position invariant).
+    /// continuation) and every decode step,
+    /// [`KVCache::trim_front_keep_sink`] is invoked on each cache whose
+    /// `live_len()` exceeds `N`, pinning a small leading attention-sink
+    /// prefix (`MAX_KV_SIZE_SINK_KEEP`) and dropping the excess tokens
+    /// that follow it rather than the oldest tokens overall. **Crucially,
+    /// the cache's monotonic `offset` is never decremented**,
+    /// `trim_front_keep_sink` advances `live_start` so RoPE relative
+    /// positions stay correct (see [`KVCache::trim_front_keep_sink`] for
+    /// the position invariant).
     ///
     /// Sliding-window models that manage their own internal
     /// `RotatingKVCache` go through a separate model-level code path and
     /// are unaffected. `None` (the default) preserves the legacy unbounded
     /// behaviour. Turbo-quantized caches (`Turbo4Asym` / `Turbo4` /
     /// `Turbo4Delegated` / `Turbo3Asym`) are skipped by
-    /// [`KVCache::trim_front`] (which returns `0` for those modes) with a
-    /// one-time startup warning logged in [`Self::with_max_kv_size`] —
-    /// the warning inspects both `kv_cache_mode` and the per-layer modes
-    /// resolved from `batch_kv_quant` so the combination
+    /// [`KVCache::trim_front_keep_sink`] (which returns `0` for those
+    /// modes) with a one-time startup warning logged in
+    /// [`Self::with_max_kv_size`], the warning inspects both
+    /// `kv_cache_mode` and the per-layer modes resolved from
+    /// `batch_kv_quant` so the combination
     /// `--kv-quant-scheme=turboquant --max-kv-size=M` is flagged even
     /// when the legacy `--kv-cache-mode` flag is left at FP16.
     max_kv_size: Option<usize>,
@@ -1198,29 +1211,14 @@ impl BatchScheduler {
                     },
                 );
             }
-            // Int8 KV forces the dense decode backend (only genuine Fp16
+            // Note: Int8 KV forces the dense decode backend (only genuine Fp16
             // sequences are pool-backed on the paged path). The dense
-            // batched-decode + front-trim path currently produces incorrect
-            // output once a prompt exceeds the cap (a pre-existing,
-            // mode-independent defect, tracked in issue #718): `--kv-cache-mode fp16
-            // --decode-storage-backend dense --max-kv-size N` mis-decodes the
-            // same way, while the KV-cache-layer Int8 trim is proven correct
-            // by unit tests. Warn loudly so operators do not silently get
-            // garbage; the cap is reliable today only on the paged backend
-            // (default Fp16).
-            let legacy_is_int8 = self.kv_cache_mode == KVCacheMode::Int8;
-            let batched_is_int8 = self.batch_kv_quant.is_enabled()
-                && self.batch_kv_quant.base_mode() == KVCacheMode::Int8;
-            if legacy_is_int8 || batched_is_int8 {
-                tracing::warn!(
-                    "--max-kv-size is set together with Int8 KV, which runs on the dense \
-                     decode backend. The dense batched-decode front-trim currently \
-                     mis-decodes prompts longer than the cap (a pre-existing defect that \
-                     also affects `--kv-cache-mode fp16 --decode-storage-backend dense`). \
-                     Omit --max-kv-size with Int8, or keep prompts within the cap, until \
-                     the dense-decode trim path is fixed."
-                );
-            }
+            // batched-decode front-trim used to mis-decode prompts longer than
+            // the cap because it dropped the leading attention-sink tokens
+            // (issue #718). `enforce_max_kv_size_for` now pins a small sink
+            // prefix via `KVCache::trim_front_keep_sink`, matching mlx-lm
+            // `RotatingKVCache(keep=4)`, so `--max-kv-size` decodes correctly on
+            // the dense backend (and therefore under Int8); no warning needed.
         }
         self.max_kv_size = max_kv_size;
         self
@@ -2336,11 +2334,14 @@ impl BatchScheduler {
 
     /// Enforce the `--max-kv-size` cap on a sequence's KV caches.
     ///
-    /// Trims the oldest `live_len(cache) - max_kv_size` tokens from every
-    /// plain `KVCache` layer whose live window exceeds the configured
-    /// bound. Turbo-mode caches return `0` from `KVCache::trim_front`
-    /// (safe no-op — see [`KVCache::trim_front`] for the per-mode
-    /// support matrix). Sliding-window models manage their own internal
+    /// Trims `live_len(cache) - max_kv_size` tokens from every plain
+    /// `KVCache` layer whose live window exceeds the configured bound,
+    /// pinning a small leading attention-sink prefix
+    /// (`MAX_KV_SIZE_SINK_KEEP`) and dropping the excess tokens that
+    /// follow it rather than the oldest tokens overall (issue #718). Turbo-mode
+    /// caches return `0` from `KVCache::trim_front_keep_sink` (safe no-op,
+    /// see [`KVCache::trim_front_keep_sink`] for the per-mode support
+    /// matrix). Sliding-window models manage their own internal
     /// `RotatingKVCache` and are never stored in the pool's
     /// `Vec<KVCache>`, so they are unaffected.
     ///
@@ -2377,6 +2378,10 @@ impl BatchScheduler {
         let Some(caches) = self.cache_pool.get_caches_mut(seq_id) else {
             return;
         };
+        // Pin a small attention-sink prefix so the trimmed window keeps the
+        // leading tokens the model attends to (issue #718). Never large enough
+        // to leave no room for the recent window under the configured cap.
+        let sink_keep = MAX_KV_SIZE_SINK_KEEP.min(max_i32 - 1).max(0);
         for cache in caches {
             // `live_len() = offset - live_start`. We trim against the live
             // window length (what attention sees), not the monotonic
@@ -2388,7 +2393,7 @@ impl BatchScheduler {
             if let Some(excess) = live_len.checked_sub(max_i32)
                 && excess > 0
             {
-                cache.trim_front(excess);
+                cache.trim_front_keep_sink(excess, sink_keep);
             }
         }
     }
