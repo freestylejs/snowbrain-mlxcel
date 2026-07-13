@@ -330,6 +330,17 @@ pub(crate) struct GenerationOptions {
     #[arg(long, value_name = "PATH", num_args = 1..)]
     pub(crate) image: Vec<PathBuf>,
 
+    /// Soft-token budget per `--image` (Gemma 4 only).
+    ///
+    /// Controls how much detail the vision tower keeps: the image is resized to
+    /// fit this many soft tokens, so a larger budget means a denser patch grid
+    /// and a longer prompt. Must be one of 70, 140, 280, 560, or 1120. When
+    /// omitted, the budget configured in the checkpoint's
+    /// `processor_config.json` is used (280 for the shipped Gemma 4
+    /// checkpoints). Ignored by every other model family.
+    #[arg(long, value_name = "N", value_parser = parse_image_soft_tokens)]
+    pub(crate) image_soft_tokens: Option<usize>,
+
     /// Audio file path for audio-language models (e.g. Gemma4 with audio)
     #[arg(long, value_name = "PATH")]
     pub(crate) audio: Option<PathBuf>,
@@ -569,6 +580,13 @@ fn parse_unit_interval(s: &str) -> Result<f32, String> {
     } else {
         Err(format!("must be between 0 and 1, got {v}"))
     }
+}
+
+/// Validate `--image-soft-tokens` at parse time so an off-ladder value is
+/// rejected before any model or image is loaded.
+fn parse_image_soft_tokens(s: &str) -> Result<usize, String> {
+    let v: usize = s.parse().map_err(|e| format!("not a number: {e}"))?;
+    mlxcel::vision::processors::gemma4::validate_image_soft_tokens(v)
 }
 
 /// Block-diffusion generation options.

@@ -91,6 +91,44 @@ pub fn image_hash_from_bytes(bytes: &[u8]) -> [u8; 32] {
     digest
 }
 
+/// SHA-256 digest of an encoded image payload, domain-separated by a
+/// preprocessing soft-token budget.
+///
+/// The cached value is the *vision tower output*, which for Gemma 4 depends on
+/// both the image bytes and the soft-token budget the preprocessor resized
+/// under: the same PNG at budget 70 and budget 1120 yields different patch
+/// grids and a different number of feature rows. Keying on bytes alone would
+/// let the first request's features be served to the second, desyncing the
+/// features from the prompt's placeholder expansion.
+///
+/// The image payload is length-prefixed and the budget field is tagged, so an
+/// attacker cannot craft an image whose trailing bytes reproduce the budget
+/// field of a different request and collide the two keys. The `None` budget
+/// (no per-request override, the common case) is a distinct sentinel from any
+/// concrete budget. `ModelVisionCaches` is a per-process in-memory cache with
+/// no on-disk form, so this framing costs nothing: the cache is empty at
+/// startup regardless of the key layout.
+pub fn image_hash_from_bytes_with_soft_tokens(
+    bytes: &[u8],
+    max_soft_tokens: Option<usize>,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"mlxcel:image-soft-tokens:v2");
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+    match max_soft_tokens {
+        Some(budget) => {
+            hasher.update([1u8]);
+            hasher.update((budget as u64).to_le_bytes());
+        }
+        None => hasher.update([0u8]),
+    }
+    let out = hasher.finalize();
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&out);
+    digest
+}
+
 /// SHA-256 digest of an MLX pixel tensor's raw bytes.
 ///
 /// Used when the image already lives on the MLX side (e.g. the request handler
@@ -98,6 +136,10 @@ pub fn image_hash_from_bytes(bytes: &[u8]) -> [u8; 32] {
 /// pixel buffer size — roughly ~8 ms for a 896×896×3 f32 tensor — which is
 /// still ~25x cheaper than the 230 ms vision tower forward pass on Gemma 4, so
 /// a cache hit is always a net win.
+///
+/// This variant needs no budget domain-separation: the pixel tensor it hashes
+/// is the *already resized* one, so a different budget produces different
+/// bytes and therefore a different digest on its own.
 pub fn image_hash_from_pixels(array: &MlxArray) -> [u8; 32] {
     // Fully materialize before extracting bytes; without eval() the contents
     // may reference lazy graph nodes that have not been realized yet.
@@ -463,6 +505,40 @@ mod tests {
         let hash_key = CacheKey::from_hash([0u8; 32]);
         let path_key = CacheKey::from_path("");
         assert_ne!(hash_key, path_key);
+    }
+
+    #[test]
+    fn soft_token_budget_partitions_the_cache_key() {
+        let bytes = b"\x89PNG\r\n\x1a\n fake image payload";
+        // No override, a concrete budget, and a different budget are all
+        // distinct keys, so the same image at two budgets can never be served
+        // the other budget's vision features.
+        let none = image_hash_from_bytes_with_soft_tokens(bytes, None);
+        let b70 = image_hash_from_bytes_with_soft_tokens(bytes, Some(70));
+        let b1120 = image_hash_from_bytes_with_soft_tokens(bytes, Some(1120));
+        assert_ne!(none, b70);
+        assert_ne!(none, b1120);
+        assert_ne!(b70, b1120);
+        // The key is deterministic for a given (bytes, budget).
+        assert_eq!(b70, image_hash_from_bytes_with_soft_tokens(bytes, Some(70)));
+    }
+
+    #[test]
+    fn soft_token_budget_key_resists_byte_boundary_collision() {
+        // The security concern: without length-prefixing, an attacker could
+        // craft an image whose trailing bytes reproduce the budget field of a
+        // different request. Construct exactly that: image A carries a payload
+        // that ends in what could look like image B's budget suffix, sent with
+        // no override; image B is the shorter prefix sent at that budget. The
+        // two must not collide.
+        let prefix = b"shared image prefix bytes";
+        let mut crafted = prefix.to_vec();
+        crafted.extend_from_slice(&[1u8]);
+        crafted.extend_from_slice(&(70u64).to_le_bytes());
+
+        let crafted_no_budget = image_hash_from_bytes_with_soft_tokens(&crafted, None);
+        let prefix_at_70 = image_hash_from_bytes_with_soft_tokens(prefix, Some(70));
+        assert_ne!(crafted_no_budget, prefix_at_70);
     }
 
     #[test]
