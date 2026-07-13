@@ -2295,16 +2295,43 @@ impl Qwen35StageModel {
 }
 
 // Weight Sanitization.
+
+/// Whether a `conv1d.weight` tensor is still in the raw torch layout.
+///
+/// The gated-delta conv is depthwise (`groups == channels`), so a raw torch
+/// weight is `[out, 1, kW]` and the converted MLX weight is `[out, kW, 1]`. A
+/// tensor of rank < 3 carries no layout information, so it reads as converted:
+/// the norm-shift gate in [`sanitize_weights`] keys on this predicate, and a
+/// degenerate tensor must not be able to trigger a shift that transposes nothing.
+fn is_raw_conv1d_layout(shape: &[i32]) -> bool {
+    shape.len() >= 3 && shape[shape.len() - 1] != 1
+}
+
 pub fn sanitize_weights(mut weights: WeightMap, config: &Qwen35Config) -> WeightMap {
-    // 1. Detect sanitization needs
-    let has_mtp = weights.keys().any(|k| k.contains("mtp."));
+    // 1. Detect sanitization needs.
+    //
+    // The conv1d weight layout is the only reliable raw-vs-converted signal: a raw
+    // torch conv1d weight is `[out, in, kW]`, a converted one is `[out, kW, 1]`.
+    // The norm shift is gated on that layout alone. An `mtp.` key is not a
+    // raw-layout signal: a converted checkpoint that bundles the MTP head (norms
+    // already shifted by +1.0, conv1d already transposed) would have its norms
+    // shifted a second time, corrupting every RMSNorm. No coverage is lost, because
+    // a raw checkpoint carrying `mtp.` weights carries unconverted conv1d weights
+    // from the same dump, and every qwen3_5 checkpoint has gated-delta layers.
+    //
+    // This diverges from mlx-lm, which still gates on `has_mtp or
+    // has_unsanitized_conv1d`
+    // (https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/qwen3_5.py).
+    // Do not reintroduce the `mtp.` term when syncing against that file.
+    //
+    // The gate and the transpose below share `is_raw_conv1d_layout`, so the
+    // invariant is "the norms shift only if at least one conv1d is actually
+    // transposed". A degenerate conv1d tensor of rank < 3 is undecidable, so it
+    // reads as converted and fails safe: no transpose, no shift.
     let has_unsanitized_conv1d = weights.iter().any(|(k, v)| {
-        k.contains("conv1d.weight") && {
-            let shape = mlxcel_core::array_shape(v);
-            shape.last() != Some(&1)
-        }
+        k.contains("conv1d.weight") && is_raw_conv1d_layout(&mlxcel_core::array_shape(v))
     });
-    let should_shift_norms = has_mtp || has_unsanitized_conv1d;
+    let should_shift_norms = has_unsanitized_conv1d;
 
     // 2. Filter MTP weights
     weights.retain(|k, _| !k.contains("mtp."));
@@ -2325,11 +2352,10 @@ pub fn sanitize_weights(mut weights: WeightMap, config: &Qwen35Config) -> Weight
 
     let keys: Vec<String> = weights.keys().cloned().collect();
     for k in &keys {
-        // Conv1d weight: moveaxis(2, 1) when shape[-1] != 1
+        // Conv1d weight: moveaxis(2, 1) when the layout is still raw
         if k.contains("conv1d.weight") {
             let v = weights.get(k.as_str()).unwrap();
-            let shape = mlxcel_core::array_shape(v);
-            if shape.len() >= 3 && shape[shape.len() - 1] != 1 {
+            if is_raw_conv1d_layout(&mlxcel_core::array_shape(v)) {
                 let transposed = mlxcel_core::swap_axes(v, -1, -2);
                 weights.insert(k.clone(), transposed);
             }
