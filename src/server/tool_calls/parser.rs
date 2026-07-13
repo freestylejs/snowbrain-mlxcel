@@ -168,9 +168,11 @@ pub fn parse_tool_calls(raw_output: &str, tools: Option<&[Tool]>) -> ToolCallPar
         formats::try_functionary_v31, // <function=name>{json}
         formats::try_qwen3_coder, // <function=name><parameter=key>val</parameter> (after v31, which declines non-JSON bodies)
         formats::try_functionary_v32, // >>>name\n
-        formats::try_llama3,      // {"name": ..., "parameters": ...}
+        // <|tool_call_start|>[func(arg=value)]<|tool_call_end|> — pythonic, before generic JSON
+        formats::try_pythonic,
+        formats::try_llama3,       // {"name": ..., "parameters": ...}
         formats::try_generic_json, // {"name": ..., "arguments": ...}
-        formats::try_command_r,   // Action: / Action Input: — least specific
+        formats::try_command_r,    // Action: / Action Input: — least specific
     ];
 
     for parser in parsers {
@@ -696,6 +698,58 @@ mod tests {
         let tools = vec![make_tool("get_weather")];
         let result = parse_tool_calls(output, Some(&tools));
         assert!(!result.has_tool_calls());
+    }
+
+    // -- Pythonic --
+
+    #[test]
+    fn parse_pythonic_format() {
+        let output = r#"<|tool_call_start|>[get_weather(city="Paris", days=2)]<|tool_call_end|>"#;
+        let tools = vec![make_tool("get_weather")];
+        let result = parse_tool_calls(output, Some(&tools));
+        assert!(result.has_tool_calls());
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].name, "get_weather");
+        let args: serde_json::Value =
+            serde_json::from_str(&result.tool_calls[0].arguments).unwrap();
+        assert_eq!(args["city"], "Paris");
+        assert_eq!(args["days"], 2);
+        assert_eq!(
+            result.format,
+            Some(crate::server::tool_calls::ToolCallFormat::Pythonic)
+        );
+    }
+
+    #[test]
+    fn parse_pythonic_filters_unknown_tools() {
+        let output = "<|tool_call_start|>[unknown_fn(x=1)]<|tool_call_end|>";
+        let tools = vec![make_tool("get_weather")];
+        let result = parse_tool_calls(output, Some(&tools));
+        assert!(!result.has_tool_calls());
+    }
+
+    #[test]
+    fn parse_pythonic_does_not_steal_json_tool_call() {
+        // Regression guard: `try_pythonic` runs before the JSON parsers and its
+        // call regex `\[(\w+)\(...\)\]` scans anywhere, so a valid JSON tool
+        // call whose string argument merely CONTAINS a `[word(...)]` substring
+        // must not be re-routed to the bracketed inner name. Here the real call
+        // is `search`, and `calc` (which appears inside the query string) is
+        // also a registered tool, so the parser must still return `search`.
+        let output = r#"{"name": "search", "arguments": {"query": "[calc(x=1)]"}}"#;
+        let tools = vec![make_tool("search"), make_tool("calc")];
+        let result = parse_tool_calls(output, Some(&tools));
+        assert!(result.has_tool_calls());
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(
+            result.tool_calls[0].name, "search",
+            "a JSON `search` call must not be mis-parsed as the bracketed `calc`"
+        );
+        assert_ne!(
+            result.format,
+            Some(crate::server::tool_calls::ToolCallFormat::Pythonic),
+            "a JSON tool call must be claimed by a JSON parser, not the pythonic one"
+        );
     }
 
     #[test]

@@ -1517,6 +1517,179 @@ fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+/// Try parsing the pythonic bracketed-call tool-call format:
+/// `<|tool_call_start|>[func(arg=value, ...)]<|tool_call_end|>`
+///
+/// Used by Llama-family "pythonic" tool use chat templates and some
+/// Nemotron templates. The call regex `\[(\w+)\((.*?)\)\]` (dotall, so it
+/// spans embedded newlines) only requires `[word(...)]` somewhere in the
+/// text, so it naturally ignores the surrounding `<|tool_call_start|>` /
+/// `<|tool_call_end|>` markers: marker-wrapped and bare bodies share this
+/// one code path. Only the FIRST match is used — the format carries a
+/// single call per message in practice.
+///
+/// Known limitation, preserved on purpose: nested parentheses, or commas
+/// inside a plain (non-bracketed) unquoted value, are not supported —
+/// matching the format's real usage rather than building a full expression
+/// parser. A single level of `[...]` list literal in a value IS supported.
+///
+/// Declines any input whose whole (trimmed) body is valid JSON. A genuine
+/// pythonic call (`[func(arg=value)]`, bare or marker-wrapped) is never itself
+/// valid JSON, whereas a JSON-format tool call IS, and its string arguments
+/// may merely CONTAIN a `[word(...)]` substring (e.g. a `search` call whose
+/// query is `"[calc(x=1)]"`). Because this parser runs before `try_llama3` /
+/// `try_generic_json` and its regex scans anywhere, without this guard such a
+/// JSON call would be mis-routed to the bracketed inner name. Declining lets
+/// the JSON parsers that run next own it.
+pub fn try_pythonic(text: &str) -> Option<ToolCallParseResult> {
+    if serde_json::from_str::<serde_json::Value>(text.trim()).is_ok() {
+        return None;
+    }
+
+    let call_re = Regex::new(r"(?s)\[(\w+)\((.*?)\)\]").ok()?;
+    let caps = call_re.captures(text).ok()??;
+
+    let name = caps.get(1)?.as_str().to_string();
+    let args_raw = caps.get(2).map(|m| m.as_str()).unwrap_or_default();
+
+    Some(ToolCallParseResult {
+        format: Some(ToolCallFormat::Pythonic),
+        tool_calls: vec![ParsedToolCall {
+            name,
+            arguments: pythonic_arguments(args_raw),
+        }],
+        content: String::new(),
+        reasoning_content: None,
+    })
+}
+
+/// Placeholder used to temporarily hide commas that sit inside a `[...]`
+/// list literal from the per-argument regex in [`pythonic_arguments`]
+/// (whose unquoted alternative `[^,]+` would otherwise stop at the first
+/// comma, breaking multi-element lists such as `tags=[1, 2, 3]`). Restored
+/// by [`unmask_bracketed_commas`] once the surrounding key=value span has
+/// been captured. A Unicode Private Use Area codepoint is used so it cannot
+/// collide with a comma that legitimately appears in real argument text.
+const MASKED_COMMA: char = '\u{E000}';
+
+/// Hide commas that occur inside an unquoted `[...]` list literal (bracket
+/// depth > 0, outside a quoted string) behind [`MASKED_COMMA`] so the
+/// per-argument regex's unquoted alternative can span the whole list.
+fn mask_bracketed_commas(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut depth: i32 = 0;
+    let mut in_quotes = false;
+    for c in raw.chars() {
+        match c {
+            '"' => {
+                in_quotes = !in_quotes;
+                out.push(c);
+            }
+            '[' if !in_quotes => {
+                depth += 1;
+                out.push(c);
+            }
+            ']' if !in_quotes => {
+                depth = depth.saturating_sub(1);
+                out.push(c);
+            }
+            ',' if !in_quotes && depth > 0 => out.push(MASKED_COMMA),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Restore commas hidden by [`mask_bracketed_commas`].
+fn unmask_bracketed_commas(masked: &str) -> String {
+    masked.replace(MASKED_COMMA, ",")
+}
+
+/// Build the JSON `arguments` object from a pythonic call's raw argument
+/// text (the `(.*?)` capture between the call's parentheses), using the
+/// per-argument regex `(\w+)=(?:"([^"]*)"|([^,]+))(?:,\s*|$)`: group 1 is
+/// the key; a matched quoted alternative (group 2) becomes a JSON string
+/// verbatim; a matched unquoted alternative (group 3) is coerced via
+/// [`coerce_pythonic_value`]. Returns `"{}"` for empty args (e.g. `ping()`).
+fn pythonic_arguments(args_raw: &str) -> String {
+    let masked = mask_bracketed_commas(args_raw);
+    let Ok(args_re) = Regex::new(r#"(\w+)=(?:"([^"]*)"|([^,]+))(?:,\s*|$)"#) else {
+        return "{}".to_string();
+    };
+
+    let mut map = serde_json::Map::new();
+    for caps in args_re.captures_iter(&masked) {
+        let Ok(caps) = caps else { continue };
+        let Some(key) = caps.get(1) else { continue };
+
+        let value = if let Some(quoted) = caps.get(2) {
+            serde_json::Value::String(quoted.as_str().to_string())
+        } else if let Some(unquoted) = caps.get(3) {
+            let restored = unmask_bracketed_commas(unquoted.as_str());
+            coerce_pythonic_value(restored.trim())
+        } else {
+            continue;
+        };
+
+        map.insert(key.as_str().to_string(), value);
+    }
+
+    serde_json::to_string(&serde_json::Value::Object(map)).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Maximum nesting depth honoured when coercing a pythonic `[...]` list
+/// literal. Each `[...]` level recurses one frame in
+/// [`coerce_pythonic_value_inner`]; untrusted model output can nest brackets
+/// arbitrarily (`[f(x=[[[[...]]]]))]`), so without a cap a few thousand
+/// brackets overflow a worker thread's stack and abort the whole process. Real
+/// pythonic tool calls nest a couple of levels at most; at the cap the
+/// still-bracketed value is kept verbatim as a raw string.
+const PYTHONIC_MAX_LIST_DEPTH: usize = 32;
+
+/// Coerce a trimmed unquoted pythonic argument value (or list item) in the
+/// order the format spec prescribes: integer, float, bool (`true`/`false`),
+/// a bracketed list `[...]` (each inner comma-separated item coerced the
+/// same way, recursively), else the raw string. A quoted list item (e.g.
+/// `"a"` inside `tags=["a", "b"]`) has its surrounding quotes stripped
+/// rather than falling through to the raw-string branch verbatim.
+fn coerce_pythonic_value(raw: &str) -> serde_json::Value {
+    coerce_pythonic_value_inner(raw, 0)
+}
+
+/// Depth-tracked worker for [`coerce_pythonic_value`]. `depth` counts how many
+/// `[...]` levels have already been entered so the recursion is bounded by
+/// [`PYTHONIC_MAX_LIST_DEPTH`].
+fn coerce_pythonic_value_inner(raw: &str, depth: usize) -> serde_json::Value {
+    if let Ok(i) = raw.parse::<i64>() {
+        return serde_json::Value::Number(i.into());
+    }
+    if let Ok(f) = raw.parse::<f64>()
+        && let Some(n) = serde_json::Number::from_f64(f)
+    {
+        return serde_json::Value::Number(n);
+    }
+    if raw == "true" || raw == "false" {
+        return serde_json::Value::Bool(raw == "true");
+    }
+    // Only descend into a `[...]` list while under the depth cap. Past the cap
+    // the value is left as a raw string, so adversarial deeply-nested brackets
+    // cannot drive unbounded recursion into a stack overflow.
+    if depth < PYTHONIC_MAX_LIST_DEPTH
+        && let Some(inner) = raw.strip_prefix('[').and_then(|s| s.strip_suffix(']'))
+    {
+        let items = inner
+            .split(',')
+            .filter(|s| !s.trim().is_empty())
+            .map(|item| coerce_pythonic_value_inner(item.trim(), depth + 1))
+            .collect();
+        return serde_json::Value::Array(items);
+    }
+    if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
+        return serde_json::Value::String(raw[1..raw.len() - 1].to_string());
+    }
+    serde_json::Value::String(raw.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2493,5 +2666,196 @@ mod tests {
             serde_json::from_str(&result.tool_calls[0].arguments).unwrap();
         assert_eq!(args["active"], true);
         assert_eq!(args["kind"], "NoneType");
+    }
+
+    // -- Pythonic --
+
+    #[test]
+    fn pythonic_quoted_string_arg() {
+        let text = r#"<|tool_call_start|>[get_weather(city="Paris")]<|tool_call_end|>"#;
+        let result = try_pythonic(text).unwrap();
+        assert_eq!(result.format, Some(ToolCallFormat::Pythonic));
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].name, "get_weather");
+        let args: serde_json::Value =
+            serde_json::from_str(&result.tool_calls[0].arguments).unwrap();
+        assert_eq!(args["city"], "Paris");
+    }
+
+    #[test]
+    fn pythonic_unquoted_int_arg() {
+        let text = "[set_count(count=42)]";
+        let result = try_pythonic(text).unwrap();
+        let args: serde_json::Value =
+            serde_json::from_str(&result.tool_calls[0].arguments).unwrap();
+        assert_eq!(args["count"], 42);
+    }
+
+    #[test]
+    fn pythonic_unquoted_float_arg() {
+        let text = "[set_temp(value=98.6)]";
+        let result = try_pythonic(text).unwrap();
+        let args: serde_json::Value =
+            serde_json::from_str(&result.tool_calls[0].arguments).unwrap();
+        assert_eq!(args["value"], 98.6);
+    }
+
+    #[test]
+    fn pythonic_unquoted_bool_args() {
+        let text = "[toggle(enabled=true, verbose=false)]";
+        let result = try_pythonic(text).unwrap();
+        let args: serde_json::Value =
+            serde_json::from_str(&result.tool_calls[0].arguments).unwrap();
+        assert_eq!(args["enabled"], true);
+        assert_eq!(args["verbose"], false);
+    }
+
+    #[test]
+    fn pythonic_bracketed_list_arg() {
+        // The unquoted alternative `[^,]+` in the per-argument regex cannot
+        // itself cross a comma, so this exercises the comma-masking done in
+        // `mask_bracketed_commas` / `unmask_bracketed_commas` around the
+        // per-argument regex, which lets a multi-element list survive intact.
+        let text = "[tag(tags=[1, 2, 3])]";
+        let result = try_pythonic(text).unwrap();
+        let args: serde_json::Value =
+            serde_json::from_str(&result.tool_calls[0].arguments).unwrap();
+        assert_eq!(args["tags"], serde_json::json!([1, 2, 3]));
+    }
+
+    #[test]
+    fn pythonic_bracketed_list_with_quoted_string_items() {
+        // Each list item is coerced independently by `coerce_pythonic_value_inner`,
+        // so a quoted item (unlike the bare integers above) must have its
+        // surrounding quotes stripped rather than kept as a literal `"a"` string.
+        let text = r#"[tag(tags=["a", "b"])]"#;
+        let result = try_pythonic(text).unwrap();
+        let args: serde_json::Value =
+            serde_json::from_str(&result.tool_calls[0].arguments).unwrap();
+        assert_eq!(args["tags"], serde_json::json!(["a", "b"]));
+    }
+
+    #[test]
+    fn pythonic_mixed_quoted_and_unquoted_args() {
+        let text = r#"[get_weather(city="Paris", days=2)]"#;
+        let result = try_pythonic(text).unwrap();
+        assert_eq!(result.tool_calls[0].name, "get_weather");
+        let args: serde_json::Value =
+            serde_json::from_str(&result.tool_calls[0].arguments).unwrap();
+        assert_eq!(args["city"], "Paris");
+        assert_eq!(args["days"], 2);
+    }
+
+    #[test]
+    fn pythonic_empty_args() {
+        let text = "[ping()]";
+        let result = try_pythonic(text).unwrap();
+        assert_eq!(result.tool_calls[0].name, "ping");
+        assert_eq!(result.tool_calls[0].arguments, "{}");
+    }
+
+    #[test]
+    fn pythonic_non_matching_text_returns_none() {
+        assert!(try_pythonic("Hello, world!").is_none());
+        assert!(try_pythonic(r#"{"name": "fn", "arguments": {}}"#).is_none());
+    }
+
+    #[test]
+    fn pythonic_marker_wrapped_and_bare_body_match() {
+        let wrapped = r#"<|tool_call_start|>[f(x="y")]<|tool_call_end|>"#;
+        let bare = r#"[f(x="y")]"#;
+        let wrapped_result = try_pythonic(wrapped).unwrap();
+        let bare_result = try_pythonic(bare).unwrap();
+        assert_eq!(wrapped_result.tool_calls, bare_result.tool_calls);
+        assert_eq!(wrapped_result.tool_calls[0].name, "f");
+        let args: serde_json::Value =
+            serde_json::from_str(&wrapped_result.tool_calls[0].arguments).unwrap();
+        assert_eq!(args["x"], "y");
+    }
+
+    #[test]
+    fn pythonic_first_match_only() {
+        let text = r#"[a(x=1)] [b(y=2)]"#;
+        let result = try_pythonic(text).unwrap();
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].name, "a");
+        let args: serde_json::Value =
+            serde_json::from_str(&result.tool_calls[0].arguments).unwrap();
+        assert_eq!(args["x"], 1);
+    }
+
+    #[test]
+    fn pythonic_declines_json_with_embedded_bracket_call() {
+        // A JSON tool call whose string argument merely contains a
+        // `[word(...)]` substring must be declined here so the downstream JSON
+        // parsers claim it, instead of the pythonic parser stealing the inner
+        // bracketed name. Both object and array JSON shapes are covered.
+        assert!(
+            try_pythonic(r#"{"name": "search", "arguments": {"query": "[calc(x=1)]"}}"#).is_none()
+        );
+        assert!(
+            try_pythonic(r#"[{"name": "search", "arguments": {"q": "[calc(x=1)]"}}]"#).is_none()
+        );
+    }
+
+    #[test]
+    fn pythonic_deeply_nested_list_does_not_overflow_stack() {
+        // Adversarial deeply-nested bracket value. Before the depth cap this
+        // recursed once per level and overflowed a worker-thread stack,
+        // aborting the process. The cap must keep parsing bounded: the call is
+        // still recognised, and the over-deep value degrades to a string rather
+        // than crashing.
+        let depth = 50_000;
+        let mut text = String::from("[f(x=");
+        text.push_str(&"[".repeat(depth));
+        text.push_str(&"]".repeat(depth));
+        text.push_str(")]");
+
+        let result = try_pythonic(&text).unwrap();
+        assert_eq!(result.tool_calls[0].name, "f");
+        // Arguments must still be valid, serializable JSON (never a panic).
+        let args: serde_json::Value =
+            serde_json::from_str(&result.tool_calls[0].arguments).unwrap();
+        assert!(args.get("x").is_some());
+    }
+
+    /// Wrap `leaf` in `layers` levels of single-element JSON arrays, i.e.
+    /// `wrap_layers(leaf, 2)` is `[[leaf]]`. Used to build the expected value
+    /// for [`pythonic_list_depth_cap_boundary`] without hand-counting nesting.
+    fn wrap_layers(leaf: serde_json::Value, layers: usize) -> serde_json::Value {
+        (0..layers).fold(leaf, |v, _| serde_json::Value::Array(vec![v]))
+    }
+
+    #[test]
+    fn pythonic_list_depth_cap_boundary() {
+        // Exactly `PYTHONIC_MAX_LIST_DEPTH` (32) nested empty `[...]` pairs. Each
+        // `[...]` strip is gated by `depth < 32`, and depths 0..=31 (32 checks)
+        // are all under the cap, so the value fully resolves: 31 single-element
+        // array layers wrap an innermost empty array, matching `[f(x=32 pairs)]`
+        // decoded with no cap in effect at all: the cap never actually engages.
+        let at_cap = format!("[f(x={})]", "[".repeat(32) + &"]".repeat(32));
+        let result = try_pythonic(&at_cap).unwrap();
+        let args: serde_json::Value =
+            serde_json::from_str(&result.tool_calls[0].arguments).unwrap();
+        let expected_at_cap = wrap_layers(serde_json::json!([]), 31);
+        assert_eq!(
+            args["x"], expected_at_cap,
+            "32 nested pairs must fully resolve to arrays, never degrading to a string"
+        );
+
+        // One bracket pair beyond the cap: the 33rd `[...]` is reached at
+        // depth == 32, where `depth < 32` is false, so it is left unstripped.
+        // The 32 layers up to the cap still resolve to arrays, but the
+        // innermost element degrades to the literal string "[]" instead of
+        // continuing as an (empty) array.
+        let over_cap = format!("[f(x={})]", "[".repeat(33) + &"]".repeat(33));
+        let result = try_pythonic(&over_cap).unwrap();
+        let args: serde_json::Value =
+            serde_json::from_str(&result.tool_calls[0].arguments).unwrap();
+        let expected_over_cap = wrap_layers(serde_json::Value::String("[]".to_string()), 32);
+        assert_eq!(
+            args["x"], expected_over_cap,
+            "the pair past the cap must degrade to a raw string, not crash or vanish"
+        );
     }
 }
