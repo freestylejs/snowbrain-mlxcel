@@ -184,6 +184,45 @@ pub fn try_mistral_nemo(text: &str) -> Option<ToolCallParseResult> {
     })
 }
 
+/// Try parsing the bracketed Mistral tool-call format:
+/// `[TOOL_CALLS]NAME[ARGS]{json}`
+///
+/// Used by Ministral 2410 and later, Mistral Small 3, Magistral, and
+/// Devstral. Distinguished from the older Mistral Nemo JSON-array format
+/// (`[TOOL_CALLS] [{"name": ..., "arguments": ...}]`, handled by
+/// [`try_mistral_nemo`]) by the literal `[ARGS]` marker: when the text after
+/// the `[TOOL_CALLS]` prefix does not match `NAME[ARGS]{json}`, this returns
+/// `None` so the older format falls through to `try_mistral_nemo`. Single
+/// call per message.
+pub fn try_mistral_bracket(text: &str) -> Option<ToolCallParseResult> {
+    let trimmed = text.trim();
+    let rest = trimmed.strip_prefix("[TOOL_CALLS]")?;
+
+    // Only compile the regex once we know `[TOOL_CALLS]` is present.
+    let re = Regex::new(r"(?s)^\s*(\w+)\[ARGS\]\s*(\{.*\})").ok()?;
+    let caps = re.captures(rest).ok()??;
+
+    let name = caps.get(1)?.as_str().to_string();
+    let args_raw = caps.get(2)?.as_str();
+
+    // Coerce the matched arguments to a JSON string the same way the other
+    // parsers in this module do: unwrap a JSON-string value, re-serialize an
+    // object/array, and fall back to the raw matched text (rather than
+    // dropping the call) when it fails to parse as JSON.
+    let arguments = match serde_json::from_str::<serde_json::Value>(args_raw) {
+        Ok(value) if value.is_string() => value.as_str().unwrap_or_default().to_string(),
+        Ok(value) => serde_json::to_string(&value).unwrap_or_else(|_| args_raw.to_string()),
+        Err(_) => args_raw.to_string(),
+    };
+
+    Some(ToolCallParseResult {
+        format: Some(ToolCallFormat::Mistral),
+        tool_calls: vec![ParsedToolCall { name, arguments }],
+        content: String::new(),
+        reasoning_content: None,
+    })
+}
+
 /// Try parsing Functionary v3.1 format:
 /// `<function=fn_name>{"key": "val"}</function>`
 pub fn try_functionary_v31(text: &str) -> Option<ToolCallParseResult> {
@@ -1556,6 +1595,96 @@ mod tests {
     #[test]
     fn mistral_nemo_no_prefix() {
         assert!(try_mistral_nemo(r#"[{"name": "x", "arguments": {}}]"#).is_none());
+    }
+
+    // -- Mistral (bracketed) --
+
+    #[test]
+    fn mistral_bracket_single_call() {
+        let text = r#"[TOOL_CALLS]get_weather[ARGS]{"city": "Paris"}"#;
+        let result = try_mistral_bracket(text).unwrap();
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].name, "get_weather");
+        let args: serde_json::Value =
+            serde_json::from_str(&result.tool_calls[0].arguments).unwrap();
+        assert_eq!(args["city"], "Paris");
+        assert_eq!(result.format, Some(ToolCallFormat::Mistral));
+    }
+
+    #[test]
+    fn mistral_bracket_nested_braces_and_newlines() {
+        // The greedy dotall `.*` in the arguments capture must reach the
+        // final closing brace even when the JSON itself contains nested
+        // objects and embedded newlines.
+        let text = "[TOOL_CALLS]search[ARGS]{\"filter\": {\"nested\": true},\n \"n\": 2}";
+        let result = try_mistral_bracket(text).unwrap();
+        assert_eq!(result.tool_calls[0].name, "search");
+        let args: serde_json::Value =
+            serde_json::from_str(&result.tool_calls[0].arguments).unwrap();
+        assert_eq!(args["filter"]["nested"], true);
+        assert_eq!(args["n"], 2);
+    }
+
+    #[test]
+    fn mistral_bracket_old_format_regression_returns_none() {
+        // The older Mistral Nemo JSON-array format carries no `[ARGS]`
+        // marker, so `try_mistral_bracket` must decline it and let the
+        // dispatcher fall through to `try_mistral_nemo`.
+        let text = r#"[TOOL_CALLS] [{"name": "x", "arguments": {}}]"#;
+        assert!(try_mistral_bracket(text).is_none());
+    }
+
+    #[test]
+    fn mistral_bracket_leading_content_returns_none() {
+        // The spec strips `[TOOL_CALLS]` after trimming, mirroring
+        // `try_mistral_nemo`'s `strip_prefix` behaviour: leading prose before
+        // the marker means the prefix strip fails, so this format declines
+        // rather than scanning mid-string for the marker.
+        let text = "Sure![TOOL_CALLS]fn[ARGS]{}";
+        assert!(try_mistral_bracket(text).is_none());
+    }
+
+    #[test]
+    fn mistral_bracket_no_args_marker_no_quadratic_blowup() {
+        // Adversarial body: `[TOOL_CALLS]` followed by a long run of word
+        // characters with no `[ARGS]` marker anywhere. The `(\w+)` capture in
+        // `^\s*(\w+)\[ARGS\]\s*(\{.*\})` backtracks one character at a time
+        // looking for the literal `[ARGS]` that never appears, so this must
+        // stay linear rather than hang.
+        let mut text = String::from("[TOOL_CALLS]");
+        text.push_str(&"a".repeat(50_000));
+
+        let start = std::time::Instant::now();
+        let result = try_mistral_bracket(&text);
+        let elapsed = start.elapsed();
+
+        // Should complete in well under one second on any reasonable hardware.
+        assert!(
+            elapsed.as_secs() < 2,
+            "parsing took {elapsed:?}; suggests catastrophic backtracking"
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn mistral_bracket_unclosed_args_no_quadratic_blowup() {
+        // Adversarial body: `[TOOL_CALLS]fn[ARGS]{` followed by a long run of
+        // word characters with no closing brace. The dotall `(\{.*\})` group
+        // cannot match without a closing `}`, so the regex must fail fast
+        // rather than degrade while `.*` backtracks across the whole buffer.
+        let mut text = String::from("[TOOL_CALLS]fn[ARGS]{");
+        text.push_str(&"a".repeat(50_000));
+
+        let start = std::time::Instant::now();
+        let result = try_mistral_bracket(&text);
+        let elapsed = start.elapsed();
+
+        // Should complete in well under one second on any reasonable hardware.
+        assert!(
+            elapsed.as_secs() < 2,
+            "parsing took {elapsed:?}; suggests catastrophic backtracking"
+        );
+        assert!(result.is_none());
     }
 
     // -- Functionary v3.1 --
