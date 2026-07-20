@@ -1,3 +1,31 @@
+mlxcel (0.4.2-1~jammy1) jammy; urgency=medium
+
+  * Added: MiniMax-M3 hybrid dense/MoE text model with block-sparse attention
+    (#799), MiniMax-M3-VL multimodal (#800), and Unlimited-OCR with a ring
+    sliding decode cache (#801).
+  * Added: XTC (Exclude Top Choices) sampling on the chat, completions, and
+    responses routes with range validation (#802).
+  * Added: thinking_mode chat-template kwarg derivation (#811), per-reason
+    prompt-cache reject metrics with an APC trace log (#810), and a decode
+    benchmark OOM backstop with a persistent record (#808).
+  * Fixed: DeepSeek-V2-Lite generated repeated tokens on GB10 CUDA; the regressed
+    upstream MLX 0.32.1 RMSNorm kernel is overlaid with its last-good version and
+    CUDA graph capture is disabled for the family (#829).
+  * Fixed: the Gemma 4 CLI audio placeholder now follows the prompt text, so the
+    12B unified model transcribes hard clips instead of answering their content
+    (#798).
+  * Fixed: requests with no effective input return a 400 before dispatch on
+    /v1/chat/completions, /v1/completions, and /v1/messages (#803, #813, #814).
+  * Fixed: long-lived CUDA speculative serving no longer aborts on the MLX
+    graph-cache Cache thrashing limit (#818); a decode-loop MLX throw fails the
+    request instead of the worker (#825); an empty paged-state length list is a
+    benign no-op (#826).
+  * Changed: the speculative slice slot rotates across waiting requests (#816);
+    the effective-input text check is allocation-free (#815); a fast test profile
+    cuts edit-test iteration (#812).
+
+ -- Jeongkyu Shin <inureyes@gmail.com>  Mon, 20 Jul 2026 09:00:00 +0000
+
 mlxcel (0.4.1-1~jammy1) jammy; urgency=medium
 
   * Added: server tool-call parsers for Kimi K2 (#783), the pythonic

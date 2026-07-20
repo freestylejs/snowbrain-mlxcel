@@ -6,22 +6,26 @@
 
 High-performance LLM/VLM inference runtime and server for Apple Silicon. The CLI and server are implemented in Rust and execute models through native MLX C++ bindings. Linux/CUDA builds are supported as a secondary target.
 
-## New in v0.4.1
+## New in v0.4.2
 
-- **Tool calling across more model families.** Server tool-call parsers for Kimi K2, the pythonic `[func(arg=value)]` format, function-calling Gemma (`start_function_call`), MiniMax-M3 (namespaced XML), GLM-4.7, and LongCat, plus the bracketed Mistral format.
-- **Three more model families.** Step-3 (`step3p7`), Command MoE (Cohere2 MoE), and Kimi-VL video input (3D MoonViT image and video patch embedding).
-- **Per-request image detail for Gemma 4.** An image soft-token budget trades prompt length for image detail, set with `--image-soft-tokens` on the CLI or `detail` / `max_soft_tokens` on the server image content parts.
-- **Audio and vision correctness fixes.** Gemma 4 E-series audio transcription no longer garbles (the Conformer mel front-end and per-layer clamp bounds now match the reference), Pixtral and Mistral 3 preserve image aspect ratio with row-structured `[IMG_BREAK]` / `[IMG_END]` tokens, DiffusionGemma tool calls parse again, and a Qwen3.5 norm-shift guard stops a converted checkpoint that bundles an MTP head from corrupting its RMSNorm weights.
+- **Three more model families.** MiniMax-M3, a hybrid dense/MoE text model with block-sparse attention (#799); MiniMax-M3-VL multimodal (#800); and Unlimited-OCR, whose decode runs against a ring sliding KV cache so a long document does not grow the cache unbounded past the window (#801).
+- **XTC sampling.** Exclude Top Choices sampling (`xtc_probability`, `xtc_threshold`) is read and applied end to end on the OpenAI-compatible chat, completions, and responses routes; out-of-range values return a 400 (#802).
+- **DeepSeek-V2 is correct on CUDA again.** An upstream MLX 0.32.1 RMSNorm kernel regression turned DeepSeek-V2-Lite generation into repeated tokens on GB10. The affected kernel is overlaid with its last-good version and CUDA graph capture is disabled for the family (as it already is for Gemma 4), so output is coherent again (#829).
+- **Empty-input requests are rejected up front.** A request whose effective input is empty or whitespace-only returns a 400 before model dispatch, on `/v1/chat/completions`, `/v1/completions`, and `/v1/messages` (#803, #813, #814).
+- **The server survives more backend faults.** An MLX evaluation throw in the decode loop fails the affected request instead of aborting the worker (#825), and CUDA builds raise the MLX graph-cache default so long-lived speculative serving no longer hits the fatal "Cache thrashing" abort (#818).
+- **Gemma 4 audio transcription fix.** The CLI renders the audio placeholder after the prompt text, so the 12B unified model transcribes acoustically hard clips instead of answering their perceived content (#798).
 
 ## New in v0.4
 
 - **Experimental OpenXLA / IREE backend (opt-in).** A second forward-execution engine built on a Rust-native StableHLO emitter and the IREE runtime, selectable with `MLXCEL_BACKEND=xla` behind the `xla-backend` / `xla-iree` build features. It runs on Metal and CUDA and serves through a continuous-batching engine. Default builds do not compile it, and the MLX path is unchanged.
-- **Over 20 new vision-language and OCR families.** Qwen3-Omni (with talker speech output), Llama 3.2 Vision, GLM-4V and GLM-4V MoE, Hunyuan-VL, ERNIE-4.5 MoE VL, DeepSeek-VL2, Kimi-VL, FastVLM, Moondream2, Idefics2, SmolVLM, LFM2-VL, and Granite Vision, plus the OCR set DeepSeek-OCR and DeepSeek-OCR 2, dots.ocr, GLM-OCR, and PaddleOCR-VL.
+- **Over 20 new vision-language and OCR families.** Qwen3-Omni (with talker speech output), Llama 3.2 Vision, GLM-4V and GLM-4V MoE, Hunyuan-VL, ERNIE-4.5 MoE VL, DeepSeek-VL2, Kimi-VL, FastVLM, Moondream2, Idefics2, SmolVLM, LFM2-VL, and Granite Vision, plus the OCR set DeepSeek-OCR and DeepSeek-OCR 2, dots.ocr, GLM-OCR, and PaddleOCR-VL. The set kept growing after 0.4.0: Kimi-VL video, Step-3, and Command MoE (Cohere2 MoE) in 0.4.1, then MiniMax-M3, MiniMax-M3-VL, and Unlimited-OCR in 0.4.2.
+- **Tool calling across model families.** Server tool-call parsers cover Kimi K2, the pythonic `[func(arg=value)]` form, function-calling Gemma, MiniMax-M3, GLM-4.7, LongCat, and the bracketed Mistral format, added in 0.4.1.
 - **Batching on by default.** `mlxcel-server` and `mlxcel serve` default to batched decode (`--parallel 4`), batched prefill (`--max-batch-prefill 4`), and the prompt-prefix cache, guarded by an automatic KV-cache budget. On M1 Ultra, 4 concurrent clients reach 1.90x the single-client aggregate throughput and about 17x lower time-to-first-token, with single-client speed unchanged. Restore the old behavior with `--parallel 1 --no-batch --no-prompt-cache`.
 - **CUDA / GB10 kernel parity.** Native paged-attention decode, fused SSM decode, and MoE prefill (sorted grouped GEMM) kernels are ported to CUDA, alongside a Blackwell (sm_120/121) quantized-matmul tile and a single-dtype decode graph.
 - **Speculative decoding overhaul.** Tick-cooperative scheduling removes the burst head-of-line block, and the MTP accept/decline policy is set from measured round cost.
 - **NVFP4 (Blackwell).** ModelOpt NVFP4 checkpoints transcode directly to the native MLX layout, with Metal defaulting to the native path.
 - **New attention paths.** DeepSeek-V3.2 / GLM-MoE DSA lightning indexer, phi3-small blocksparse attention, and qwen3-next pipeline-parallel stages.
+- **Server hardening.** In 0.4.2, requests with no effective input are rejected before dispatch, a decode-loop MLX throw fails the request instead of the worker, and long-lived CUDA speculative serving no longer aborts on the MLX graph-cache limit.
 - **Interrupted downloads recover.** A partial model snapshot is detected against its own weight index and re-fetched at load instead of failing with a bare `Weight not found`.
 
 See the [changelog](CHANGELOG.md) for the full list.

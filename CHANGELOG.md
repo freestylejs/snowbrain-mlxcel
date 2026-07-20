@@ -4,6 +4,33 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [v0.4.2] - 2026-07-20
+
+### Added
+
+- MiniMax-M3 text model: a hybrid dense/MoE architecture with block-sparse attention (#799).
+- MiniMax-M3-VL multimodal support (#800).
+- Unlimited-OCR: long-document OCR on the DeepSeek-OCR stack with a per-layer ring sliding decode cache that keeps the full prefill and rotates only the most recent decode window (#801).
+- XTC (Exclude Top Choices) sampling, read and applied end to end on the OpenAI-compatible chat, completions, and responses routes, with range validation (#802).
+- `thinking_mode` chat-template kwarg is injected when the template references the identifier and thinking is enabled (#811).
+- Per-reason prompt-cache reject metrics and an APC trace log (#810).
+- Monotonic OOM backstop and a persistent OOM record for decode benchmark sweeps (#808).
+
+### Fixed
+
+- DeepSeek-V2-Lite generated repeated tokens on GB10 CUDA. An upstream MLX 0.32.1 RMSNorm kernel regression is overlaid with its last-good version, and CUDA graph capture is disabled for the DeepSeek-V2 family (as it already is for Gemma 4), so output is coherent again (#829).
+- Gemma 4 audio: the CLI rendered the `<|audio|>` placeholder before the prompt text, which flipped the 12B unified model from transcription into answering the perceived content on acoustically hard clips. The placeholder now follows the prompt text (#798).
+- Requests with no effective input (empty or whitespace-only prompts and messages) were dispatched to the model; they now return a 400 before dispatch on `/v1/chat/completions`, `/v1/completions`, and `/v1/messages` (#803, #813, #814).
+- Long-lived speculative serving on CUDA hit a fatal MLX "Cache thrashing" abort once the graph cache filled. CUDA builds raise the `MLX_CUDA_GRAPH_CACHE_SIZE` default so the abort no longer fires (#818).
+- An MLX evaluation throw in the batch decode loop aborted the whole worker and dropped every in-flight request; it now fails the affected request instead (#825).
+- An empty paged-state length list from a not-yet-populated sequence returned an Err that spammed a "Failed to sync paged state" warning; it is treated as a benign no-op (#826).
+
+### Changed
+
+- The speculative slice slot rotates across waiting requests instead of always going to the window head (#816).
+- Effective-input text check is allocation-free (#815).
+- Added a fast test profile to cut edit-test iteration time (#812).
+
 ## [v0.4.1] - 2026-07-16
 
 ### Added
@@ -1069,6 +1096,7 @@ Initial public release of mlxcel.
 - GitHub Actions release workflow for macOS ARM64
 - Profile mode for prefill/decode timing analysis
 
+[v0.4.2]: https://github.com/lablup/mlxcel/compare/v0.4.1...v0.4.2
 [v0.4.1]: https://github.com/lablup/mlxcel/compare/v0.4.0...v0.4.1
 [v0.4.0]: https://github.com/lablup/mlxcel/compare/v0.3.3...v0.4.0
 [v0.3.3]: https://github.com/lablup/mlxcel/compare/v0.3.2...v0.3.3
