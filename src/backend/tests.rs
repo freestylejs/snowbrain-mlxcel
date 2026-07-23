@@ -124,6 +124,29 @@ fn mlx_session_threads_the_token_bias_through() {
     }
 }
 
+#[cfg(feature = "xla-backend")]
+#[test]
+fn xla_image_capability_requires_runtime_and_host_preprocessor() {
+    use super::session::{qualified_xla_capabilities, qualified_xla_supports_images};
+    use mlxcel_core::session::SessionCapabilities;
+
+    let text_runtime = SessionCapabilities::single_sequence();
+    let multimodal_runtime = text_runtime.with_multimodal();
+
+    assert!(!qualified_xla_supports_images(text_runtime, false));
+    assert!(!qualified_xla_supports_images(text_runtime, true));
+    assert!(!qualified_xla_supports_images(multimodal_runtime, false));
+    assert!(qualified_xla_supports_images(multimodal_runtime, true));
+    assert!(
+        !qualified_xla_capabilities(multimodal_runtime, false).multimodal,
+        "missing required host artifact must keep capability false"
+    );
+    assert!(
+        qualified_xla_capabilities(multimodal_runtime, true).multimodal,
+        "only a qualified runtime plus loaded preprocessor advertises images"
+    );
+}
+
 /// The experimental scaffold has no engine wired in, so it cannot produce a
 /// session. Compiled only under the optional feature; default builds carry none
 /// of it.
@@ -161,13 +184,14 @@ fn xla_backend_creates_a_single_sequence_session_scaffold() {
         "the XLA backend drives generation through the session, not load_model"
     );
 
+    let model_dir = tempfile::tempdir().expect("temporary text-model fixture");
+    std::fs::write(
+        model_dir.path().join("config.json"),
+        r#"{"model_type":"llama"}"#,
+    )
+    .expect("write text-model config");
     let session = backend
-        .create_session(
-            std::path::Path::new("/tmp/model"),
-            16,
-            KVCacheMode::Fp16,
-            TokenBiasMap::new(),
-        )
+        .create_session(model_dir.path(), 16, KVCacheMode::Fp16, TokenBiasMap::new())
         .expect("xla session creation must succeed");
     let caps = session.capabilities();
     assert!(
