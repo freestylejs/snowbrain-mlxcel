@@ -327,6 +327,15 @@ pub enum MessageContent {
     Parts(Vec<ContentPart>),
 }
 
+pub(crate) const ORDERED_MEDIA_PREFIX: &str = "<|mlxcel_ordered_";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OrderedMediaSegment<'a> {
+    Text(&'a str),
+    Image(usize),
+    Audio(usize),
+}
+
 impl MessageContent {
     /// Extract the text content from the message
     pub fn text(&self) -> String {
@@ -415,6 +424,76 @@ impl MessageContent {
                 .collect(),
         }
     }
+}
+
+pub(crate) fn ordered_image_sentinel(ordinal: usize) -> String {
+    format!("{ORDERED_MEDIA_PREFIX}image_{ordinal}|>")
+}
+
+pub(crate) fn ordered_audio_sentinel(ordinal: usize) -> String {
+    format!("{ORDERED_MEDIA_PREFIX}audio_{ordinal}|>")
+}
+
+pub(crate) fn parse_ordered_media_segments(
+    prompt: &str,
+) -> Result<Vec<OrderedMediaSegment<'_>>, String> {
+    let mut segments = Vec::new();
+    let mut remaining = prompt;
+    let mut expected_image = 1usize;
+    let mut expected_audio = 1usize;
+    while let Some(position) = remaining.find(ORDERED_MEDIA_PREFIX) {
+        if position > 0 {
+            segments.push(OrderedMediaSegment::Text(&remaining[..position]));
+        }
+        let marker = &remaining[position + ORDERED_MEDIA_PREFIX.len()..];
+        let end = marker
+            .find("|>")
+            .ok_or("malformed ordered media sentinel: missing |>")?;
+        let descriptor = &marker[..end];
+        let (kind, ordinal) = descriptor
+            .rsplit_once('_')
+            .ok_or("malformed ordered media sentinel: missing ordinal")?;
+        let ordinal = ordinal
+            .parse::<usize>()
+            .map_err(|_| "malformed ordered media sentinel: invalid ordinal")?;
+        match kind {
+            "image" if ordinal == expected_image => {
+                segments.push(OrderedMediaSegment::Image(ordinal));
+                expected_image += 1;
+            }
+            "audio" if ordinal == expected_audio => {
+                segments.push(OrderedMediaSegment::Audio(ordinal));
+                expected_audio += 1;
+            }
+            "image" => {
+                return Err(format!(
+                    "ordered image sentinel {ordinal} is out of sequence; expected {expected_image}"
+                ));
+            }
+            "audio" => {
+                return Err(format!(
+                    "ordered audio sentinel {ordinal} is out of sequence; expected {expected_audio}"
+                ));
+            }
+            _ => return Err("malformed ordered media sentinel: unknown kind".to_string()),
+        }
+        remaining = &marker[end + 2..];
+    }
+    if !remaining.is_empty() {
+        segments.push(OrderedMediaSegment::Text(remaining));
+    }
+    Ok(segments)
+}
+
+pub(crate) fn strip_ordered_media_sentinels(prompt: &str) -> Result<String, String> {
+    let segments = parse_ordered_media_segments(prompt)?;
+    let mut stripped = String::with_capacity(prompt.len());
+    for segment in segments {
+        if let OrderedMediaSegment::Text(text) = segment {
+            stripped.push_str(text);
+        }
+    }
+    Ok(stripped)
 }
 
 impl Default for MessageContent {
@@ -1035,6 +1114,43 @@ mod tests {
                 content.text()
             );
         }
+    }
+
+    #[test]
+    fn ordered_media_parser_preserves_text_and_exact_part_order() {
+        let flattened = concat!(
+            "alpha<|mlxcel_ordered_audio_1|>",
+            "beta<|mlxcel_ordered_image_1|>",
+            "<|mlxcel_ordered_audio_2|>gamma"
+        );
+        assert_eq!(ordered_audio_sentinel(1), "<|mlxcel_ordered_audio_1|>");
+        assert_eq!(ordered_image_sentinel(1), "<|mlxcel_ordered_image_1|>");
+        assert_eq!(
+            parse_ordered_media_segments(flattened).unwrap(),
+            vec![
+                OrderedMediaSegment::Text("alpha"),
+                OrderedMediaSegment::Audio(1),
+                OrderedMediaSegment::Text("beta"),
+                OrderedMediaSegment::Image(1),
+                OrderedMediaSegment::Audio(2),
+                OrderedMediaSegment::Text("gamma"),
+            ]
+        );
+    }
+
+    #[test]
+    fn ordered_media_parser_rejects_cardinality_drift() {
+        let duplicate = concat!("<|mlxcel_ordered_audio_1|>", "<|mlxcel_ordered_audio_1|>");
+        assert!(
+            parse_ordered_media_segments(duplicate)
+                .unwrap_err()
+                .contains("out of sequence")
+        );
+        assert!(
+            parse_ordered_media_segments("<|mlxcel_ordered_image_2|>")
+                .unwrap_err()
+                .contains("expected 1")
+        );
     }
 
     #[test]

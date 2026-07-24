@@ -16,8 +16,9 @@ use std::f64::consts::PI;
 
 use mlxcel_core::{MlxArray, UniquePtr};
 
+use crate::audio::{AudioCancellation, AudioPreprocessCheckpoint};
+
 const FEATURE_SIZE: usize = 80;
-const TARGET_SAMPLE_RATE: u32 = 16_000;
 const PREEMPHASIS: f32 = 0.97;
 const INPUT_SCALE: f32 = 32_768.0;
 const COMPRESSION_RATE: usize = 8;
@@ -57,6 +58,15 @@ impl Phi4MMAudioFeatureExtractor {
     }
 
     pub fn extract_batch(&self, audios: &[(Vec<f32>, u32)]) -> Result<Phi4MMAudioBatch, String> {
+        self.extract_batch_cancellable(audios, &std::sync::atomic::AtomicBool::new(false))
+    }
+
+    pub fn extract_batch_cancellable(
+        &self,
+        audios: &[(Vec<f32>, u32)],
+        cancelled: &dyn AudioCancellation,
+    ) -> Result<Phi4MMAudioBatch, String> {
+        check_feature_cancelled(cancelled)?;
         if audios.is_empty() {
             return Err("Phi4MM audio input is empty".into());
         }
@@ -64,8 +74,9 @@ impl Phi4MMAudioFeatureExtractor {
         let mut frame_lengths = Vec::with_capacity(audios.len());
         let mut embed_sizes = Vec::with_capacity(audios.len());
         for (index, (samples, sample_rate)) in audios.iter().enumerate() {
+            check_feature_cancelled(cancelled)?;
             let (features, frames) = self
-                .extract_clip(samples, *sample_rate)
+                .extract_clip_cancellable(samples, *sample_rate, cancelled)
                 .map_err(|err| format!("audio clip {}: {err}", index + 1))?;
             clips.push(features);
             frame_lengths.push(frames);
@@ -78,11 +89,26 @@ impl Phi4MMAudioFeatureExtractor {
         })
     }
 
+    #[cfg(test)]
     fn extract_clip(
         &self,
         samples: &[f32],
         sample_rate: u32,
     ) -> Result<(UniquePtr<MlxArray>, usize), String> {
+        self.extract_clip_cancellable(
+            samples,
+            sample_rate,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+    }
+
+    fn extract_clip_cancellable(
+        &self,
+        samples: &[f32],
+        sample_rate: u32,
+        cancelled: &dyn AudioCancellation,
+    ) -> Result<(UniquePtr<MlxArray>, usize), String> {
+        check_feature_cancelled(cancelled)?;
         validate_waveform(samples.len(), sample_rate)?;
         if samples.iter().any(|sample| !sample.is_finite()) {
             return Err("audio waveform contains a non-finite sample".into());
@@ -92,26 +118,9 @@ impl Phi4MMAudioFeatureExtractor {
         // In particular, 16_001..31_999 Hz uses a divisor of one and is merely
         // relabeled as 16 kHz; changing this to an ideal rational resampler
         // changes the official checkpoint's frame count and greedy output.
-        let resampled;
-        let (waveform, effective_rate) = if sample_rate == 8_000 || sample_rate == 16_000 {
-            (samples, sample_rate)
-        } else if sample_rate > 16_000 {
-            let divisor = sample_rate / 16_000;
-            if divisor == 1 {
-                (samples, TARGET_SAMPLE_RATE)
-            } else {
-                resampled = scipy_resample_poly_down(samples, divisor as usize);
-                (&resampled[..], TARGET_SAMPLE_RATE)
-            }
-        } else {
-            let divisor = sample_rate / 8_000;
-            if divisor == 1 {
-                (samples, 8_000)
-            } else {
-                resampled = scipy_resample_poly_down(samples, divisor as usize);
-                (&resampled[..], 8_000)
-            }
-        };
+        let (waveform, effective_rate) =
+            crate::audio::preprocessing::wav::phi4mm_resample(samples, sample_rate)?;
+        let waveform = waveform.as_ref();
 
         let (win_length, hop_length, n_fft) = if effective_rate == 8_000 {
             (200usize, 80usize, 256usize)
@@ -132,6 +141,9 @@ impl Phi4MMAudioFeatureExtractor {
             .collect();
         let mut framed = vec![0.0f32; frames * n_fft];
         for frame_index in 0..frames {
+            if frame_index % 64 == 0 {
+                check_feature_cancelled(cancelled)?;
+            }
             let start = frame_index * hop_length;
             let frame = &waveform[start..start + win_length];
             for i in 0..win_length {
@@ -143,6 +155,7 @@ impl Phi4MMAudioFeatureExtractor {
                     (frame[i] - PREEMPHASIS * previous) * INPUT_SCALE * window[i];
             }
         }
+        check_feature_cancelled(cancelled)?;
 
         let framed = mlxcel_core::from_slice_f32(&framed, &[frames as i32, n_fft as i32]);
         let spectrum = mlxcel_core::abs(&mlxcel_core::rfft(&framed, n_fft as i32, 1));
@@ -168,91 +181,11 @@ impl Phi4MMAudioFeatureExtractor {
     }
 }
 
-/// `scipy.signal.resample_poly(x, 1, down)` with its default Kaiser-5 FIR.
-///
-/// The pinned processor only requests integer downsampling. Keeping this
-/// implementation local makes that unusual contract explicit and avoids
-/// silently substituting the shared linear 16 kHz resampler.
-fn scipy_resample_poly_down(samples: &[f32], down: usize) -> Vec<f32> {
-    if down <= 1 {
-        return samples.to_vec();
-    }
-
-    let half_len = 10 * down;
-    let filter_len = 2 * half_len + 1;
-    let cutoff = 1.0 / down as f64;
-    let beta = 5.0;
-    let i0_beta = bessel_i0(beta);
-    let mut filter = Vec::with_capacity(filter_len);
-    for index in 0..filter_len {
-        let offset = index as isize - half_len as isize;
-        let phase = cutoff * offset as f64;
-        let sinc = if offset == 0 {
-            1.0
-        } else {
-            (PI * phase).sin() / (PI * phase)
-        };
-        let ratio = 2.0 * index as f64 / (filter_len - 1) as f64 - 1.0;
-        let window = bessel_i0(beta * (1.0 - ratio * ratio).max(0.0).sqrt()) / i0_beta;
-        filter.push(cutoff * sinc * window);
-    }
-    let scale: f64 = filter.iter().sum();
-    for value in &mut filter {
-        *value /= scale;
-    }
-
-    // SciPy prepends `down - half_len % down` zeros, then removes the first
-    // `(half_len + pre_pad) / down` polyphase outputs to center sample zero.
-    let pre_pad = down - half_len % down;
-    let pre_remove = (half_len + pre_pad) / down;
-    let output_len = samples.len().div_ceil(down);
-    let padded_filter_len = pre_pad + filter.len();
-    let mut output = Vec::with_capacity(output_len);
-    for output_index in 0..output_len {
-        let raw_index = (pre_remove + output_index) * down;
-        let first_sample = raw_index.saturating_sub(padded_filter_len - 1);
-        let last_sample = raw_index.min(samples.len().saturating_sub(1));
-        let mut sum = 0.0f64;
-        if first_sample <= last_sample {
-            for (sample_index, sample) in samples
-                .iter()
-                .enumerate()
-                .take(last_sample + 1)
-                .skip(first_sample)
-            {
-                let padded_filter_index = raw_index - sample_index;
-                if padded_filter_index >= pre_pad {
-                    let filter_index = padded_filter_index - pre_pad;
-                    if filter_index < filter.len() {
-                        sum += *sample as f64 * filter[filter_index];
-                    }
-                }
-            }
-        }
-        output.push(sum as f32);
-    }
-    output
-}
-
-fn bessel_i0(value: f64) -> f64 {
-    let x = value.abs();
-    if x < 3.75 {
-        let y = (x / 3.75).powi(2);
-        1.0 + y
-            * (3.515_622_9
-                + y * (3.089_942_4
-                    + y * (1.206_749_2 + y * (0.265_973_2 + y * (0.036_076_8 + y * 0.004_581_3)))))
+fn check_feature_cancelled(cancelled: &dyn AudioCancellation) -> Result<(), String> {
+    if cancelled.is_cancelled(AudioPreprocessCheckpoint::Feature) {
+        Err("Phi4MM audio feature extraction was cancelled".to_string())
     } else {
-        let y = 3.75 / x;
-        (x.exp() / x.sqrt())
-            * (0.398_942_28
-                + y * (0.013_285_92
-                    + y * (0.002_253_19
-                        + y * (-0.001_575_65
-                            + y * (0.009_162_81
-                                + y * (-0.020_577_06
-                                    + y * (0.026_355_37
-                                        + y * (-0.016_476_33 + y * 0.003_923_77))))))))
+        Ok(())
     }
 }
 
@@ -309,11 +242,32 @@ fn speechlib_mel() -> Vec<f32> {
 mod tests {
     use super::*;
 
+    struct CancelInsideFeature(std::sync::atomic::AtomicUsize);
+
+    impl AudioCancellation for CancelInsideFeature {
+        fn is_cancelled(&self, checkpoint: AudioPreprocessCheckpoint) -> bool {
+            checkpoint == AudioPreprocessCheckpoint::Feature
+                && self.0.fetch_add(1, std::sync::atomic::Ordering::AcqRel) >= 4
+        }
+    }
+
     #[test]
     fn token_count_is_ceiling_frames_over_eight() {
         assert_eq!(audio_embed_size(1), 1);
         assert_eq!(audio_embed_size(8), 1);
         assert_eq!(audio_embed_size(9), 2);
+    }
+
+    #[test]
+    fn framing_loop_observes_live_cancellation_before_mlx_allocation() {
+        let error = Phi4MMAudioFeatureExtractor::new()
+            .extract_batch_cancellable(
+                &[(vec![0.0; 20_000], 16_000)],
+                &CancelInsideFeature(std::sync::atomic::AtomicUsize::new(0)),
+            )
+            .err()
+            .expect("feature extraction must cancel before MLX tensor creation");
+        assert!(error.contains("cancelled"));
     }
 
     #[test]
@@ -352,21 +306,24 @@ mod tests {
     }
 
     #[test]
-    fn polyphase_integer_downsample_matches_scipy_reference() {
+    fn phi_frontend_call_path_matches_pre_move_scipy_reference() {
         let samples: Vec<f32> = (0..64)
             .map(|index| (0.25 * (2.0 * PI * 440.0 * index as f64 / 48_000.0).sin()) as f32)
             .collect();
-        for (down, expected) in [
+        for (source_rate, expected) in [
             (
-                2,
+                32_000,
                 [0.002_246_874_2, 0.028_348_744, 0.057_180_017, 0.084_596_574],
             ),
             (
-                3,
+                48_000,
                 [0.003_921_834_3, 0.042_409_703, 0.084_868_06, 0.123_779_45],
             ),
         ] {
-            let actual = scipy_resample_poly_down(&samples, down);
+            let (actual, effective_rate) =
+                crate::audio::preprocessing::wav::phi4mm_resample(&samples, source_rate).unwrap();
+            let down = source_rate as usize / 16_000;
+            assert_eq!(effective_rate, 16_000);
             assert_eq!(actual.len(), samples.len().div_ceil(down));
             for (index, expected) in expected.into_iter().enumerate() {
                 assert!(

@@ -46,6 +46,7 @@ pub struct Phi4MMVLModel {
     pub audio_encoder: Phi4MMAudioEncoder,
     pub audio_projection: Phi4MMAudioProjection,
     pub audio_extractor: Phi4MMAudioFeatureExtractor,
+    pub audio_preprocess_policy: crate::audio::AudioFamilyPolicy,
     pub select_layer: isize,
     pub eos_token_ids: Vec<i32>,
     /// Learnable global separator: [1, 1, vision_dim]
@@ -154,6 +155,15 @@ impl Phi4MMVLModel {
 
     pub fn extract_audio(&self, audios: &[(Vec<f32>, u32)]) -> Result<Phi4MMAudioBatch, String> {
         self.audio_extractor.extract_batch(audios)
+    }
+
+    pub fn extract_audio_cancellable(
+        &self,
+        audios: &[(Vec<f32>, u32)],
+        cancelled: &dyn crate::audio::AudioCancellation,
+    ) -> Result<Phi4MMAudioBatch, String> {
+        self.audio_extractor
+            .extract_batch_cancellable(audios, cancelled)
     }
 
     pub fn get_input_embeddings_with_audio(

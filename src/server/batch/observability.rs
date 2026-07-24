@@ -233,6 +233,27 @@ pub struct BatchObservability {
     /// Per-request decode throughput, in tokens/second. Recorded once per
     /// completed request from `completion_tokens / generation_only_ms`.
     pub request_decode_tok_s: RequestHistogram,
+
+    // -- host audio preprocessing (issue #873) --
+    pub audio_source_duration_micros: AtomicU64,
+    pub audio_source_samples: AtomicU64,
+    pub audio_normalized_samples: AtomicU64,
+    pub audio_feature_frames: AtomicU64,
+    pub audio_effective_tokens: AtomicU64,
+    pub audio_effective_prefill_tokens: AtomicU64,
+    pub audio_preprocess_latency_micros: AtomicU64,
+    pub audio_preprocess_rejections: AtomicU64,
+    pub audio_reject_queue_full: AtomicU64,
+    pub audio_reject_memory_limit: AtomicU64,
+    pub audio_reject_worker_unavailable: AtomicU64,
+    pub audio_reject_overflow: AtomicU64,
+    pub audio_reject_waveform: AtomicU64,
+    pub audio_reject_feature: AtomicU64,
+    pub audio_reject_feature_panic: AtomicU64,
+    pub audio_reject_context_limit: AtomicU64,
+    pub audio_preprocess_cancelled: AtomicU64,
+    pub audio_preprocess_queued_bytes: AtomicUsize,
+    pub audio_preprocess_inflight_host_bytes: AtomicUsize,
 }
 
 impl Default for BatchObservability {
@@ -271,6 +292,25 @@ impl BatchObservability {
             prompt_cache_reject_reasons: PromptCacheRejectCounters::new(),
             request_ttft_ms: RequestHistogram::new(&TTFT_MS_BUCKETS),
             request_decode_tok_s: RequestHistogram::new(&DECODE_TOK_S_BUCKETS),
+            audio_source_duration_micros: AtomicU64::new(0),
+            audio_source_samples: AtomicU64::new(0),
+            audio_normalized_samples: AtomicU64::new(0),
+            audio_feature_frames: AtomicU64::new(0),
+            audio_effective_tokens: AtomicU64::new(0),
+            audio_effective_prefill_tokens: AtomicU64::new(0),
+            audio_preprocess_latency_micros: AtomicU64::new(0),
+            audio_preprocess_rejections: AtomicU64::new(0),
+            audio_reject_queue_full: AtomicU64::new(0),
+            audio_reject_memory_limit: AtomicU64::new(0),
+            audio_reject_worker_unavailable: AtomicU64::new(0),
+            audio_reject_overflow: AtomicU64::new(0),
+            audio_reject_waveform: AtomicU64::new(0),
+            audio_reject_feature: AtomicU64::new(0),
+            audio_reject_feature_panic: AtomicU64::new(0),
+            audio_reject_context_limit: AtomicU64::new(0),
+            audio_preprocess_cancelled: AtomicU64::new(0),
+            audio_preprocess_queued_bytes: AtomicUsize::new(0),
+            audio_preprocess_inflight_host_bytes: AtomicUsize::new(0),
         }
     }
 
@@ -406,6 +446,46 @@ impl BatchObservability {
         self.request_decode_tok_s.snapshot()
     }
 
+    pub(crate) fn record_audio_waveforms(&self, waveforms: &crate::audio::AudioWaveformBatch) {
+        self.audio_source_duration_micros
+            .fetch_add(waveforms.total_source_duration_micros, Ordering::Relaxed);
+        self.audio_source_samples
+            .fetch_add(waveforms.total_source_samples as u64, Ordering::Relaxed);
+        self.audio_normalized_samples
+            .fetch_add(waveforms.total_samples as u64, Ordering::Relaxed);
+        self.audio_feature_frames
+            .fetch_add(waveforms.estimated_frames as u64, Ordering::Relaxed);
+        self.audio_effective_tokens
+            .fetch_add(waveforms.effective_audio_tokens as u64, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_audio_effective_prefill(&self, sequence_len: usize) {
+        self.audio_effective_prefill_tokens
+            .fetch_add(sequence_len as u64, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_audio_preprocess_latency(&self, elapsed_micros: u64) {
+        self.audio_preprocess_latency_micros
+            .fetch_add(elapsed_micros, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_audio_waveform_rejection(&self) {
+        self.audio_preprocess_rejections
+            .fetch_add(1, Ordering::Relaxed);
+        self.audio_reject_waveform.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_audio_feature_rejection(&self) {
+        self.audio_preprocess_rejections
+            .fetch_add(1, Ordering::Relaxed);
+        self.audio_reject_feature.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_audio_cancelled(&self) {
+        self.audio_preprocess_cancelled
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     // -- Gauge updates (called by the scheduler thread) --
 
     /// Update the point-in-time gauge values.
@@ -475,6 +555,35 @@ impl BatchObservability {
                 .cache_pool_paged_block_budget
                 .load(Ordering::Relaxed),
             decode_storage_fallbacks: self.decode_storage_fallbacks.load(Ordering::Relaxed),
+            audio_source_duration_micros: self.audio_source_duration_micros.load(Ordering::Relaxed),
+            audio_source_samples: self.audio_source_samples.load(Ordering::Relaxed),
+            audio_normalized_samples: self.audio_normalized_samples.load(Ordering::Relaxed),
+            audio_feature_frames: self.audio_feature_frames.load(Ordering::Relaxed),
+            audio_effective_tokens: self.audio_effective_tokens.load(Ordering::Relaxed),
+            audio_effective_prefill_tokens: self
+                .audio_effective_prefill_tokens
+                .load(Ordering::Relaxed),
+            audio_preprocess_latency_micros: self
+                .audio_preprocess_latency_micros
+                .load(Ordering::Relaxed),
+            audio_preprocess_rejections: self.audio_preprocess_rejections.load(Ordering::Relaxed),
+            audio_reject_queue_full: self.audio_reject_queue_full.load(Ordering::Relaxed),
+            audio_reject_memory_limit: self.audio_reject_memory_limit.load(Ordering::Relaxed),
+            audio_reject_worker_unavailable: self
+                .audio_reject_worker_unavailable
+                .load(Ordering::Relaxed),
+            audio_reject_overflow: self.audio_reject_overflow.load(Ordering::Relaxed),
+            audio_reject_waveform: self.audio_reject_waveform.load(Ordering::Relaxed),
+            audio_reject_feature: self.audio_reject_feature.load(Ordering::Relaxed),
+            audio_reject_feature_panic: self.audio_reject_feature_panic.load(Ordering::Relaxed),
+            audio_reject_context_limit: self.audio_reject_context_limit.load(Ordering::Relaxed),
+            audio_preprocess_cancelled: self.audio_preprocess_cancelled.load(Ordering::Relaxed),
+            audio_preprocess_queued_bytes: self
+                .audio_preprocess_queued_bytes
+                .load(Ordering::Relaxed),
+            audio_preprocess_inflight_host_bytes: self
+                .audio_preprocess_inflight_host_bytes
+                .load(Ordering::Relaxed),
             prompt_cache_hits: self.prompt_cache_hits.load(Ordering::Relaxed),
             prompt_cache_hit_tokens: self.prompt_cache_hit_tokens.load(Ordering::Relaxed),
             prompt_cache_inserts: self.prompt_cache_inserts.load(Ordering::Relaxed),
@@ -538,6 +647,25 @@ pub struct ObservabilitySnapshot {
     pub cache_pool_paged_bytes_in_use: u64,
     pub cache_pool_paged_block_budget: u64,
     pub decode_storage_fallbacks: u64,
+    pub audio_source_duration_micros: u64,
+    pub audio_source_samples: u64,
+    pub audio_normalized_samples: u64,
+    pub audio_feature_frames: u64,
+    pub audio_effective_tokens: u64,
+    pub audio_effective_prefill_tokens: u64,
+    pub audio_preprocess_latency_micros: u64,
+    pub audio_preprocess_rejections: u64,
+    pub audio_reject_queue_full: u64,
+    pub audio_reject_memory_limit: u64,
+    pub audio_reject_worker_unavailable: u64,
+    pub audio_reject_overflow: u64,
+    pub audio_reject_waveform: u64,
+    pub audio_reject_feature: u64,
+    pub audio_reject_feature_panic: u64,
+    pub audio_reject_context_limit: u64,
+    pub audio_preprocess_cancelled: u64,
+    pub audio_preprocess_queued_bytes: usize,
+    pub audio_preprocess_inflight_host_bytes: usize,
     /// successful prompt-cache adoptions.
     pub prompt_cache_hits: u64,
     /// tokens skipped due to cache hits (Σ
