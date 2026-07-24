@@ -684,7 +684,7 @@ fn iree_dist() -> Result<PathBuf, String> {
 /// iree-compile (version-matched to that runtime) is required via
 /// `MLXCEL_XLA_IREE_COMPILE` (runtime env, else baked at build); in the dist
 /// build it is the dist's own `bin/iree-compile`.
-fn iree_compile_bin() -> Result<PathBuf, String> {
+pub(crate) fn iree_compile_bin() -> Result<PathBuf, String> {
     if let Ok(ic) = std::env::var("MLXCEL_XLA_IREE_COMPILE") {
         return Ok(PathBuf::from(ic));
     }
@@ -717,7 +717,7 @@ fn iree_compile_bin() -> Result<PathBuf, String> {
 /// cuda codegen); `metal` -> the Metal target (metal-spirv codegen; the Apple
 /// Silicon dev path, where the macOS runtime registers the metal driver and the
 /// pinned macOS universal2 iree-compile has metal-spirv codegen).
-fn target_flags(device: &str) -> Result<&'static [&'static str], String> {
+pub(crate) fn target_flags(device: &str) -> Result<&'static [&'static str], String> {
     if device == "cuda" {
         Ok(&["--iree-hal-target-device=cuda"])
     } else if device == "metal" {
@@ -735,16 +735,14 @@ fn target_flags(device: &str) -> Result<&'static [&'static str], String> {
     }
 }
 
-/// Compile one bundled graph to a vmfb, cached by a hash of its text + flags so
-/// repeated loads skip the ~3 s compile.
-fn compile_one(
+fn compiled_graph_paths(
     iree_compile: &Path,
     mlir: &str,
     flags: &[&str],
     cache: &Path,
     tag: &str,
     context_capacity: usize,
-) -> Result<PathBuf, String> {
+) -> (PathBuf, PathBuf) {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     mlir.hash(&mut h);
     for f in flags {
@@ -757,16 +755,43 @@ fn compile_one(
     let key = h.finish();
     let mlir_path = cache.join(format!("{tag}-c{context_capacity}-{key:016x}.mlir"));
     let vmfb_path = cache.join(format!("{tag}-c{context_capacity}-{key:016x}.vmfb"));
-    if vmfb_path.exists() {
-        return Ok(vmfb_path);
-    }
+    (mlir_path, vmfb_path)
+}
+
+/// Return the cache path for one bundled graph without compiling it.
+pub(crate) fn cached_vmfb_path(
+    iree_compile: &Path,
+    mlir: &str,
+    flags: &[&str],
+    cache: &Path,
+    tag: &str,
+    context_capacity: usize,
+) -> PathBuf {
+    compiled_graph_paths(iree_compile, mlir, flags, cache, tag, context_capacity).1
+}
+
+/// Compile one bundled graph to an explicit output path.
+///
+/// Qualification-aware auxiliary caches use this to compile to a temporary
+/// sibling before atomically publishing the final VMFB.
+pub(crate) fn compile_one_to(
+    iree_compile: &Path,
+    mlir: &str,
+    flags: &[&str],
+    cache: &Path,
+    tag: &str,
+    context_capacity: usize,
+    output: &Path,
+) -> Result<(), String> {
+    let (mlir_path, _) =
+        compiled_graph_paths(iree_compile, mlir, flags, cache, tag, context_capacity);
     std::fs::write(&mlir_path, mlir).map_err(|e| format!("write {}: {e}", mlir_path.display()))?;
     let out = Command::new(iree_compile)
         .arg("--iree-input-type=stablehlo")
         .args(flags)
         .arg(&mlir_path)
         .arg("-o")
-        .arg(&vmfb_path)
+        .arg(output)
         .output()
         .map_err(|e| format!("run {}: {e}", iree_compile.display()))?;
     if !out.status.success() {
@@ -775,6 +800,32 @@ fn compile_one(
             String::from_utf8_lossy(&out.stderr)
         ));
     }
+    Ok(())
+}
+
+/// Compile one bundled graph to a vmfb, cached by a hash of its text + flags so
+/// repeated loads skip the ~3 s compile.
+pub(crate) fn compile_one(
+    iree_compile: &Path,
+    mlir: &str,
+    flags: &[&str],
+    cache: &Path,
+    tag: &str,
+    context_capacity: usize,
+) -> Result<PathBuf, String> {
+    let vmfb_path = cached_vmfb_path(iree_compile, mlir, flags, cache, tag, context_capacity);
+    if vmfb_path.exists() {
+        return Ok(vmfb_path);
+    }
+    compile_one_to(
+        iree_compile,
+        mlir,
+        flags,
+        cache,
+        tag,
+        context_capacity,
+        &vmfb_path,
+    )?;
     Ok(vmfb_path)
 }
 
@@ -2201,6 +2252,23 @@ impl IreeRaggedLlama {
     #[must_use]
     pub fn b_max(&self) -> usize {
         self.b_max
+    }
+
+    /// Clear all ragged KV slots before an independent diagnostic capture.
+    ///
+    /// Production batching retains slots between scheduler steps. Diagnostic
+    /// baselines instead compare independent prepared payloads on the same
+    /// loaded engine, so each capture must start from an empty cache.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn reset_slots_for_diagnostics(&mut self) -> Result<(), String> {
+        let b_max = checked_ffi_int(self.b_max, "b_max")?;
+        // Safety: `self.ctx` remains valid for the lifetime of this engine, and
+        // the call only releases/reinitializes cache objects owned by that ctx.
+        let rc = unsafe { xla_llama_ragged_reset(self.ctx, b_max) };
+        if rc != 0 {
+            return Err(format!("xla_llama_ragged_reset failed (status {rc})"));
+        }
+        Ok(())
     }
 
     /// The vocabulary size (logits per row). The engine slices the ragged decode's
