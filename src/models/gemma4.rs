@@ -1885,7 +1885,8 @@ impl Attention {
         values: &MlxArray,
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        let local_mask = trim_mask_to_keys(mask, keys);
+        let query_len = mlxcel_core::array_shape(queries)[2];
+        let local_mask = trim_mask_to_keys(mask, keys, query_len);
 
         // When mask was discarded (undersized) or originally None,
         // use causal attention if possible.
@@ -2361,7 +2362,11 @@ impl Attention {
     }
 }
 
-fn trim_mask_to_keys(mask: Option<&MlxArray>, keys: &MlxArray) -> Option<UniquePtr<MlxArray>> {
+fn trim_mask_to_keys(
+    mask: Option<&MlxArray>,
+    keys: &MlxArray,
+    query_len: i32,
+) -> Option<UniquePtr<MlxArray>> {
     let mask = mask?;
     let mask_shape = mlxcel_core::array_shape(mask);
     let key_shape = mlxcel_core::array_shape(keys);
@@ -2373,14 +2378,32 @@ fn trim_mask_to_keys(mask: Option<&MlxArray>, keys: &MlxArray) -> Option<UniqueP
         let start = mask_len - key_len;
         Some(slice_axis(mask, -1, start, mask_len))
     } else {
-        // mask is smaller than key length — this happens when an external
-        // mask was created with stale offset (e.g. during chunked prefill on
-        // non-batching models).  Discard the undersized caller mask and let
-        // the attention kernel fall back to its internal causal handling by
-        // returning None, which will cause the caller to pass a null mask.
+        // Mask SHORTER than the keys: discard it and let the layer fall back to
+        // the maskless `causal_attention` path with its own window. This covers
+        // both single-token decode and multi-token chunks.
+        //
+        // Single-token decode (`query_len == 1`): a caller mask built with a
+        // stale offset can be shorter than the keys, but the decode kernel
+        // derives its own causal / sliding-window mask, so discarding is safe.
+        //
+        // Multi-token chunk (`query_len > 1`): the #885 corruption on the
+        // chunked-prefill path is prevented upstream by the caller-mask-branch
+        // rebuild in `forward_with_speculative_sinks`, which sizes both
+        // attention-family masks to the keys the caches return before this
+        // function is called; on that path a too-short multi-token mask never
+        // reaches here. The one legitimate too-short multi-token case that does
+        // reach here is the buffered MTP `RotatingKVCache` verify path
+        // (`buffer_size > 0`): its `update_and_fetch` returns `sliding_live_len
+        // + query_len` uncompacted keys, which exceed the window-capped
+        // `create_sliding_window_prefill_mask` axis once the live length reaches
+        // the window. Discarding here and falling back to `causal_attention`
+        // with the layer window is the correct, pre-#885 behaviour for that
+        // chronological buffered layout. Panicking here (the #891 regression)
+        // crashed the server worker on that legitimate path.
         tracing::warn!(
             mask_len,
             key_len,
+            query_len,
             "trim_mask_to_keys: mask shorter than key length, discarding caller mask"
         );
         None
@@ -3056,7 +3079,43 @@ impl Gemma4TextModel {
                 )),
             )
         } else if let Some(mask) = mask {
-            (Some(mlxcel_core::copy(mask)), Some(mlxcel_core::copy(mask)))
+            // A caller-supplied prefill mask (the server's
+            // `create_padded_prefill_mask`) is chunk-local. For a model-owned-
+            // cache batching model like Gemma 4 the scheduler builds it against
+            // its dummy (offset-0) cache view, so during a chunked-prefill
+            // CONTINUATION the mask's key axis is far shorter than the per-family
+            // caches actually return for this chunk: the full-attention
+            // `KVCache` returns `global_live_len + l` keys and the sliding
+            // `RotatingKVCache` returns `min(sliding_live_len, window - 1) + l`.
+            // Reusing that single short mask for BOTH families makes
+            // `trim_mask_to_keys` discard it (mask shorter than keys), dropping
+            // the causal / sliding-window alignment and collapsing sliding-
+            // window Gemma 4 output into reserved `<unused...>` tokens (issue
+            // #885). When the caller mask is too short for the returned keys,
+            // rebuild BOTH masks from the caches' live windows exactly as the
+            // non-caller `l > 1` branch below, so each family's mask key axis
+            // matches its returned keys and chunked prefill is byte-identical to
+            // unchunked prefill. A correctly-sized caller mask (cold batched
+            // prefill, or a full prefill that adopted a prompt-cache prefix) is
+            // preserved unchanged and cropped per family by `trim_mask_to_keys`.
+            let mask_key_len = *mlxcel_core::array_shape(mask).last().unwrap_or(&0);
+            let global_live_len = first_cache_live_len(caches, "full_attention");
+            let sliding_live_len = first_cache_live_len(caches, "sliding_attention");
+            let window = self.config.sliding_window as i32;
+            let full_returned = global_live_len + l;
+            let sliding_returned = sliding_live_len.min((window - 1).max(0)) + l;
+            if l > 1 && mask_key_len < full_returned.max(sliding_returned) {
+                (
+                    Some(create_causal_mask(l, global_live_len)),
+                    Some(create_sliding_window_prefill_mask(
+                        l,
+                        sliding_live_len,
+                        window,
+                    )),
+                )
+            } else {
+                (Some(mlxcel_core::copy(mask)), Some(mlxcel_core::copy(mask)))
+            }
         } else if has_padding {
             // Resident prompt padding present (ragged burst). Build per-row
             // left-padding-aware masks for ANY query width, including `l == 1`.
@@ -5558,6 +5617,151 @@ mod gemma4_unified_mask_tests {
             first_cache_live_len(&mut caches, "sliding_attention"),
             returned_klen,
             "sliding first_cache_live_len (== seq_len) must equal the returned key axis"
+        );
+    }
+
+    /// Issue #885 sliding-family regression. During a chunked-prefill
+    /// continuation the sliding `RotatingKVCache` is rolled over and returns
+    /// `min(sliding_live_len, window - 1) + l` keys. The mask the fix builds
+    /// from the live window (`create_sliding_window_prefill_mask`) must have a
+    /// key axis EQUAL to those returned keys so `trim_mask_to_keys` keeps it,
+    /// whereas the server's offset-0 chunk-local `create_padded_prefill_mask`
+    /// is SHORTER than the returned keys (the discard-and-corrupt case). This
+    /// is the deterministic proxy for chunked-vs-unchunked output parity: the
+    /// divergence was entirely in this mask's key axis.
+    #[test]
+    fn chunked_continuation_sliding_mask_matches_returned_keys() {
+        const H: i32 = 2;
+        const D: i32 = 4;
+        let window = 4;
+        let m = 3; // continuation chunk length (l > 1)
+
+        let mut cache = RotatingKVCache::new(window);
+        // First chunk fills the window so the rotating cache is in the rolled-
+        // over continuation state a chunked prefill reaches after chunk 0.
+        cache.update_and_fetch(make_kv(H, window, D, 0.0), make_kv(H, window, D, 100.0));
+
+        // The pre-continuation live window, exactly what the forward reads via
+        // `first_cache_live_len` before the layer loop updates the cache.
+        let sliding_live_len = cache.seq_len();
+
+        // Continuation chunk: the rotating cache returns `window - 1` retained
+        // prior keys plus all `m` new keys.
+        let (k, _) = cache.update_and_fetch(make_kv(H, m, D, 200.0), make_kv(H, m, D, 300.0));
+        let returned_klen = mlxcel_core::array_shape(&k)[2];
+
+        // The fix: the sliding mask built from the live window matches the keys.
+        let fixed = create_sliding_window_prefill_mask(m, sliding_live_len, window);
+        mlxcel_core::eval(&fixed);
+        assert_eq!(
+            *mlxcel_core::array_shape(&fixed).last().unwrap(),
+            returned_klen,
+            "live-window sliding mask key axis must equal the rotating cache's returned keys"
+        );
+
+        // The bug: the server's offset-0 chunk-local mask is shorter than the
+        // returned keys, so `trim_mask_to_keys` would discard it.
+        let caller = mlxcel_core::utils::create_padded_prefill_mask(m, m, 0);
+        mlxcel_core::eval(&caller);
+        assert!(
+            *mlxcel_core::array_shape(&caller).last().unwrap() < returned_klen,
+            "offset-0 caller mask must be shorter than the returned keys (the discard case)"
+        );
+
+        // The correctly-sized mask survives `trim_mask_to_keys` (no discard).
+        assert!(
+            trim_mask_to_keys(Some(&fixed), &k, m).is_some(),
+            "the live-window sliding mask must survive trim_mask_to_keys"
+        );
+    }
+
+    /// Issue #885 full-attention-family companion. The chunked continuation's
+    /// offset-0 caller mask is ALSO shorter than the full-attention `KVCache`'s
+    /// returned keys (`global_live_len + l`), so the full-attention layers were
+    /// silently discarding it too. The mask the fix builds
+    /// (`create_causal_mask(l, global_live_len)`) matches the returned keys.
+    #[test]
+    fn chunked_continuation_global_mask_matches_returned_keys() {
+        const H: i32 = 2;
+        const D: i32 = 4;
+        let n1 = 4; // first chunk
+        let m = 3; // continuation chunk (l > 1)
+
+        let mut cache = KVCache::new();
+        cache.update_and_fetch(make_kv(H, n1, D, 0.0), make_kv(H, n1, D, 100.0));
+        let global_live_len = cache.live_len();
+
+        let (k, _) = cache.update_and_fetch(make_kv(H, m, D, 200.0), make_kv(H, m, D, 300.0));
+        let returned_klen = mlxcel_core::array_shape(&k)[2];
+        assert_eq!(returned_klen, global_live_len + m);
+
+        let fixed = create_causal_mask(m, global_live_len);
+        mlxcel_core::eval(&fixed);
+        assert_eq!(
+            *mlxcel_core::array_shape(&fixed).last().unwrap(),
+            returned_klen,
+            "live-window global mask key axis must equal the full-attention returned keys"
+        );
+
+        let caller = mlxcel_core::utils::create_padded_prefill_mask(m, m, 0);
+        mlxcel_core::eval(&caller);
+        assert!(
+            *mlxcel_core::array_shape(&caller).last().unwrap() < returned_klen,
+            "offset-0 caller mask must be shorter than the full-attention returned keys"
+        );
+        assert!(trim_mask_to_keys(Some(&fixed), &k, m).is_some());
+    }
+
+    /// A mask LONGER than the keys (correctly-offset caller mask on the sliding
+    /// family) must still be cropped, not discarded: the pre-#885 crop path is
+    /// preserved for `query_len > 1`.
+    #[test]
+    fn trim_mask_to_keys_crops_when_mask_longer_than_keys() {
+        const H: i32 = 2;
+        const D: i32 = 4;
+        let keys = make_kv(H, 4, D, 0.0); // 4 returned keys
+        let mask = create_causal_mask(3, 5); // [3, 8], longer than the keys
+        let trimmed = trim_mask_to_keys(Some(&mask), &keys, 3)
+            .expect("a mask longer than the keys must crop, not discard");
+        mlxcel_core::eval(&trimmed);
+        assert_eq!(
+            *mlxcel_core::array_shape(&trimmed).last().unwrap(),
+            4,
+            "the crop keeps the trailing `key_len` columns"
+        );
+    }
+
+    /// A too-short mask on a MULTI-token chunk is discarded (returns `None`),
+    /// not a panic. The #885 chunked-prefill corruption is prevented upstream by
+    /// the caller-mask-branch rebuild in `forward_with_speculative_sinks`, so the
+    /// only too-short multi-token mask that reaches here is the buffered MTP
+    /// `RotatingKVCache` verify path, where discarding and falling back to
+    /// `causal_attention` is correct (panicking here was the #891 DoS).
+    #[test]
+    fn trim_mask_to_keys_discards_too_short_multi_token() {
+        const H: i32 = 2;
+        const D: i32 = 4;
+        let keys = make_kv(H, 6, D, 0.0); // 6 returned keys
+        let short = mlxcel_core::utils::create_padded_prefill_mask(3, 3, 0); // [3, 3]
+        // query_len = 3 (> 1): a too-short mask is discarded, not a panic.
+        assert!(
+            trim_mask_to_keys(Some(&short), &keys, 3).is_none(),
+            "a too-short mask on a multi-token chunk is discarded, not a panic"
+        );
+    }
+
+    /// A too-short mask on single-token DECODE (`query_len == 1`) is still
+    /// discarded (returns `None`): the decode kernel derives its own mask, so
+    /// this path stays safe and unchanged.
+    #[test]
+    fn trim_mask_to_keys_discards_too_short_single_token_decode() {
+        const H: i32 = 2;
+        const D: i32 = 4;
+        let keys = make_kv(H, 6, D, 0.0);
+        let short = mlxcel_core::utils::create_padded_prefill_mask(1, 1, 0); // [1, 1]
+        assert!(
+            trim_mask_to_keys(Some(&short), &keys, 1).is_none(),
+            "single-token decode still discards an undersized caller mask"
         );
     }
 
