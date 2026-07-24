@@ -20,7 +20,7 @@
 //! is byte-identical to before.
 
 use super::builder::{Builder, Precision, Ty, Val, precision_from_env, quant_in_graph};
-use super::config::{Config, MropeLayout, NormStyle};
+use super::config::{Config, DeepStackConfig, MropeLayout, NormStyle};
 use super::moe::{self, MoeLayerW, MoeSharedW};
 use super::rope;
 
@@ -2566,11 +2566,23 @@ pub fn emit_decode_ragged_with(
 enum PrefillInputKind {
     Tokens,
     Embeddings,
+    DeepStack,
 }
 
 enum PrefillInput {
     Tokens(Val),
     Embeddings { hidden: Val, attention_bias: Val },
+    DeepStack(Box<DeepStackPrefillInput>),
+}
+
+struct DeepStackPrefillInput {
+    hidden: Val,
+    attention_bias: Val,
+    visual_positions: Val,
+    layer_features: Val,
+    layer_indices: Val,
+    actual_layer_count: Val,
+    actual_visual_count: Val,
 }
 
 /// Prefill arg handles. Weights are identical to decode (same order/locs), which
@@ -2632,7 +2644,7 @@ fn build_prefill_arg_schema(
             )),
             None,
         ),
-        PrefillInputKind::Embeddings => (
+        PrefillInputKind::Embeddings | PrefillInputKind::DeepStack => (
             None,
             Some(take_arg(
                 &mut decls,
@@ -2656,8 +2668,8 @@ fn build_prefill_arg_schema(
         "positions".into(),
     );
     let real_len = take_arg(&mut decls, &mut idx, Ty::scalar("i32"), "real_len".into());
-    let input = match (tokens, embeddings) {
-        (None, Some(hidden)) => PrefillInput::Embeddings {
+    let input = match (tokens, embeddings, input_kind) {
+        (None, Some(hidden), PrefillInputKind::Embeddings) => PrefillInput::Embeddings {
             hidden,
             attention_bias: take_arg(
                 &mut decls,
@@ -2666,7 +2678,54 @@ fn build_prefill_arg_schema(
                 "attention_bias".into(),
             ),
         },
-        (Some(tokens), None) => PrefillInput::Tokens(tokens),
+        (None, Some(hidden), PrefillInputKind::DeepStack) => {
+            let schema = c
+                .deepstack
+                .as_ref()
+                .expect("DeepStack prefill requires a declared schema");
+            let layer_count = schema.target_layer_indices.len();
+            let max_visual = schema.max_visual_positions;
+            PrefillInput::DeepStack(Box::new(DeepStackPrefillInput {
+                hidden,
+                attention_bias: take_arg(
+                    &mut decls,
+                    &mut idx,
+                    Ty::f32(vec![lp, lp]),
+                    "attention_bias".into(),
+                ),
+                visual_positions: take_arg(
+                    &mut decls,
+                    &mut idx,
+                    Ty::new(vec![max_visual], "i32"),
+                    "deepstack.visual_positions".into(),
+                ),
+                layer_features: take_arg(
+                    &mut decls,
+                    &mut idx,
+                    Ty::f32(vec![layer_count, max_visual, c.hidden]),
+                    "deepstack.layer_features".into(),
+                ),
+                layer_indices: take_arg(
+                    &mut decls,
+                    &mut idx,
+                    Ty::new(vec![layer_count], "i32"),
+                    "deepstack.layer_indices".into(),
+                ),
+                actual_layer_count: take_arg(
+                    &mut decls,
+                    &mut idx,
+                    Ty::scalar("i32"),
+                    "deepstack.actual_layer_count".into(),
+                ),
+                actual_visual_count: take_arg(
+                    &mut decls,
+                    &mut idx,
+                    Ty::scalar("i32"),
+                    "deepstack.actual_visual_count".into(),
+                ),
+            }))
+        }
+        (Some(tokens), None, PrefillInputKind::Tokens) => PrefillInput::Tokens(tokens),
         _ => unreachable!("each prefill schema has exactly one input representation"),
     };
 
@@ -2849,7 +2908,7 @@ pub fn emit_prefill(c: &Config, sample: bool) -> String {
 }
 
 pub fn emit_prefill_with(c: &Config, sample: bool, precision: Precision) -> String {
-    emit_prefill_module(c, sample, precision, PrefillInputKind::Tokens)
+    emit_prefill_module(c, sample, precision, PrefillInputKind::Tokens, false)
 }
 
 /// Emit the distinct prefill-from-embeddings StableHLO module at the ambient
@@ -2865,7 +2924,107 @@ pub(crate) fn emit_prefill_embeddings_with(
     sample: bool,
     precision: Precision,
 ) -> String {
-    emit_prefill_module(c, sample, precision, PrefillInputKind::Embeddings)
+    emit_prefill_module(c, sample, precision, PrefillInputKind::Embeddings, false)
+}
+
+/// Emit the optional sparse DeepStack embeddings-prefill entry.
+///
+/// DeepStack additions occur immediately after each selected language layer,
+/// matching the MLX Qwen3-VL reference path. The ordinary embeddings entry
+/// remains a distinct module with its original schema.
+pub(crate) fn emit_prefill_embeddings_deepstack_with(
+    c: &Config,
+    sample: bool,
+    precision: Precision,
+) -> String {
+    c.deepstack
+        .as_ref()
+        .expect("DeepStack prefill requires a declared schema")
+        .validate(c.n_layers, c.context_capacity)
+        .expect("invalid DeepStack schema");
+    emit_prefill_module(c, sample, precision, PrefillInputKind::DeepStack, false)
+}
+
+/// Emit the full DeepStack prefill plus post-hook hidden states for oracle tests.
+///
+/// This uses the production layer loop and residual hook but remains a diagnostic
+/// module that is never loaded into a serving session.
+pub(crate) fn emit_prefill_embeddings_deepstack_diagnostics_with(
+    c: &Config,
+    precision: Precision,
+) -> String {
+    c.deepstack
+        .as_ref()
+        .expect("DeepStack diagnostics require a declared schema")
+        .validate(c.n_layers, c.context_capacity)
+        .expect("invalid DeepStack schema");
+    emit_prefill_module(c, false, precision, PrefillInputKind::DeepStack, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_deepstack_after_layer(
+    b: &mut Builder,
+    schema: &DeepStackConfig,
+    layer_index: usize,
+    hidden: &Val,
+    visual_positions: &Val,
+    layer_features: &Val,
+    layer_indices: &Val,
+    actual_layer_count: &Val,
+    actual_visual_count: &Val,
+) -> Val {
+    let Some(payload_index) = schema
+        .target_layer_indices
+        .iter()
+        .position(|&configured_layer| configured_layer == layer_index)
+    else {
+        return hidden.clone();
+    };
+    let lp = hidden.ty.shape[0];
+    let hidden_size = hidden.ty.shape[1];
+    let max_visual = schema.max_visual_positions;
+
+    let row_indices = b.iota(lp);
+    let row_matrix = b.broadcast(&row_indices, &[0], vec![lp, max_visual]);
+    let positions_matrix = b.broadcast(visual_positions, &[1], vec![lp, max_visual]);
+    let position_matches = b.compare("EQ", &row_matrix, &positions_matrix, "SIGNED");
+
+    let visual_indices = b.iota(max_visual);
+    let visual_limit = b.broadcast(actual_visual_count, &[], vec![max_visual]);
+    let visual_active = b.compare("LT", &visual_indices, &visual_limit, "SIGNED");
+    let visual_active = b.broadcast(&visual_active, &[1], vec![lp, max_visual]);
+    let position_matches = b.and(&position_matches, &visual_active);
+
+    let zero = b.const_f32(0.0);
+    let zero_rows = b.broadcast(&zero, &[], vec![lp, max_visual, hidden_size]);
+    let payload_layer = b.slice(layer_indices, &[(payload_index, payload_index + 1)]);
+    let payload_layer = b.reshape(&payload_layer, vec![]);
+    let expected_layer = b.const_i32(layer_index as i32);
+    let layer_matches = b.compare("EQ", &payload_layer, &expected_layer, "SIGNED");
+    let payload_slot = b.const_i32(payload_index as i32);
+    let slot_active = b.compare("LT", &payload_slot, actual_layer_count, "SIGNED");
+    let layer_active = b.and(&layer_matches, &slot_active);
+    let layer_active = b.broadcast(&layer_active, &[], vec![lp, max_visual]);
+    let active_positions = b.and(&position_matches, &layer_active);
+    let active_positions = b.broadcast(
+        &active_positions,
+        &[0, 1],
+        vec![lp, max_visual, hidden_size],
+    );
+
+    let features = b.slice(
+        layer_features,
+        &[
+            (payload_index, payload_index + 1),
+            (0, max_visual),
+            (0, hidden_size),
+        ],
+    );
+    let features = b.reshape(&features, vec![max_visual, hidden_size]);
+    let features = b.broadcast(&features, &[1, 2], vec![lp, max_visual, hidden_size]);
+    let selected = b.select(&active_positions, &features, &zero_rows);
+    let delta = b.reduce_add(&selected, 1, &zero);
+    b.add(hidden, &delta)
 }
 
 fn emit_prefill_module(
@@ -2873,7 +3032,12 @@ fn emit_prefill_module(
     sample: bool,
     precision: Precision,
     input_kind: PrefillInputKind,
+    capture_deepstack_states: bool,
 ) -> String {
+    assert!(
+        !capture_deepstack_states || matches!(input_kind, PrefillInputKind::DeepStack),
+        "post-hook state capture is only valid for DeepStack prefill"
+    );
     let lp = c.context_capacity;
     let mut b = Builder::new().with_precision(precision);
     let (decls, a) = build_prefill_arg_schema(&mut b, c, lp, input_kind);
@@ -2893,6 +3057,7 @@ fn emit_prefill_module(
             scale_embedding(&mut b, c, emb, vec![lp, h])
         }
         PrefillInput::Embeddings { hidden, .. } => hidden.clone(),
+        PrefillInput::DeepStack(deepstack) => deepstack.hidden.clone(),
     };
 
     // --- shared position preparation ---
@@ -2959,6 +3124,22 @@ fn emit_prefill_module(
             });
             (cmask, cmask_local)
         }
+        PrefillInput::DeepStack(deepstack) => {
+            let cmask = deepstack.attention_bias.clone();
+            let cmask_local = c.sliding_window.map(|w| {
+                let irow = b.iota(lp);
+                let row = b.broadcast(&irow, &[0], vec![lp, lp]);
+                let jcol = b.iota(lp);
+                let col = b.broadcast(&jcol, &[1], vec![lp, lp]);
+                let wc = b.const_i32(w as i32);
+                let wb = b.broadcast(&wc, &[], vec![lp, lp]);
+                let age = b.subtract(&row, &col);
+                let within = b.compare("LT", &age, &wb, "SIGNED");
+                let negs = b.broadcast(&k.neg_big, &[], vec![lp, lp]);
+                b.select(&within, &cmask, &negs)
+            });
+            (cmask, cmask_local)
+        }
     };
 
     let layout = AttnLayout::Prefill {
@@ -2974,11 +3155,32 @@ fn emit_prefill_module(
     // caches start as zeros; prefill writes the [0:Lp] block and returns them
     let mut kcache = b.broadcast(&k.zero, &[], vec![c.n_layers, lp, nkv, d]);
     let mut vcache = b.broadcast(&k.zero, &[], vec![c.n_layers, lp, nkv, d]);
+    let mut deepstack_states: Option<Val> = None;
 
     for li in 0..c.n_layers {
         let lw = &a.layers[li];
         // Full transformer layer, shared with the single / ragged graphs.
         x = emit_transformer_layer(&mut b, c, &k, lw, li, &x, &layout, &mut kcache, &mut vcache);
+        if let (Some(schema), PrefillInput::DeepStack(deepstack)) = (&c.deepstack, &a.input) {
+            x = apply_deepstack_after_layer(
+                &mut b,
+                schema,
+                li,
+                &x,
+                &deepstack.visual_positions,
+                &deepstack.layer_features,
+                &deepstack.layer_indices,
+                &deepstack.actual_layer_count,
+                &deepstack.actual_visual_count,
+            );
+            if capture_deepstack_states && schema.target_layer_indices.contains(&li) {
+                let state = b.reshape(&x, vec![1, lp, h]);
+                deepstack_states = Some(match deepstack_states {
+                    Some(previous) => b.concatenate(&previous, &state, 0),
+                    None => state,
+                });
+            }
+        }
     }
 
     // --- tail: final norm (+ LayerNorm bias), take the row at real_len-1, LM head
@@ -3009,21 +3211,32 @@ fn emit_prefill_module(
 
     let sig = render_signature(&decls);
     let cache_ty = Ty::f32(vec![c.n_layers, lp, c.n_kv, c.head_dim]).render();
-    let module_name = match input_kind {
-        PrefillInputKind::Tokens => "prefill",
-        PrefillInputKind::Embeddings => "prefill_embeddings",
+    let module_name = match (input_kind, capture_deepstack_states) {
+        (PrefillInputKind::DeepStack, true) => "prefill_embeddings_deepstack_diagnostics",
+        (PrefillInputKind::Tokens, false) => "prefill",
+        (PrefillInputKind::Embeddings, false) => "prefill_embeddings",
+        (PrefillInputKind::DeepStack, false) => "prefill_embeddings_deepstack",
+        _ => unreachable!("diagnostic capture requires DeepStack"),
     };
-    format!(
-        "module @{module_name} {{\n  func.func public @main({sig}) -> ({out_ty}, {cache_ty}, {cache_ty}) {{\n{body}    return {l}, {kc}, {vc} : {out_ty}, {cache_ty}, {cache_ty}\n  }}\n}}\n",
-        module_name = module_name,
-        sig = sig,
-        out_ty = out_ty,
-        cache_ty = cache_ty,
-        body = b.body(),
-        l = out_val,
-        kc = kcache.name,
-        vc = vcache.name,
-    )
+    if let Some(states) = deepstack_states {
+        let state_ty = states.ty.render();
+        format!(
+            "module @{module_name} {{\n  func.func public @main({sig}) -> ({out_ty}, {cache_ty}, {cache_ty}, {state_ty}) {{\n{body}    return {l}, {kc}, {vc}, {states} : {out_ty}, {cache_ty}, {cache_ty}, {state_ty}\n  }}\n}}\n",
+            body = b.body(),
+            l = out_val,
+            kc = kcache.name,
+            vc = vcache.name,
+            states = states.name,
+        )
+    } else {
+        format!(
+            "module @{module_name} {{\n  func.func public @main({sig}) -> ({out_ty}, {cache_ty}, {cache_ty}) {{\n{body}    return {l}, {kc}, {vc} : {out_ty}, {cache_ty}, {cache_ty}\n  }}\n}}\n",
+            body = b.body(),
+            l = out_val,
+            kc = kcache.name,
+            vc = vcache.name,
+        )
+    }
 }
 
 // ===========================================================================

@@ -58,10 +58,11 @@ use mlxcel_core::session::PreparedPrefill;
 use safetensors::{Dtype, SafeTensors};
 
 use crate::emitter::{
-    Config, Gemma3nConfig, Gemma3nWeightSpec, Precision, QuantConfig, check_packed_supported,
-    emit_decode_ragged_with, emit_decode_with, emit_gemma3n_decode_ragged_with_qmv,
-    emit_gemma3n_decode_with_qmv, emit_gemma3n_prefill_embeddings_ple_with_qmv,
-    emit_gemma3n_prefill_with_qmv, emit_prefill_embeddings_with, emit_prefill_with,
+    Config, DeepStackConfig, Gemma3nConfig, Gemma3nWeightSpec, Precision, QuantConfig,
+    check_packed_supported, emit_decode_ragged_with, emit_decode_with,
+    emit_gemma3n_decode_ragged_with_qmv, emit_gemma3n_decode_with_qmv,
+    emit_gemma3n_prefill_embeddings_ple_with_qmv, emit_gemma3n_prefill_with_qmv,
+    emit_prefill_embeddings_deepstack_with, emit_prefill_embeddings_with, emit_prefill_with,
     gemma3n_qmv_artifact_identity, gemma3n_qmv_is_available, gemma3n_weight_specs, quant_in_graph,
     resolve_precision, resolve_precision_checked,
 };
@@ -71,10 +72,11 @@ use crate::emitter::{
     emit_gemma3n_prefill_diagnostics_with_qmv,
 };
 use crate::prepared::{
-    PreparedIreePrefill, PreparedPositionMode, canonical_text_positions, mrope_decode_coordinate,
+    DecodePositionState, PreparedIreePrefill, PreparedPositionMode, canonical_text_positions,
     validate_slot,
 };
-use crate::{Gemma3nDensePle, Gemma3nPreparedPrefill};
+use crate::prepared_deepstack::PreparedDeepStack;
+use crate::{DeepStackFeatures, DeepStackPreparedPrefill, Gemma3nDensePle, Gemma3nPreparedPrefill};
 // The loader reads the per-architecture checkpoint-weight order from
 // `weights::weight_specs`, which sources its names from `weight_names::scheme_names`
 // (issue #499 naming schemes) and covers the #498 dense pack (LayerNorm / o_proj /
@@ -205,6 +207,7 @@ unsafe extern "C" {
         device: *const c_char,
         prefill: *const c_char,
         prefill_embeddings: *const c_char,
+        prefill_embeddings_deepstack: *const c_char,
         decode: *const c_char,
         prefill_diagnostics: *const c_char,
         compatibility_fingerprint: u64,
@@ -219,6 +222,10 @@ unsafe extern "C" {
         prefill_embeddings_kind: c_int,
         dense_ple_layers: c_int,
         dense_ple_hidden: c_int,
+        model_layers: c_int,
+        deepstack_layers: c_int,
+        deepstack_visual_positions: c_int,
+        deepstack_target_layers: *const c_int,
     ) -> *mut XlaCtx;
     fn xla_llama_prefill(
         c: *mut XlaCtx,
@@ -310,6 +317,36 @@ unsafe extern "C" {
         vocab: c_int,
         out_logits: *mut f32,
     ) -> c_int;
+    fn xla_llama_prefill_embeddings_deepstack(
+        c: *mut XlaCtx,
+        position_mode: c_int,
+        embeddings: *const XlaTensorDesc,
+        positions: *const XlaTensorDesc,
+        attention_bias: *const XlaTensorDesc,
+        visual_positions: *const XlaTensorDesc,
+        layer_features: *const XlaTensorDesc,
+        layer_indices: *const XlaTensorDesc,
+        actual_layer_count: c_int,
+        actual_visual_count: c_int,
+        real_len: c_int,
+        out_token: *mut c_int,
+    ) -> c_int;
+    fn xla_llama_prefill_embeddings_deepstack_slot_logits(
+        c: *mut XlaCtx,
+        slot: c_int,
+        position_mode: c_int,
+        embeddings: *const XlaTensorDesc,
+        positions: *const XlaTensorDesc,
+        attention_bias: *const XlaTensorDesc,
+        visual_positions: *const XlaTensorDesc,
+        layer_features: *const XlaTensorDesc,
+        layer_indices: *const XlaTensorDesc,
+        actual_layer_count: c_int,
+        actual_visual_count: c_int,
+        real_len: c_int,
+        vocab: c_int,
+        out_logits: *mut f32,
+    ) -> c_int;
     fn xla_llama_decode_ragged_logits(
         c: *mut XlaCtx,
         bsz: c_int,
@@ -338,8 +375,8 @@ pub(crate) const RAGGED_B_VALUES: &[usize] = &[4, 8];
 
 #[derive(Clone, Debug)]
 enum RuntimeConfig {
-    Dense(Config),
-    Gemma3n(Gemma3nConfig),
+    Dense(Box<Config>),
+    Gemma3n(Box<Gemma3nConfig>),
 }
 
 fn checked_ffi_int(value: usize, name: &str) -> Result<c_int, String> {
@@ -357,6 +394,9 @@ struct RuntimeFfiDimensions {
     hidden: c_int,
     dense_ple_layers: c_int,
     dense_ple_hidden: c_int,
+    model_layers: c_int,
+    deepstack_layers: c_int,
+    deepstack_visual: c_int,
 }
 
 fn runtime_ffi_dimensions(
@@ -377,6 +417,17 @@ fn runtime_ffi_dimensions(
             dense_ple.map_or(0, |shape| shape[2]),
             "dense_ple_hidden",
         )?,
+        model_layers: checked_ffi_int(cfg.n_layers(), "model_layers")?,
+        deepstack_layers: checked_ffi_int(
+            cfg.deepstack()
+                .map_or(0, |schema| schema.target_layer_indices.len()),
+            "deepstack_layers",
+        )?,
+        deepstack_visual: checked_ffi_int(
+            cfg.deepstack()
+                .map_or(0, |schema| schema.max_visual_positions),
+            "deepstack_visual_positions",
+        )?,
     })
 }
 
@@ -391,11 +442,13 @@ impl RuntimeConfig {
         if matches!(model_type, Some("gemma3n" | "gemma3n_text")) {
             return Gemma3nConfig::from_json_str(&text)
                 .and_then(|config| config.with_context_capacity(context_capacity))
+                .map(Box::new)
                 .map(Self::Gemma3n)
                 .map_err(|error| format!("{}: {error}", path.display()));
         }
         Config::from_json(model_dir)?
             .with_context_capacity(context_capacity)
+            .map(Box::new)
             .map(Self::Dense)
     }
 
@@ -417,6 +470,13 @@ impl RuntimeConfig {
         match self {
             Self::Dense(config) => config.vocab,
             Self::Gemma3n(config) => config.vocab,
+        }
+    }
+
+    fn n_layers(&self) -> usize {
+        match self {
+            Self::Dense(config) => config.n_layers,
+            Self::Gemma3n(config) => config.n_layers,
         }
     }
 
@@ -462,6 +522,13 @@ impl RuntimeConfig {
         match self {
             Self::Dense(config) if config.uses_mrope() => PreparedPositionMode::Mrope3D,
             Self::Dense(_) | Self::Gemma3n(_) => PreparedPositionMode::OneD,
+        }
+    }
+
+    fn deepstack(&self) -> Option<&DeepStackConfig> {
+        match self {
+            Self::Dense(config) => config.deepstack.as_ref(),
+            Self::Gemma3n(_) => None,
         }
     }
 }
@@ -697,10 +764,11 @@ fn compile_one(
     Ok(vmfb_path)
 }
 
-/// Three compatible entry modules loaded atomically into one runtime session.
+/// Compatible entry modules loaded atomically into one runtime session.
 struct CompiledBundle {
     prefill_vmfb: PathBuf,
     prefill_embeddings_vmfb: PathBuf,
+    prefill_embeddings_deepstack_vmfb: Option<PathBuf>,
     decode_vmfb: PathBuf,
     compatibility_fingerprint: u64,
 }
@@ -719,6 +787,7 @@ fn compile_bundle(
     prefill_tag: &str,
     prefill_embeddings_mlir: &str,
     prefill_embeddings_tag: &str,
+    prefill_embeddings_deepstack: Option<(&str, &str)>,
     decode_mlir: &str,
     decode_tag: &str,
 ) -> Result<CompiledBundle, String> {
@@ -751,6 +820,18 @@ fn compile_bundle(
         prefill_embeddings_tag,
         cfg.context_capacity(),
     )?;
+    let pre_embeddings_deepstack = prefill_embeddings_deepstack
+        .map(|(mlir, tag)| {
+            compile_one(
+                &iree_compile,
+                mlir,
+                &flags,
+                &cache,
+                tag,
+                cfg.context_capacity(),
+            )
+        })
+        .transpose()?;
     let dec = compile_one(
         &iree_compile,
         decode_mlir,
@@ -769,11 +850,15 @@ fn compile_bundle(
     }
     prefill_mlir.hash(&mut fingerprint);
     prefill_embeddings_mlir.hash(&mut fingerprint);
+    prefill_embeddings_deepstack
+        .map(|(mlir, _)| mlir)
+        .hash(&mut fingerprint);
     decode_mlir.hash(&mut fingerprint);
     let compatibility_fingerprint = fingerprint.finish();
     Ok(CompiledBundle {
         prefill_vmfb: pre,
         prefill_embeddings_vmfb: pre_embeddings,
+        prefill_embeddings_deepstack_vmfb: pre_embeddings_deepstack,
         decode_vmfb: dec,
         compatibility_fingerprint: compatibility_fingerprint.max(1),
     })
@@ -786,18 +871,23 @@ fn compile_vmfbs(device: &str, cfg: &RuntimeConfig) -> Result<CompiledBundle, St
         RuntimeConfig::Dense(_) => false,
         RuntimeConfig::Gemma3n(config) => gemma3n_native_qmv(device, config)?,
     };
-    let (prefill, prefill_embeddings, decode) = match cfg {
+    let (prefill, prefill_embeddings, prefill_embeddings_deepstack, decode) = match cfg {
         RuntimeConfig::Dense(config) => {
             check_packed_supported(device, quant_in_graph() && config.supports_packed_quant())?;
             (
                 emit_prefill_with(config, true, precision),
                 emit_prefill_embeddings_with(config, true, precision),
+                config
+                    .deepstack
+                    .as_ref()
+                    .map(|_| emit_prefill_embeddings_deepstack_with(config, true, precision)),
                 emit_decode_with(config, true, precision),
             )
         }
         RuntimeConfig::Gemma3n(config) => (
             emit_gemma3n_prefill_with_qmv(config, true, precision, native_qmv),
             emit_gemma3n_prefill_embeddings_ple_with_qmv(config, true, precision, native_qmv),
+            None,
             emit_gemma3n_decode_with_qmv(config, true, precision, native_qmv),
         ),
     };
@@ -809,6 +899,9 @@ fn compile_vmfbs(device: &str, cfg: &RuntimeConfig) -> Result<CompiledBundle, St
         "prefill",
         &prefill_embeddings,
         "prefill_embeddings",
+        prefill_embeddings_deepstack
+            .as_deref()
+            .map(|mlir| (mlir, "prefill_embeddings_deepstack")),
         &decode,
         "decode",
     )
@@ -1081,7 +1174,7 @@ mod checkpoint_name_tests {
     use super::*;
 
     fn tiny_gemma3n_runtime() -> RuntimeConfig {
-        RuntimeConfig::Gemma3n(
+        RuntimeConfig::Gemma3n(Box::new(
             Gemma3nConfig::from_json_str(
                 &serde_json::json!({
                     "model_type": "gemma3n_text",
@@ -1105,7 +1198,7 @@ mod checkpoint_name_tests {
             .unwrap()
             .with_context_capacity(4)
             .unwrap(),
-        )
+        ))
     }
 
     #[test]
@@ -1505,6 +1598,23 @@ fn dense_ple_descriptor(dense_ple: &Gemma3nDensePle) -> Result<XlaTensorDesc, St
     XlaTensorDesc::f32(dense_ple.as_slice(), &dense_ple.shape())
 }
 
+fn deepstack_descriptors(
+    deepstack: &PreparedDeepStack,
+) -> Result<(XlaTensorDesc, XlaTensorDesc, XlaTensorDesc), String> {
+    Ok((
+        XlaTensorDesc::i32(&deepstack.visual_positions, &[deepstack.max_visual_count])?,
+        XlaTensorDesc::f32(
+            &deepstack.layer_features,
+            &[
+                deepstack.max_layer_count,
+                deepstack.max_visual_count,
+                deepstack.hidden_size,
+            ],
+        )?,
+        XlaTensorDesc::i32(&deepstack.layer_indices, &[deepstack.max_layer_count])?,
+    ))
+}
+
 /// Load the weights and create the C execution context for a (prefill, decode)
 /// vmfb pair on `device`. Shared by the single-sequence ([`IreeLlama`]) and ragged
 /// ([`IreeRaggedLlama`]) engines, which differ only in which decode vmfb they pass.
@@ -1537,8 +1647,24 @@ fn create_ctx_with_diagnostics(
     let c_dev = CString::new(device).map_err(|_| "device has interior nul".to_string())?;
     let c_pre = path_cstring(&bundle.prefill_vmfb)?;
     let c_pre_embeddings = path_cstring(&bundle.prefill_embeddings_vmfb)?;
+    let c_pre_embeddings_deepstack = bundle
+        .prefill_embeddings_deepstack_vmfb
+        .as_deref()
+        .map(path_cstring)
+        .transpose()?;
     let c_dec = path_cstring(&bundle.decode_vmfb)?;
     let c_diagnostics = prefill_diagnostics_vmfb.map(path_cstring).transpose()?;
+    let deepstack_target_layers = cfg
+        .deepstack()
+        .map(|schema| {
+            schema
+                .target_layer_indices
+                .iter()
+                .map(|&layer| checked_ffi_int(layer, "deepstack target layer"))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
     // Safety: pointers are valid for the duration of the call; the shim copies
     // the weight data into device buffers before returning.
     let ctx = unsafe {
@@ -1546,6 +1672,9 @@ fn create_ctx_with_diagnostics(
             c_dev.as_ptr(),
             c_pre.as_ptr(),
             c_pre_embeddings.as_ptr(),
+            c_pre_embeddings_deepstack
+                .as_ref()
+                .map_or(std::ptr::null(), |path| path.as_ptr()),
             c_dec.as_ptr(),
             c_diagnostics
                 .as_ref()
@@ -1562,6 +1691,14 @@ fn create_ctx_with_diagnostics(
             i32::from(cfg.dense_ple_shape().is_some()),
             ffi.dense_ple_layers,
             ffi.dense_ple_hidden,
+            ffi.model_layers,
+            ffi.deepstack_layers,
+            ffi.deepstack_visual,
+            if deepstack_target_layers.is_empty() {
+                std::ptr::null()
+            } else {
+                deepstack_target_layers.as_ptr()
+            },
         )
     };
     // Weights are resident on the device now; free the host copy.
@@ -1584,7 +1721,8 @@ pub struct IreeLlama {
     hidden_size: usize,
     dense_ple_shape: Option<[usize; 3]>,
     position_mode: PreparedPositionMode,
-    rope_delta: i32,
+    decode_position: DecodePositionState,
+    deepstack_schema: Option<DeepStackConfig>,
 }
 
 impl IreeLlama {
@@ -1602,7 +1740,8 @@ impl IreeLlama {
             hidden_size: cfg.hidden(),
             dense_ple_shape: cfg.dense_ple_shape(),
             position_mode: cfg.position_mode(),
-            rope_delta: 0,
+            decode_position: DecodePositionState::default(),
+            deepstack_schema: cfg.deepstack().cloned(),
         })
     }
 
@@ -1667,11 +1806,69 @@ impl IreeLlama {
                 &mut out,
             )
         };
-        if rc != 0 {
-            return Err(format!("xla_llama_prefill_embeddings failed (status {rc})"));
-        }
-        self.rope_delta = rope_delta;
-        Ok(out)
+        let result = if rc == 0 {
+            Ok(out)
+        } else {
+            Err(format!("xla_llama_prefill_embeddings failed (status {rc})"))
+        };
+        self.decode_position.complete_prefill(rope_delta, result)
+    }
+
+    /// Seed KV through the distinct sparse DeepStack embeddings entry.
+    pub fn prefill_deepstack_prepared_first(
+        &mut self,
+        request: &DeepStackPreparedPrefill,
+    ) -> Result<i32, String> {
+        let schema = self.deepstack_schema.as_ref().ok_or_else(|| {
+            "DeepStack prefill was requested from a runtime bundle without that capability"
+                .to_string()
+        })?;
+        let prepared = PreparedIreePrefill::prepare_for_mode(
+            request.prepared(),
+            self.hidden_size,
+            self.context_capacity,
+            self.position_mode,
+        )
+        .map_err(|error| error.to_string())?;
+        let rope_delta = prepared.positions.rope_delta();
+        let deepstack = PreparedDeepStack::prepare(request.deepstack(), schema, self.hidden_size)
+            .map_err(|error| error.to_string())?;
+        let (embeddings, positions, attention_bias) = prepared_descriptors(&prepared)?;
+        let (visual_positions, layer_features, layer_indices) = deepstack_descriptors(&deepstack)?;
+        let actual_layer_count =
+            checked_ffi_int(deepstack.actual_layer_count, "DeepStack actual layer count")?;
+        let actual_visual_count = checked_ffi_int(
+            deepstack.actual_visual_count,
+            "DeepStack actual visual count",
+        )?;
+        let real_len = checked_ffi_int(prepared.effective_len, "prepared effective length")?;
+        let mut out = 0i32;
+        // Safety: all descriptors reference validated owned buffers that outlive
+        // the call. The C shim repeats descriptor, value, and bound checks.
+        let rc = unsafe {
+            xla_llama_prefill_embeddings_deepstack(
+                self.ctx,
+                prepared.positions.mode().ffi_code(),
+                &embeddings,
+                &positions,
+                &attention_bias,
+                &visual_positions,
+                &layer_features,
+                &layer_indices,
+                actual_layer_count,
+                actual_visual_count,
+                real_len,
+                &mut out,
+            )
+        };
+        let result = if rc == 0 {
+            Ok(out)
+        } else {
+            Err(format!(
+                "xla_llama_prefill_embeddings_deepstack failed (status {rc})"
+            ))
+        };
+        self.decode_position.complete_prefill(rope_delta, result)
     }
 
     /// Seed Gemma3n KV from post-scale merged embeddings plus a canonical dense
@@ -1714,13 +1911,14 @@ impl IreeLlama {
                 &mut out,
             )
         };
-        if rc != 0 {
-            return Err(format!(
+        let result = if rc == 0 {
+            Ok(out)
+        } else {
+            Err(format!(
                 "xla_llama_prefill_embeddings_ple failed (status {rc})"
-            ));
-        }
-        self.rope_delta = 0;
-        Ok(out)
+            ))
+        };
+        self.decode_position.complete_prefill(0, result)
     }
 
     /// Pad `prompt` into the configured static bucket, run the prefill, and return its
@@ -1752,11 +1950,12 @@ impl IreeLlama {
                 &mut out,
             )
         };
-        if rc != 0 {
-            return Err(format!("xla_llama_prefill failed (status {rc})"));
-        }
-        self.rope_delta = 0;
-        Ok(out)
+        let result = if rc == 0 {
+            Ok(out)
+        } else {
+            Err(format!("xla_llama_prefill failed (status {rc})"))
+        };
+        self.decode_position.complete_prefill(0, result)
     }
 
     /// Advance one token at `cache_len` (== position), returning the next token
@@ -1775,7 +1974,9 @@ impl IreeLlama {
                 unsafe { xla_llama_decode(self.ctx, token, cache_len, cache_len, &mut out) }
             }
             PreparedPositionMode::Mrope3D => {
-                let coordinate = mrope_decode_coordinate(cache_len, self.rope_delta)
+                let coordinate = self
+                    .decode_position
+                    .mrope_coordinate(cache_len)
                     .map_err(|error| error.to_string())?;
                 let positions = [coordinate; 3];
                 // Safety: positions is exactly the explicit rank-1 `[3]` ABI payload.
@@ -1821,6 +2022,7 @@ pub struct IreeRaggedLlama {
     hidden_size: usize,
     dense_ple_shape: Option<[usize; 3]>,
     position_mode: PreparedPositionMode,
+    deepstack_schema: Option<DeepStackConfig>,
     #[cfg(feature = "diagnostics")]
     diagnostic_layout: Option<Gemma3nDiagnosticLayout>,
 }
@@ -1885,21 +2087,33 @@ impl IreeRaggedLlama {
             RuntimeConfig::Dense(_) => false,
             RuntimeConfig::Gemma3n(config) => gemma3n_native_qmv(device, config)?,
         };
-        let (prefill_mlir, prefill_embeddings_mlir, decode_mlir) = match &cfg {
-            RuntimeConfig::Dense(config) => {
-                check_packed_supported(device, quant_in_graph() && config.supports_packed_quant())?;
-                (
-                    emit_prefill_with(config, false, precision),
-                    emit_prefill_embeddings_with(config, false, precision),
-                    emit_decode_ragged_with(config, b_max, false, precision),
-                )
-            }
-            RuntimeConfig::Gemma3n(config) => (
-                emit_gemma3n_prefill_with_qmv(config, false, precision, native_qmv),
-                emit_gemma3n_prefill_embeddings_ple_with_qmv(config, false, precision, native_qmv),
-                emit_gemma3n_decode_ragged_with_qmv(config, b_max, false, precision, native_qmv),
-            ),
-        };
+        let (prefill_mlir, prefill_embeddings_mlir, prefill_embeddings_deepstack_mlir, decode_mlir) =
+            match &cfg {
+                RuntimeConfig::Dense(config) => {
+                    check_packed_supported(
+                        device,
+                        quant_in_graph() && config.supports_packed_quant(),
+                    )?;
+                    (
+                        emit_prefill_with(config, false, precision),
+                        emit_prefill_embeddings_with(config, false, precision),
+                        config.deepstack.as_ref().map(|_| {
+                            emit_prefill_embeddings_deepstack_with(config, false, precision)
+                        }),
+                        emit_decode_ragged_with(config, b_max, false, precision),
+                    )
+                }
+                RuntimeConfig::Gemma3n(config) => (
+                    emit_gemma3n_prefill_with_qmv(config, false, precision, native_qmv),
+                    emit_gemma3n_prefill_embeddings_ple_with_qmv(
+                        config, false, precision, native_qmv,
+                    ),
+                    None,
+                    emit_gemma3n_decode_ragged_with_qmv(
+                        config, b_max, false, precision, native_qmv,
+                    ),
+                ),
+            };
         let bundle = compile_bundle(
             device,
             &cfg,
@@ -1908,6 +2122,9 @@ impl IreeRaggedLlama {
             "prefill_logits",
             &prefill_embeddings_mlir,
             "prefill_embeddings_logits",
+            prefill_embeddings_deepstack_mlir
+                .as_deref()
+                .map(|mlir| (mlir, "prefill_embeddings_deepstack_logits")),
             &decode_mlir,
             &format!("decode_ragged_logits_b{b_max}"),
         )?;
@@ -1945,6 +2162,7 @@ impl IreeRaggedLlama {
             hidden_size: cfg.hidden(),
             dense_ple_shape: cfg.dense_ple_shape(),
             position_mode: cfg.position_mode(),
+            deepstack_schema: cfg.deepstack().cloned(),
             #[cfg(feature = "diagnostics")]
             diagnostic_layout,
         })
@@ -1977,6 +2195,18 @@ impl IreeRaggedLlama {
 
     pub(crate) const fn position_mode(&self) -> PreparedPositionMode {
         self.position_mode
+    }
+
+    pub(crate) fn prepare_deepstack(
+        &self,
+        features: &DeepStackFeatures,
+    ) -> Result<PreparedDeepStack, String> {
+        let schema = self.deepstack_schema.as_ref().ok_or_else(|| {
+            "DeepStack prefill was requested from a runtime bundle without that capability"
+                .to_string()
+        })?;
+        PreparedDeepStack::prepare(features, schema, self.hidden_size)
+            .map_err(|error| error.to_string())
     }
 
     pub fn validate_gemma3n_dense_ple(&self, dense_ple: &Gemma3nDensePle) -> Result<(), String> {
@@ -2143,6 +2373,71 @@ impl IreeRaggedLlama {
         if rc != 0 {
             return Err(format!(
                 "xla_llama_prefill_embeddings_slot_logits failed (status {rc})"
+            ));
+        }
+        Ok(logits)
+    }
+
+    /// Seed one batch slot through the sparse DeepStack prefill entry.
+    pub fn prefill_deepstack_prepared_slot_logits(
+        &mut self,
+        slot: usize,
+        prepared: &PreparedIreePrefill,
+        deepstack: &PreparedDeepStack,
+    ) -> Result<Vec<f32>, String> {
+        let schema = self.deepstack_schema.as_ref().ok_or_else(|| {
+            "DeepStack prefill was requested from a runtime bundle without that capability"
+                .to_string()
+        })?;
+        validate_slot(slot, self.b_max).map_err(|error| error.to_string())?;
+        if prepared.hidden_size != self.hidden_size
+            || prepared.context_capacity != self.context_capacity
+            || prepared.effective_len == 0
+            || prepared.effective_len > self.context_capacity
+            || prepared.positions.mode() != self.position_mode
+            || deepstack.hidden_size != self.hidden_size
+            || deepstack.max_layer_count != schema.target_layer_indices.len()
+            || deepstack.max_visual_count != schema.max_visual_positions
+        {
+            return Err(
+                "DeepStack prepared payload is incompatible with this runtime bundle".to_string(),
+            );
+        }
+        let (embeddings, positions, attention_bias) = prepared_descriptors(prepared)?;
+        let (visual_positions, layer_features, layer_indices) = deepstack_descriptors(deepstack)?;
+        let slot = checked_ffi_int(slot, "slot")?;
+        let actual_layer_count =
+            checked_ffi_int(deepstack.actual_layer_count, "DeepStack actual layer count")?;
+        let actual_visual_count = checked_ffi_int(
+            deepstack.actual_visual_count,
+            "DeepStack actual visual count",
+        )?;
+        let real_len = checked_ffi_int(prepared.effective_len, "prepared effective length")?;
+        let vocab = checked_ffi_int(self.vocab, "vocab_size")?;
+        let mut logits = vec![0.0; self.vocab];
+        // Safety: descriptors and output remain live for the call; the C shim
+        // repeats all descriptor and compact-index checks before device upload.
+        let rc = unsafe {
+            xla_llama_prefill_embeddings_deepstack_slot_logits(
+                self.ctx,
+                slot,
+                prepared.positions.mode().ffi_code(),
+                &embeddings,
+                &positions,
+                &attention_bias,
+                &visual_positions,
+                &layer_features,
+                &layer_indices,
+                actual_layer_count,
+                actual_visual_count,
+                real_len,
+                vocab,
+                logits.as_mut_ptr(),
+            )
+        };
+        if rc != 0 {
+            return Err(format!(
+                "xla_llama_prefill_embeddings_deepstack_slot_logits failed (status {rc})"
             ));
         }
         Ok(logits)
