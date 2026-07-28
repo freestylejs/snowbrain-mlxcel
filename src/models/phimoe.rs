@@ -507,22 +507,34 @@ impl PhiMoeModel {
                     );
 
                     if weights.contains_key(&first_key) {
-                        let mut expert_arrays: Vec<UniquePtr<MlxArray>> = Vec::new();
+                        // Borrowed pointers, not copies (issue #948). The
+                        // intermediate `mlxcel_core::copy` produced a `Copy`
+                        // graph node per expert tensor that the following
+                        // `mx::stack` then consumed, and nothing else used, so
+                        // it was pure indirection. It was NOT redundant memory
+                        // traffic: `Copy::eval` is
+                        // `out.copy_shared_buffer(inputs[0])`, which aliases the
+                        // input buffer rather than materializing it. See the
+                        // longer note in `switch_layers.rs`. `weights` is only
+                        // read and is not mutated while the pointers are live;
+                        // the stacked result goes into the separate
+                        // `new_weights` map and keeps its inputs alive on its
+                        // own, because the C++ `stack` shim copies each
+                        // refcounted `mx::array` handle into its own vector.
+                        let mut expert_ptrs: Vec<*const MlxArray> = Vec::new();
                         for e in 0..args.num_local_experts {
                             let key = format!(
                                 "{}.block_sparse_moe.experts.{}.{}.{}",
                                 prefix, e, orig_name, weight_type
                             );
                             if let Some(w) = weights.get(&key) {
-                                expert_arrays.push(mlxcel_core::copy(w));
+                                expert_ptrs
+                                    .push(w.as_ref().expect("weight map holds no null handles")
+                                        as *const MlxArray);
                             }
                         }
 
-                        if !expert_arrays.is_empty() {
-                            let expert_ptrs: Vec<*const MlxArray> = expert_arrays
-                                .iter()
-                                .map(|a| a.as_ref().unwrap() as *const _)
-                                .collect();
+                        if !expert_ptrs.is_empty() {
                             let stacked = mlxcel_core::stack(&expert_ptrs, 0);
                             let new_key = format!(
                                 "{}.block_sparse_moe.switch_mlp.{}.{}",
@@ -605,5 +617,89 @@ impl LanguageModel for PhiMoeModel {
     fn eos_token_ids(&self) -> Vec<i32> {
         // PhiMoE EOS token (commonly <|endoftext|> = 32000)
         vec![32000]
+    }
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::*;
+
+    /// Per-expert stacking builds its `stack` inputs from pointers borrowed out
+    /// of the source `WeightMap` rather than from `mlxcel_core::copy` results
+    /// (issue #948). Drop the source map before evaluating anything, so a stack
+    /// that held a borrow instead of a refcounted handle reads freed memory
+    /// rather than failing an assertion. Inline rather than in
+    /// `phimoe_tests.rs`, which is a sibling module and cannot reach the private
+    /// `sanitize_weights`; this mirrors how `deepseek_v3.rs` tests its own.
+    #[test]
+    fn stacked_experts_outlive_the_weight_map_they_were_borrowed_from() {
+        let args: ModelArgs = serde_json::from_str(
+            r#"{
+                "model_type": "phimoe",
+                "num_hidden_layers": 1,
+                "num_local_experts": 2,
+                "num_experts_per_tok": 2
+            }"#,
+        )
+        .expect("tiny config parses");
+
+        // w1 -> gate_proj, w3 -> up_proj, w2 -> down_proj.
+        let mut weights = WeightMap::new();
+        for e in 0..2 {
+            let base = (e + 1) as f32;
+            for (leaf, bump) in [("w1", 0.0), ("w2", 10.0), ("w3", 20.0)] {
+                weights.insert(
+                    format!("model.layers.0.block_sparse_moe.experts.{e}.{leaf}.weight"),
+                    mlxcel_core::from_slice_f32(
+                        &[
+                            base + bump,
+                            base + bump + 0.5,
+                            base + bump,
+                            base + bump + 0.5,
+                        ],
+                        &[2, 2],
+                    ),
+                );
+            }
+        }
+        // A non-expert weight, to pin that the passthrough branch still runs.
+        weights.insert(
+            "model.norm.weight".into(),
+            mlxcel_core::from_slice_f32(&[1.0, 1.0], &[2]),
+        );
+
+        let stacked = PhiMoeModel::sanitize_weights(&weights, &args).expect("stacking succeeds");
+        drop(weights);
+
+        for (proj, bump) in [("gate_proj", 0.0), ("down_proj", 10.0), ("up_proj", 20.0)] {
+            let key = format!("model.layers.0.block_sparse_moe.switch_mlp.{proj}.weight");
+            let tensor = stacked.get(&key).unwrap_or_else(|| panic!("missing {key}"));
+            mlxcel_core::eval(tensor);
+            assert_eq!(
+                mlxcel_core::array_shape(tensor),
+                vec![2, 2, 2],
+                "{key} must stack both experts"
+            );
+            for e in 0..2i32 {
+                let first = mlxcel_core::slice(tensor, &[e, 0, 0], &[e + 1, 1, 1]);
+                mlxcel_core::eval(&first);
+                assert_eq!(
+                    mlxcel_core::item_f32(&first),
+                    (e + 1) as f32 + bump,
+                    "{key} expert {e} landed at the wrong plane or read freed memory"
+                );
+            }
+        }
+
+        assert!(
+            stacked.contains_key("model.norm.weight"),
+            "non-expert weights must still be carried over"
+        );
+        assert!(
+            !stacked
+                .keys()
+                .any(|k| k.contains("block_sparse_moe.experts.")),
+            "the per-expert keys must not survive stacking"
+        );
     }
 }
