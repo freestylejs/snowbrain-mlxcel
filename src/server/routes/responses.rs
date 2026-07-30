@@ -62,6 +62,7 @@ use super::chat::{
     build_generate_options, build_prompt_cache_request_context, parse_priority_header,
     validate_xtc_params,
 };
+use crate::server::request_options::chat_carries_loop_amplifier;
 
 /// POST /v1/responses
 pub async fn create_response(
@@ -215,7 +216,14 @@ async fn non_stream_create_response(
             return ErrorResponse::new(err.to_string(), "invalid_request_error").into_response();
         }
     };
-    let mut options = build_generate_options(&translated.chat_request.params, &state.config);
+    // Loop-detection amplifier signal (issue #967): the Responses translator maps
+    // `tools` onto `chat_request.tools`, `tool_choice` onto
+    // `chat_request.tool_choice`, and `text.format` onto
+    // `chat_request.response_format`; `structured` is the constraint compiled from
+    // the last of those.
+    let amplified = chat_carries_loop_amplifier(&translated.chat_request, structured.is_some());
+    let mut options =
+        build_generate_options(&translated.chat_request.params, &state.config, amplified);
     options.priority = priority;
     // per-request Gemma 4 image soft-token budget, resolved and validated from
     // the translated `image_url` content parts. `None` when unset.
@@ -329,7 +337,14 @@ async fn stream_create_response(
             return ErrorResponse::new(err.to_string(), "invalid_request_error").into_response();
         }
     };
-    let mut options = build_generate_options(&translated.chat_request.params, &state.config);
+    // Loop-detection amplifier signal (issue #967): the Responses translator maps
+    // `tools` onto `chat_request.tools`, `tool_choice` onto
+    // `chat_request.tool_choice`, and `text.format` onto
+    // `chat_request.response_format`; `structured` is the constraint compiled from
+    // the last of those.
+    let amplified = chat_carries_loop_amplifier(&translated.chat_request, structured.is_some());
+    let mut options =
+        build_generate_options(&translated.chat_request.params, &state.config, amplified);
     options.priority = priority;
     // per-request Gemma 4 image soft-token budget, resolved and validated from
     // the translated `image_url` content parts. `None` when unset.

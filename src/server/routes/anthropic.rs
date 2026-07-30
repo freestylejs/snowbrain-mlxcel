@@ -60,6 +60,7 @@ use crate::server::types::anthropic_stream::{
 use super::chat::{
     MAX_TOOLS, build_generate_options, build_prompt_cache_request_context, parse_priority_header,
 };
+use crate::server::request_options::chat_carries_loop_amplifier;
 
 /// POST /v1/messages
 pub async fn anthropic_messages(
@@ -175,7 +176,15 @@ async fn non_stream_messages(
         Err(err) => return AnthropicErrorResponse::bad_request(err.to_string()).into_response(),
     };
 
-    let mut options = build_generate_options(&translated.chat_request.params, &state.config);
+    // Loop-detection amplifier signal (issue #967): the Anthropic Messages
+    // surface has no `response_format` (the translator always sets it to `None`)
+    // and this route compiles no grammar constraint, so only the translated tool
+    // declarations can turn the Gemma 4 family default-on on. The translator also
+    // maps `tool_choice`, so an Anthropic `tool_choice: {"type": "none"}` lands as
+    // `Mode("none")` and `effective_tools` drops the declarations here too.
+    let amplified = chat_carries_loop_amplifier(&translated.chat_request, false);
+    let mut options =
+        build_generate_options(&translated.chat_request.params, &state.config, amplified);
     options.priority = priority;
     // per-request Gemma 4 image soft-token budget, resolved and validated from
     // the translated `image_url` content parts. `None` when unset.
@@ -297,7 +306,15 @@ async fn stream_messages(
         Err(err) => return AnthropicErrorResponse::bad_request(err.to_string()).into_response(),
     };
 
-    let mut options = build_generate_options(&translated.chat_request.params, &state.config);
+    // Loop-detection amplifier signal (issue #967): the Anthropic Messages
+    // surface has no `response_format` (the translator always sets it to `None`)
+    // and this route compiles no grammar constraint, so only the translated tool
+    // declarations can turn the Gemma 4 family default-on on. The translator also
+    // maps `tool_choice`, so an Anthropic `tool_choice: {"type": "none"}` lands as
+    // `Mode("none")` and `effective_tools` drops the declarations here too.
+    let amplified = chat_carries_loop_amplifier(&translated.chat_request, false);
+    let mut options =
+        build_generate_options(&translated.chat_request.params, &state.config, amplified);
     options.priority = priority;
     // per-request Gemma 4 image soft-token budget, resolved and validated from
     // the translated `image_url` content parts. `None` when unset.

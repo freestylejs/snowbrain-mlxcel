@@ -664,7 +664,20 @@ async fn route_chat(state: Arc<RouterState>, request: ChatCompletionRequest) -> 
 
     // Resolve sampling and token budget using the same defaults as the
     // model worker.
-    let opts = super::routes::chat::build_generate_options(&request.params, &state.config);
+    //
+    // Loop-detection amplifier signal (issue #967): the same derivation as the
+    // single-node chat route, so the computed value matches it. The router never
+    // compiles a grammar constraint (the PrefillRequestFrame cannot carry one),
+    // so the grammar half is always false.
+    //
+    // This value is currently inert on this path: `sampling_to_serializable`
+    // does not put `loop_detection` on the wire and
+    // `serving_protocol::sampling_from_serializable` hardcodes the disabled
+    // baseline, so the decode node never runs the detector. It is computed
+    // anyway so the front is correct the day the field is serialized.
+    let amplified = crate::server::request_options::chat_carries_loop_amplifier(&request, false);
+    let opts =
+        super::routes::chat::build_generate_options(&request.params, &state.config, amplified);
 
     // Assign a request id and dispatch the prefill request through the shared
     // tokenize -> select_prefill -> send body (issue #200). The chat id scheme
@@ -940,7 +953,11 @@ async fn route_completion(state: Arc<RouterState>, request: CompletionRequest) -
 
     let prompt = request.prompt.clone();
     // Same default/override resolution as the single-node completion route.
-    let opts = super::routes::chat::build_generate_options(&request.params, &state.config);
+    //
+    // Loop-detection amplifier signal (issue #967): `CompletionRequest` has no
+    // `tools` field and the `response_format` guard above already rejected any
+    // structured-output request with a 400, so neither amplifier can be present.
+    let opts = super::routes::chat::build_generate_options(&request.params, &state.config, false);
 
     // Assign a request id and dispatch the prefill request through the shared
     // tokenize -> select_prefill -> send body. The completion id format
