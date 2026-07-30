@@ -643,6 +643,279 @@ fn fused_qk_norm_enabled_from(value: Option<&str>) -> bool {
     }
 }
 
+// ── Fused residual-add + RMSNorm (issue #905) ────────────────────────────────
+
+/// Default for the fused residual-add + RMSNorm decode path.
+///
+/// **This is the one place to flip if the measurement does not justify the
+/// fusion.** `MLXCEL_FUSED_ADD_RMSNORM=0` disables it at runtime without a
+/// rebuild; setting this constant to `false` makes off the default and
+/// `MLXCEL_FUSED_ADD_RMSNORM=1` the opt-in.
+///
+/// Default-OFF: measured, and the measurement did not justify wiring it on.
+///
+/// Op-level microbench on Apple M1 Ultra (Metal, f16, hidden {2048, 4096,
+/// 8192} x batch {1, 4, 8}, three repetitions) put the fused path at roughly
+/// parity with the graph it replaces: per-cell speedups scattered between
+/// 0.77x and 1.14x with no structure, and the extreme values did not
+/// reproduce (the 0.77x cell re-measured at 1.02x and 1.03x). The harness
+/// cannot resolve these ops on this host, because per-iteration time stays
+/// pinned near 280-410us across a 4x change in hidden size, so fixed dispatch
+/// and synchronization cost dominates whatever the kernel saves.
+///
+/// Issue #905's measure-then-keep policy says a fusion lands unwired unless
+/// the microbench shows a win, so the kernel ships available but off, matching
+/// how `MLXCEL_FUSED_QK_NORM` (#326) shipped after the same outcome. Set
+/// `MLXCEL_FUSED_ADD_RMSNORM=1` to opt in. Flip this constant to `true` if a
+/// quiet host, a harness that amortizes dispatch cost, or another backend
+/// demonstrates a win. See
+/// `docs/benchmark_results/fused-norm-rope-m1ultra-2026-07-31.md`.
+pub(crate) const FUSED_ADD_RMSNORM_DEFAULT: bool = false;
+
+/// Default for the fused q/k RoPE + KV-append-layout decode path. Same
+/// flip-here contract and the same measured outcome as
+/// [`FUSED_ADD_RMSNORM_DEFAULT`], so it also ships opt-in via
+/// `MLXCEL_FUSED_ROPE_APPEND=1`.
+///
+/// One cell was consistently below parity rather than merely noisy: hidden
+/// 8192 at batch 1 measured 0.94x, 0.90x and 0.89x across three repetitions.
+/// That is the single reproducible signal in the sweep and it points the wrong
+/// way, which is the stronger reason to leave this unwired until a backend or
+/// shape is found where it wins.
+pub(crate) const FUSED_ROPE_APPEND_DEFAULT: bool = false;
+
+/// Whether the fused residual-add + RMSNorm path (#905) is enabled.
+///
+/// Read once at first call and cached for the process lifetime: reading the
+/// environment per decode step would put a `getenv` on the hot path, and the
+/// switch is not meant to change mid-run.
+///
+/// Greedy temp-0 output is not guaranteed byte-identical to the unfused path
+/// over long generation. The two differ only by the rounding of the residual
+/// sum feeding the sum of squares (see `fused_norm.cpp`), which is far below
+/// the argmax-flip scale, but a near-tie argmax can still land on the other
+/// side. That is a tie-break difference, not a regression.
+pub fn fused_add_rmsnorm_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        fused_add_rmsnorm_enabled_from(std::env::var("MLXCEL_FUSED_ADD_RMSNORM").ok().as_deref())
+    })
+}
+
+/// Whether the fused q/k RoPE + KV-append-layout path (#905) is enabled.
+///
+/// Same caching and tie-break caveats as [`fused_add_rmsnorm_enabled`].
+pub fn fused_rope_append_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        fused_rope_append_enabled_from(std::env::var("MLXCEL_FUSED_ROPE_APPEND").ok().as_deref())
+    })
+}
+
+/// Pure decision behind the two #905 kill switches, split out for unit testing
+/// without touching process-global env state.
+///
+/// `None` (unset) takes `default`; an explicit `0`/`false`/`off`/`no` is off and
+/// `1`/`true`/`on`/`yes` is on (case-insensitive, trimmed). An unrecognised
+/// value takes `default` rather than silently disabling: a typo in a deployment
+/// script should not quietly change the decode graph.
+fn fused_flag_enabled_from(value: Option<&str>, default: bool) -> bool {
+    match value {
+        Some(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "0" | "false" | "off" | "no" => false,
+            "1" | "true" | "on" | "yes" => true,
+            _ => default,
+        },
+        None => default,
+    }
+}
+
+fn fused_add_rmsnorm_enabled_from(value: Option<&str>) -> bool {
+    fused_flag_enabled_from(value, FUSED_ADD_RMSNORM_DEFAULT)
+}
+
+fn fused_rope_append_enabled_from(value: Option<&str>) -> bool {
+    fused_flag_enabled_from(value, FUSED_ROPE_APPEND_DEFAULT)
+}
+
+/// An RMSNorm as the fused residual-add kernel needs to see it.
+///
+/// The fused kernel folds the Gemma `(1 + w)` offset itself, from the raw
+/// weight plus a scalar bias, so it needs the *unadjusted* weight. The graph
+/// fallback cannot do that without paying an extra `add` per call, so it needs
+/// the *adjusted* weight the norm already keeps. Both are exposed rather than
+/// deriving one from the other at call time.
+///
+/// - [`RMSNorm`]: raw and effective weights are the same tensor, bias `0.0`.
+/// - [`GemmaRMSNorm`]: effective weight is the precomputed `(1 + w)`, bias
+///   `1.0`. Folding `1.0` into the raw weight inside the kernel happens in the
+///   weight's own dtype, which is exactly how `GemmaRMSNorm::new` builds
+///   `adjusted_weight`, so the two agree bit-for-bit.
+///
+/// Used by: [`fused_add_rms_norm`], reached from the Llama3-family and Gemma
+/// transformer blocks.
+pub trait FusedAddRmsNormSpec {
+    /// The checkpoint's RMSNorm weight, with no `(1 + w)` adjustment applied.
+    fn raw_norm_weight(&self) -> &MlxArray;
+    /// The weight to hand a plain `fast_rms_norm`, already `(1 + w)` for Gemma.
+    fn effective_norm_weight(&self) -> &MlxArray;
+    /// `0.0` for a standard RMSNorm, `1.0` for the Gemma convention.
+    fn norm_weight_bias(&self) -> f32;
+    /// RMS normalization epsilon.
+    fn norm_eps(&self) -> f32;
+}
+
+impl FusedAddRmsNormSpec for RMSNorm {
+    fn raw_norm_weight(&self) -> &MlxArray {
+        &self.weight
+    }
+    fn effective_norm_weight(&self) -> &MlxArray {
+        &self.weight
+    }
+    fn norm_weight_bias(&self) -> f32 {
+        0.0
+    }
+    fn norm_eps(&self) -> f32 {
+        self.eps
+    }
+}
+
+impl FusedAddRmsNormSpec for GemmaRMSNorm {
+    fn raw_norm_weight(&self) -> &MlxArray {
+        &self.weight
+    }
+    fn effective_norm_weight(&self) -> &MlxArray {
+        self.adjusted_weight()
+    }
+    fn norm_weight_bias(&self) -> f32 {
+        1.0
+    }
+    fn norm_eps(&self) -> f32 {
+        self.eps
+    }
+}
+
+/// Residual join of a pre-norm transformer block: `new_residual = residual +
+/// delta`, `normed = rms_norm(new_residual) * effective_weight`.
+///
+/// Returns `(normed, new_residual)`. Callers keep `new_residual` as the
+/// residual stream for the next join and feed `normed` to the sublayer.
+///
+/// Routes through the fused kernel (#905) when it is enabled, the backend has
+/// one, and the shapes are eligible; otherwise it builds the same two-op graph
+/// the blocks used before. `MLXCEL_FUSED_ADD_RMSNORM=0` forces the graph path,
+/// which is what the parity tests use as their reference.
+///
+/// Floating-point addition is commutative, so `delta` and `residual` may be
+/// passed in either order; the names describe intent, not an asymmetry.
+///
+/// Used by: Llama3 / Qwen2-family `TransformerBlock`, Gemma `TransformerBlock`.
+pub fn fused_add_rms_norm<N: FusedAddRmsNormSpec + ?Sized>(
+    norm: &N,
+    delta: &MlxArray,
+    residual: &MlxArray,
+) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+    if fused_add_rmsnorm_enabled()
+        && fused_add_rms_norm_eligible(delta, residual, norm.raw_norm_weight())
+    {
+        let mut normed = UniquePtr::null();
+        let mut new_residual = UniquePtr::null();
+        ffi::fused_add_rms_norm(
+            delta,
+            residual,
+            norm.raw_norm_weight(),
+            norm.norm_eps(),
+            norm.norm_weight_bias(),
+            &mut normed,
+            &mut new_residual,
+        );
+        return (normed, new_residual);
+    }
+    graph_add_rms_norm(norm, delta, residual)
+}
+
+/// Graph-composed reference for [`fused_add_rms_norm`]: the elementwise `add`
+/// plus `fast_rms_norm` pair the transformer blocks built before #905.
+///
+/// Public so the parity tests can pin the fused kernel against it directly
+/// rather than against a re-derivation of it.
+pub fn graph_add_rms_norm<N: FusedAddRmsNormSpec + ?Sized>(
+    norm: &N,
+    delta: &MlxArray,
+    residual: &MlxArray,
+) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+    let new_residual = ffi::add(residual, delta);
+    let normed = ffi::fast_rms_norm(&new_residual, norm.effective_norm_weight(), norm.norm_eps());
+    (normed, new_residual)
+}
+
+/// Whether this backend has a fused-add-RMSNorm kernel, asked once.
+///
+/// The FFI answer reaches `metal::is_available()` / `cu::is_available()` in
+/// C++, and the backend cannot change mid-process, so re-asking at every
+/// residual join of every layer of every token would be pure overhead on the
+/// path the fusion exists to make cheaper.
+fn fused_add_rms_norm_backend_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(ffi::fused_add_rms_norm_available)
+}
+
+/// Whether this backend has a fused RoPE + append kernel, asked once. Same
+/// reasoning as [`fused_add_rms_norm_backend_available`].
+fn fused_rope_append_backend_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(ffi::fused_rope_qk_append_available)
+}
+
+/// Whether the fused kernel can serve this call.
+///
+/// The launcher throws on a contract violation rather than returning an error,
+/// and an exception crossing the cxx boundary is not recoverable, so the
+/// eligibility test lives here and the fused branch is only taken when the
+/// launcher cannot throw: matching shapes and dtypes, a 1-D weight whose length
+/// is the trailing dimension, and a backend that has a custom-kernel JIT at all
+/// (false on a CPU-only build).
+fn fused_add_rms_norm_eligible(delta: &MlxArray, residual: &MlxArray, weight: &MlxArray) -> bool {
+    if !fused_add_rms_norm_backend_available() || ffi::array_ndim(weight) != 1 {
+        return false;
+    }
+    let d_shape = ffi::array_shape(delta);
+    let Some(&trailing) = d_shape.last() else {
+        return false;
+    };
+    ffi::array_shape(weight)[0] == trailing
+        && ffi::array_shape(residual) == d_shape
+        && ffi::array_dtype(delta) == ffi::array_dtype(residual)
+}
+
+/// Destination layout for the fused RoPE + KV-append kernel (#905).
+///
+/// The kernel emits the K/V append payload in the layout its destination
+/// consumes, so the cache append stays an O(new tokens) donated `slice_update`
+/// instead of the O(capacity) slab copy an in-kernel write would force. See
+/// `src/lib/mlx-cpp/turbo/fused_rope_append.h` for why the write itself cannot
+/// be fused under MLX's custom-kernel contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FusedRopeDestLayout {
+    /// Dense `KVCache` slab order `[B, Hkv, L, D]`.
+    DenseSlab,
+    /// Paged block-pool row order `[B, L, Hkv, D]`.
+    ///
+    /// Implemented and covered by parity tests, but not wired into any caller
+    /// yet: the batched paged decode path that would use it belongs to issue
+    /// #899, and restructuring it here would collide with that work.
+    PagedPool,
+}
+
+impl FusedRopeDestLayout {
+    fn as_i32(self) -> i32 {
+        match self {
+            Self::DenseSlab => 0,
+            Self::PagedPool => 1,
+        }
+    }
+}
+
 /// Layer Normalization layer (standard LayerNorm with weight and optional bias)
 pub struct LayerNorm {
     pub weight: UniquePtr<MlxArray>,
@@ -1944,6 +2217,88 @@ impl FusedQKVLinear {
         let v = ffi::slice_last_dim(&qkv, q_size + kv_size, q_size + 2 * kv_size);
 
         (q, k, v)
+    }
+
+    /// Concatenated QKV projection followed by the fused q/k RoPE +
+    /// KV-append-layout kernel (#905).
+    ///
+    /// Returns `(q, k, v)` with `q` in attention order `[B, Hq, L, D]` and
+    /// `k` / `v` already in the layout `dest_layout` names, so the caller's
+    /// cache append is a plain `slice_update` with no intervening reshape,
+    /// transpose or contiguity copy.
+    ///
+    /// Returns `None` when the fused path is disabled
+    /// (`MLXCEL_FUSED_ROPE_APPEND=0`), the backend has no custom-kernel JIT, or
+    /// the geometry is outside the kernel's contract. The caller then keeps its
+    /// existing reshape / transpose / `fast_rope` graph, which is also the
+    /// reference the parity tests compare against.
+    ///
+    /// `positions_base` is the absolute position of the first token in the
+    /// window: token `t` rotates at `positions_base + t`. That is
+    /// `KVCache::offset` for the dense path, and is already absolute for
+    /// `RingSlidingKVCache`, so no adjustment is needed for rotated caches.
+    ///
+    /// Unlike [`Self::forward_split_rope`], this works for both quantized and
+    /// non-quantized weights: it only needs the projection's row-contiguous
+    /// output, not the packed weight.
+    ///
+    /// Used by: Llama3-family (and Qwen2-family) dense decode path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_fused_rope_append(
+        &self,
+        x: &MlxArray,
+        rope_dims: i32,
+        rope_base: f32,
+        rope_scale: f32,
+        traditional: bool,
+        positions_base: i32,
+        dest_layout: FusedRopeDestLayout,
+    ) -> Option<(
+        UniquePtr<MlxArray>,
+        UniquePtr<MlxArray>,
+        UniquePtr<MlxArray>,
+    )> {
+        if !fused_rope_append_enabled() || !fused_rope_append_backend_available() {
+            return None;
+        }
+        // The kernel's contract, checked here so the launcher's `throw` is
+        // unreachable from the decode path.
+        if self.head_dim % 2 != 0
+            || rope_dims <= 0
+            || rope_dims % 2 != 0
+            || rope_dims > self.head_dim
+            || self.n_heads <= 0
+            || self.n_kv_heads <= 0
+        {
+            return None;
+        }
+        let qkv = self.qkv_proj.forward(x);
+        let qkv_shape = ffi::array_shape(&qkv);
+        if qkv_shape.len() != 3
+            || qkv_shape[2] != (self.n_heads + 2 * self.n_kv_heads) * self.head_dim
+        {
+            return None;
+        }
+
+        let mut q = UniquePtr::null();
+        let mut k = UniquePtr::null();
+        let mut v = UniquePtr::null();
+        ffi::fused_rope_qk_append(
+            &qkv,
+            self.n_heads,
+            self.n_kv_heads,
+            self.head_dim,
+            rope_dims,
+            rope_base,
+            rope_scale,
+            traditional,
+            positions_base,
+            dest_layout.as_i32(),
+            &mut q,
+            &mut k,
+            &mut v,
+        );
+        Some((q, k, v))
     }
 
     /// Fused concatenated QKV projection + split + reshape + transpose + RoPE.
@@ -5781,6 +6136,95 @@ mod tests {
                 "{v:?} should keep the fused QK-norm kernel off"
             );
         }
+    }
+
+    /// The #905 kill switches are default-ON, which is the inverse of the
+    /// opt-in `MLXCEL_FUSED_QK_NORM` flag above, so they get their own pin: a
+    /// recognised disable string turns the fusion off, an unset variable leaves
+    /// the compiled-in default, and an unrecognised value must not silently
+    /// change the decode graph.
+    #[test]
+    fn fused_905_flags_follow_the_default_and_respect_explicit_values() {
+        // Unset means the compiled-in default, whichever way it is set. Asserting
+        // a literal here instead would re-pin the default and fail whenever a
+        // measurement flips it, which is exactly what happened when the #905
+        // sweep moved both constants to off.
+        assert_eq!(
+            fused_add_rmsnorm_enabled_from(None),
+            FUSED_ADD_RMSNORM_DEFAULT
+        );
+        assert_eq!(
+            fused_rope_append_enabled_from(None),
+            FUSED_ROPE_APPEND_DEFAULT
+        );
+
+        for v in ["0", "false", "off", "no", "OFF", "False", " 0 ", "No"] {
+            assert!(
+                !fused_add_rmsnorm_enabled_from(Some(v)),
+                "{v:?} should disable the fused add+RMSNorm path"
+            );
+            assert!(
+                !fused_rope_append_enabled_from(Some(v)),
+                "{v:?} should disable the fused RoPE + append path"
+            );
+        }
+        for v in ["1", "true", "on", "yes", "ON", "True", " 1 ", "Yes"] {
+            assert!(fused_add_rmsnorm_enabled_from(Some(v)));
+            assert!(fused_rope_append_enabled_from(Some(v)));
+        }
+        // Unrecognised values keep the compiled-in default rather than
+        // disabling: a typo in a deployment script must not quietly change the
+        // graph in either direction.
+        for v in ["", "maybe", "2"] {
+            assert_eq!(
+                fused_add_rmsnorm_enabled_from(Some(v)),
+                FUSED_ADD_RMSNORM_DEFAULT,
+                "{v:?} should fall back to the compiled-in default"
+            );
+            assert_eq!(
+                fused_rope_append_enabled_from(Some(v)),
+                FUSED_ROPE_APPEND_DEFAULT,
+                "{v:?} should fall back to the compiled-in default"
+            );
+        }
+    }
+
+    /// `RMSNorm` is the standard convention (`weight_bias = 0`, raw and
+    /// effective weight identical); `GemmaRMSNorm` is the `(1 + w)` convention
+    /// (`weight_bias = 1`, effective weight is the precomputed sum). The fused
+    /// kernel picks its behavior entirely from these four accessors, so a
+    /// mis-implemented impl is a silent wrong-math bug.
+    #[test]
+    fn fused_add_rms_norm_spec_reports_the_right_convention() {
+        let w = ffi::from_slice_f32(&[0.5, -0.25, 1.5, 0.0], &[4]);
+        let plain = RMSNorm::new(ffi::copy(&w), 1e-5);
+        assert_eq!(plain.norm_weight_bias(), 0.0);
+        assert_eq!(plain.norm_eps(), 1e-5);
+        assert_eq!(
+            ffi::array_to_raw_bytes(plain.raw_norm_weight()),
+            ffi::array_to_raw_bytes(plain.effective_norm_weight()),
+            "a standard RMSNorm has no separate effective weight"
+        );
+
+        let gemma = GemmaRMSNorm::new(ffi::copy(&w), 1e-5);
+        assert_eq!(gemma.norm_weight_bias(), 1.0);
+        let raw = read_f32_vec(gemma.raw_norm_weight());
+        let effective = read_f32_vec(gemma.effective_norm_weight());
+        for (r, e) in raw.iter().zip(effective.iter()) {
+            assert!(
+                (e - (r + 1.0)).abs() < 1e-6,
+                "Gemma effective weight must be (1 + w): raw {r} vs effective {e}"
+            );
+        }
+    }
+
+    fn read_f32_vec(arr: &MlxArray) -> Vec<f32> {
+        let a = ffi::astype(arr, crate::dtype::FLOAT32);
+        ffi::eval(&a);
+        ffi::array_to_raw_bytes(&a)
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
     }
 
     // ── Adaptive pooled paged-attention selector (issue #331) ────────────────
