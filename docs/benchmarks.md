@@ -16,7 +16,8 @@ For every benchmark run, include:
 - model checkpoint name and quantization format;
 - prompt length, requested decode length, batch size, and warmup policy;
 - cache mode and server/generation flags;
-- raw per-model prefill and decode throughput where available.
+- raw per-model prefill and decode throughput where available;
+- for op-level microbenchmarks, the memory mode (warm or cold last-level cache) and the rotation count, per the section below.
 
 Averages are useful only after the raw rows are available. Avoid statements such
 as "faster than X" unless the comparable model set and exclusions are explicit.
@@ -52,6 +53,94 @@ arguments may evolve, so inspect each script before publishing results.
 # Multi-model suite shape.
 ./scripts/bench_all_models.sh --hardware <name> --cooldown 45 --big-cooldown 60
 ```
+
+## Warm vs cold last-level cache (issue #906)
+
+An op-level microbenchmark that allocates its inputs once and reuses them on
+every timed iteration measures a warm cache. After the first iteration the
+working set is resident in the last-level cache (Apple's System Level Cache,
+NVIDIA's L2), so the remaining iterations read at cache bandwidth. For a
+bandwidth-bound kernel that is a different measurement from the one production
+takes: the KV pool is far larger than any last-level cache and is touched once
+per decode step, so the representative read comes from DRAM.
+
+The gap matters most for exactly the kernels this epic touches. Paged KV
+gather, paged decode attention, and rmsnorm are bandwidth-bound, so a warm-cache
+number for them is an upper bound rather than an estimate. Compute-bound
+kernels (large-M quantized GEMM) barely move between the two modes, which is
+itself a useful signal: a kernel whose warm and cold numbers agree is not
+limited by memory.
+
+### How the harnesses do it
+
+`mlxcel_core::bench_rotation` allocates several copies of the input and
+advances one copy per timed iteration. The rotation count is
+`ceil(2 * last_level_cache / per_iteration_read_bytes)`, clamped to 64, so the
+whole rotation set exceeds the cache and a buffer has been evicted by the time
+the rotation returns to it. The 2x headroom covers the cache being shared with
+the rest of the system and with the kernel's own output traffic.
+
+Cache sizing is an estimate by device family, because macOS exposes no SLC size
+through `sysctl`: 8 MiB for a base M-series, 24 MiB for a Pro, 48 MiB for a
+Max, 96 MiB for an Ultra (two dies, two SLCs). The estimates are biased high,
+since over-estimating only costs memory for extra rotation buffers while
+under-estimating silently reintroduces the warm-cache bias. Reading the CUDA L2
+size needs `cudaDeviceProp::l2CacheSize` through an FFI helper that does not
+exist yet, so on a CUDA host set `MLXCEL_BENCH_LLC_BYTES` to the device's real
+L2 size. Set the same variable on Apple Silicon when the published SLC figure
+for the specific chip is known.
+
+Note that a large working set needs no rotation at all: once a single iteration
+reads more than the last-level cache holds, the rotation count collapses to 1 and
+the cold mode costs nothing. On an M1 Ultra (96 MiB SLC) that crossover lands at
+batch 4 / context 16384. The two modes diverge at small batch and short context,
+which is also where a warm measurement is most misleading.
+
+### What it actually measured on Apple Silicon
+
+Measured before assuming, because the size of the effect turned out to matter
+less than its shape. On an M1 Ultra at batch 1 / context 4096 (rotation 12),
+medians over five repetitions each:
+
+| Path | Warm | Cold | Delta |
+|---|---|---|---|
+| `contig_sdpa` | 438.3 us | 433.7 us | -1.0% |
+| `gatherA_sdpa` | 509.4 us | 535.0 us | +5.0% |
+
+The median barely moves. What moves is the spread: warm `gatherA_sdpa` ranged
+425.6 to 542.1 us (27%, including one 708 us first-iteration outlier), while cold
+ranged 525.1 to 546.0 us (4.0%).
+
+So on this part the case for cold mode is reproducibility, not a large correction
+to the number. Unified memory with very high bandwidth blunts the cache cliff that
+motivates the technique. Do not carry that conclusion to CUDA: a discrete GPU with
+a private L2 behind PCIe has a much sharper cliff, and the same rotation there
+should be expected to move the median considerably more. Full numbers and the
+load conditions they were taken under are in
+[autotuner-m1ultra-2026-07-30](benchmark_results/autotuner-m1ultra-2026-07-30.md).
+
+### Running and recording
+
+```bash
+# Warm (historical default, unchanged).
+caffeinate -i cargo run --release --features metal,accelerate \
+    --example page_gather_microbench
+
+# Cold last-level cache.
+caffeinate -i cargo run --release --features metal,accelerate \
+    --example page_gather_microbench -- --cold-l2
+```
+
+The harness prints `memory mode=...` in its header, `mode=` and `rotation=` per
+config, and appends `mode` and `rotation` as the last two columns of its `CSV:`
+rows. Every recorded result must state which mode produced it; a warm number
+and a cold number for the same kernel are not comparable and must never appear
+in the same column of a report.
+
+`examples/qmm_gemv_microbench.rs` has carried its own ad-hoc version of this
+since it landed (a fixed 128 MiB target, 2 to 12 weight copies round-robin).
+`bench_rotation` is the generalization of that idea with the cache size
+detected rather than assumed.
 
 ## Speculative decoding (MTP)
 
