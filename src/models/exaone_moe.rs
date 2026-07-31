@@ -22,6 +22,7 @@
 //! - Shared experts alongside routed experts
 //! - RotatingKVCache for sliding window layers
 
+use crate::models::switch_layers::validate_expert_quantization_params;
 use mlxcel_core::generate::LanguageModel;
 use mlxcel_core::layers::{KVCache, RMSNorm, RotatingKVCache, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::utils;
@@ -1020,6 +1021,10 @@ fn load_switch_linear(
     let weight = get_weight_copy(weights, &format!("{}.weight", prefix))?;
     let scales_key = format!("{}.scales", prefix);
     if weights.contains_key(&scales_key) {
+        // Bound the declared pair here, where it is stored: this family-local
+        // expert type never reaches `reconcile_quantization_layout` and hands
+        // the stored pair to `gather_qmm` (issue #958).
+        validate_expert_quantization_params(prefix, group_size, bits)?;
         let scales = mlxcel_core::copy(weights.get(&scales_key).unwrap());
         let biases = get_weight_copy(weights, &format!("{}.biases", prefix))?;
         Ok(SwitchLinear::Quantized {
@@ -1171,3 +1176,7 @@ mod exaone_moe_mask_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "exaone_moe_tests.rs"]
+mod tests;

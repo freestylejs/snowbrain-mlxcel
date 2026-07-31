@@ -47,6 +47,7 @@
 
 use crate::models::ernie4_5_moe::{DenseMLP, SwitchGLU, SwitchLinear};
 use crate::models::qwen_mrope_state::MRopeState;
+use crate::models::switch_layers::validate_expert_quantization_params;
 use mlxcel_core::cache::SequenceId;
 use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::weights::WeightMap;
@@ -475,6 +476,12 @@ fn load_switch_linear(
     let num_experts = mlxcel_core::array_shape(&weight)[0] as usize;
     let scales_key = format!("{prefix}.scales");
     if let Some(scales) = weights.get(&scales_key) {
+        // This builds `ernie4_5_moe::SwitchLinear::Quantized` as a bare struct
+        // literal rather than through `ernie4_5_moe::SwitchLinear::from_weights`,
+        // so the bound that loader carries does not apply here (issue #958).
+        // The pair also arrives from `Ernie45MoeVlTextConfig`, whose accessors
+        // fall back to 0 rather than 64/4 when no `quantization` block exists.
+        validate_expert_quantization_params(prefix, gs, bits)?;
         let biases_key = format!("{prefix}.biases");
         let biases = weights
             .get(&biases_key)
@@ -1175,6 +1182,82 @@ mod tests {
                 (g - e).abs() < 1e-4,
                 "mixing weights must be uncorrected renormalized probs, got {got:?} expected {expected:?}"
             );
+        }
+    }
+
+    /// Honest 4-bit expert geometry: `packed_in * 32 == bits * num_groups *
+    /// group_size` (8 * 32 == 4 * 1 * 64), so the positive control below is a
+    /// plane MLX can actually describe.
+    const QUANT_EXPERTS: i32 = 3;
+    const QUANT_OUT: i32 = 4;
+    const QUANT_PACKED_IN: i32 = 8;
+    const QUANT_NUM_GROUPS: i32 = 1;
+    const QUANT_GROUP_SIZE: i32 = 64;
+    const QUANT_BITS: i32 = 4;
+
+    const QUANT_PREFIX: &str = "model.layers.0.mlp.switch_mlp.gate_proj";
+
+    /// The pair this loader stores is handed straight to `gather_qmm`, which
+    /// crosses the cxx bridge as `UniquePtr<MlxArray>` rather than `Result`. A
+    /// C++ throw there is an uncatchable `std::terminate`,
+    /// so losing the bound turns a rejected load into an uncatchable abort at
+    /// the first routed forward pass in production. This test asserts on the
+    /// load result rather than running a forward pass, so a regression fails
+    /// cleanly here instead of aborting the test binary.
+    #[test]
+    fn ernie4_5_moe_vl_switch_linear_rejects_params_that_would_abort_gather_qmm() {
+        use crate::models::switch_layers::{
+            HOSTILE_QUANT_PARAMS, insert_stacked_quantized_expert_plane,
+        };
+
+        let mut weights = WeightMap::new();
+        insert_stacked_quantized_expert_plane(
+            &mut weights,
+            QUANT_PREFIX,
+            QUANT_EXPERTS,
+            QUANT_OUT,
+            QUANT_PACKED_IN,
+            QUANT_NUM_GROUPS,
+        );
+
+        // Positive control first, so a guard that rejected every quantized
+        // plane could not pass this test.
+        match load_switch_linear(&weights, QUANT_PREFIX, QUANT_GROUP_SIZE, QUANT_BITS) {
+            Ok(_) => {}
+            Err(e) => panic!("honest 4-bit expert plane must load: {e}"),
+        }
+
+        for (group_size, bits, field) in HOSTILE_QUANT_PARAMS {
+            let err = match load_switch_linear(&weights, QUANT_PREFIX, group_size, bits) {
+                Ok(_) => panic!(
+                    "(group_size {group_size}, bits {bits}) must be refused at load, \
+                     not stored for gather_qmm"
+                ),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains(field),
+                "(group_size {group_size}, bits {bits}) must be blamed on {field}, got: {err}"
+            );
+            assert!(
+                err.contains(QUANT_PREFIX),
+                "the load error must name the offending tensor {QUANT_PREFIX}, got: {err}"
+            );
+        }
+
+        // A bf16 expert plane carries no packing and no `.scales`, so the
+        // declared pair is inert on the `gather_mm` path and must not gate the
+        // load.
+        let mut dense = WeightMap::new();
+        let shape = [QUANT_EXPERTS, QUANT_OUT, QUANT_PACKED_IN];
+        let n = (QUANT_EXPERTS * QUANT_OUT * QUANT_PACKED_IN) as usize;
+        dense.insert(
+            format!("{QUANT_PREFIX}.weight"),
+            mlxcel_core::from_slice_f32(&vec![0.0f32; n], &shape),
+        );
+        match load_switch_linear(&dense, QUANT_PREFIX, 0, 0) {
+            Ok(_) => {}
+            Err(e) => panic!("a non-quantized expert plane must load with an unset pair: {e}"),
         }
     }
 }

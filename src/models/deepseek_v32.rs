@@ -41,6 +41,7 @@ mod indexer;
 mod deepseek_v32_tests;
 
 use crate::distributed::pipeline::{LayerFilter, StageExecutionOutput};
+use crate::models::switch_layers::validate_expert_quantization_params;
 use indexer::Indexer;
 use mlxcel_core::generate::LanguageModel;
 use mlxcel_core::layers::{KVCache, MultiLinear, RMSNorm, UnifiedEmbedding, UnifiedLinear};
@@ -829,19 +830,22 @@ impl DeepSeekV32Model {
             .map_err(|e| format!("Failed to parse config.json: {}", e))?;
 
         let weights = crate::models::load_text_weights(model_dir, None)?;
-        let weights = Self::sanitize_weights(weights, &args);
+        let weights = Self::sanitize_weights(weights, &args)?;
         let model = Self::from_weights(&weights, &args)?;
 
         Ok((model, args))
     }
 
     /// Public entry point for sanitizing weights with external args (used by GLM MoE DSA)
-    pub fn sanitize_weights_with_args(weights: WeightMap, args: &ModelArgs) -> WeightMap {
+    pub fn sanitize_weights_with_args(
+        weights: WeightMap,
+        args: &ModelArgs,
+    ) -> Result<WeightMap, String> {
         Self::sanitize_weights(weights, args)
     }
 
     /// Decompose kv_b_proj into embed_q and unembed_out for MLA, and stack expert weights
-    fn sanitize_weights(mut weights: WeightMap, args: &ModelArgs) -> WeightMap {
+    fn sanitize_weights(mut weights: WeightMap, args: &ModelArgs) -> Result<WeightMap, String> {
         // Remove multi-token prediction (MTP) layers beyond num_hidden_layers
         let mtp_layer = args.num_hidden_layers;
         weights.retain(|k, _| {
@@ -917,11 +921,19 @@ impl DeepSeekV32Model {
                 let b = weights
                     .remove(&format!("{}.kv_b_proj.biases", prefix))
                     .unwrap();
-                let w_shape = mlxcel_core::array_shape(&w);
-                let s_shape = mlxcel_core::array_shape(&s);
-                let kv_lora_rank = args.kv_lora_rank as i32;
-                let inferred_bits = (w_shape[w_shape.len() - 1] * 32) / kv_lora_rank;
-                let inferred_gs = kv_lora_rank / s_shape[s_shape.len() - 1];
+                // Solve the packed pair from the shapes and bound it before it
+                // reaches `dequantize`. The shared helper checks each divisor
+                // before dividing: `kv_lora_rank` is a config field and the
+                // scales axis is checkpoint data, so the naive form panics on a
+                // zero divisor and overflows i32 on a large packed axis, both
+                // before the bound could fire (issue #958).
+                let (inferred_gs, inferred_bits) =
+                    mlxcel_core::layers::infer_mla_quantization_params(
+                        &mlxcel_core::array_shape(&w),
+                        &mlxcel_core::array_shape(&s),
+                        args.kv_lora_rank as i32,
+                        &format!("{prefix}.kv_b_proj"),
+                    )?;
                 unsafe {
                     mlxcel_core::dequantize(
                         &w,
@@ -962,7 +974,7 @@ impl DeepSeekV32Model {
             weights.remove(&key);
         }
 
-        weights
+        Ok(weights)
     }
 
     pub fn from_weights(weights: &WeightMap, args: &ModelArgs) -> Result<Self, String> {
@@ -1230,6 +1242,13 @@ fn load_switch_linear(
     let is_quantized = weights.contains_key(&format!("{}.0.{}.scales", prefix, weight_name));
 
     if is_quantized {
+        // Bound the declared pair before any of the per-expert tensors are
+        // stacked: this family-local expert type never reaches
+        // `reconcile_quantization_layout` and hands the stored pair to
+        // `gather_qmm` (issue #958). The pair can also arrive from a GLM
+        // config, via `glm_moe_dsa::to_dsv32_args`, rather than a DeepSeek one.
+        validate_expert_quantization_params(&format!("{prefix}.{weight_name}"), group_size, bits)?;
+
         let mut expert_scales = Vec::with_capacity(num_experts);
         let mut expert_biases = Vec::with_capacity(num_experts);
 

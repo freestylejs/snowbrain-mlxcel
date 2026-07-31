@@ -24,6 +24,7 @@
 
 use crate::models::gated_delta::{gated_delta_update, scaled_fast_rms_norm_no_weight};
 use crate::models::switch_layers::SwitchGLU;
+use crate::models::switch_layers::validate_expert_quantization_params;
 use mlxcel_core::dtype;
 use mlxcel_core::generate::LanguageModel;
 use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
@@ -212,6 +213,13 @@ impl MultiLinear {
             .map(|w| mlxcel_core::copy(w));
 
         let is_quantized = scales.is_some();
+        if is_quantized {
+            // KimiLinear keeps a private `MultiLinear` rather than using
+            // `mlxcel_core::layers::MultiLinear`, so it does not inherit the
+            // bound that loader now carries. The stored pair goes straight to
+            // `quantized_matmul` on every MLA forward (issue #958).
+            validate_expert_quantization_params(prefix, group_size, bits)?;
+        }
 
         Ok(Self {
             weight,
@@ -1093,7 +1101,7 @@ impl KimiLinearModel {
 
         println!("[KimiLinear] Loading weights...");
         let weights = crate::models::load_text_weights(model_dir, None)?;
-        let weights = Self::sanitize_weights(weights, &config);
+        let weights = Self::sanitize_weights(weights, &config)?;
 
         println!("[KimiLinear] Building model...");
         let model = Self::from_weights(&weights, &config)?;
@@ -1102,7 +1110,10 @@ impl KimiLinearModel {
         Ok((model, config))
     }
 
-    pub fn sanitize_weights(mut weights: WeightMap, config: &KimiLinearConfig) -> WeightMap {
+    pub fn sanitize_weights(
+        mut weights: WeightMap,
+        config: &KimiLinearConfig,
+    ) -> Result<WeightMap, String> {
         // Remove mtp weights
         let mtp_keys: Vec<String> = weights
             .keys()
@@ -1270,11 +1281,18 @@ impl KimiLinearModel {
                     let biases = weights
                         .remove(&format!("{}.kv_b_proj.biases", attn_prefix))
                         .unwrap();
-                    let w_shape = mlxcel_core::array_shape(&w);
-                    let dims = config.kv_lora_rank as i32;
-                    let bits = (w_shape[w_shape.len() - 1] * 32) / dims;
-                    let s_shape = mlxcel_core::array_shape(&scales);
-                    let group_size = dims / s_shape[s_shape.len() - 1];
+                    // Solve the packed pair from the shapes and bound it
+                    // before it reaches `dequantize`. The shared helper checks
+                    // each divisor before dividing: `kv_lora_rank` is a config
+                    // field and the scales axis is checkpoint data, so the naive
+                    // form panics on a zero divisor and overflows i32 on a large
+                    // packed axis, both before the bound could fire (issue #958).
+                    let (group_size, bits) = mlxcel_core::layers::infer_mla_quantization_params(
+                        &mlxcel_core::array_shape(&w),
+                        &mlxcel_core::array_shape(&scales),
+                        config.kv_lora_rank as i32,
+                        &format!("{attn_prefix}.kv_b_proj"),
+                    )?;
                     unsafe {
                         mlxcel_core::dequantize(
                             &w,
@@ -1309,7 +1327,7 @@ impl KimiLinearModel {
             }
         }
 
-        weights
+        Ok(weights)
     }
 
     pub fn from_weights(weights: &WeightMap, config: &KimiLinearConfig) -> Result<Self, String> {
@@ -1392,3 +1410,7 @@ impl LanguageModel for KimiLinearModel {
         self.forward(input_ids, &mut caches)
     }
 }
+
+#[cfg(test)]
+#[path = "kimi_linear_tests.rs"]
+mod tests;
