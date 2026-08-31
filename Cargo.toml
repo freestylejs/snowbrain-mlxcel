@@ -24,6 +24,7 @@ members = [
     "src/lib/mlxcel-mlx-pin",
     "src/lib/mlxcel-surgery",
     "src/lib/mlxcel-xla",
+    "tools/mlxcel-build-identity",
 ]
 resolver = "2"
 
@@ -144,6 +145,7 @@ safetensors = "0.7.0"
 tokenizers = "0.22.2"
 sentencepiece = "0.13"
 hf-hub = "0.5.0"
+tempfile = "3"
 
 # Zero-copy buffers
 bytes = "1.9"
@@ -332,9 +334,13 @@ type_complexity = "allow"
 large_enum_variant = "allow"
 should_implement_trait = "allow"
 
+[build-dependencies]
+sha2 = "0.10"
+toml = "0.8"
+
 [dev-dependencies]
 ctor = "1.0.13"
-tempfile = "3"
+static_assertions = "1"
 # `#[tokio::test(start_paused = true)]` for the socket-timeout unit tests
 # (#1432); `full` does not include the test clock.
 tokio = { version = "1.52", features = ["full", "test-util"] }

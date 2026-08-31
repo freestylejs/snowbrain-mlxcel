@@ -28,6 +28,7 @@ pub mod lang_bias;
 pub mod lora;
 pub mod models;
 pub mod multimodal;
+pub mod native_runtime;
 pub mod reasoning_stream;
 pub mod rerank;
 pub mod server;

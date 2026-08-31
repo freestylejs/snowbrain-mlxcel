@@ -27,6 +27,9 @@
 //! this implementation matches that ordering.
 
 use mlxcel_core::layers::UnifiedLinear;
+use mlxcel_core::tensor_metadata::{
+    TensorMetadataLookup, TensorQuantization, validate_required_matrix,
+};
 use mlxcel_core::{MlxArray, UniquePtr};
 
 /// Vision/audio feature embedder used by Gemma 4 VLM.
@@ -36,6 +39,28 @@ use mlxcel_core::{MlxArray, UniquePtr};
 pub struct Gemma4MultimodalEmbedder {
     embedding_projection: UnifiedLinear,
     pre_projection_norm: crate::models::gemma4::RMSNormNoScale,
+}
+
+/// Validate the exact projection matrix consumed by
+/// [`Gemma4MultimodalEmbedder::from_weights`]. The RMS norm is parameter-free.
+pub(crate) fn validate_native_tensor_metadata(
+    lookup: &dyn TensorMetadataLookup,
+    prefix: &str,
+    output_hidden_size: usize,
+    embedding_dim: usize,
+    quantization: TensorQuantization,
+) -> Result<(), String> {
+    if output_hidden_size == 0 || embedding_dim == 0 {
+        return Err("Gemma 4 multimodal projection has a zero dimension".to_string());
+    }
+    validate_required_matrix(
+        lookup,
+        &format!("{prefix}.embedding_projection"),
+        output_hidden_size,
+        embedding_dim,
+        quantization,
+        true,
+    )
 }
 
 impl Gemma4MultimodalEmbedder {

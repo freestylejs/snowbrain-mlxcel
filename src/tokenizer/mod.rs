@@ -20,8 +20,42 @@ mod tiktoken;
 use anyhow::Result;
 use hf_hub::api::sync::Api;
 use sentencepiece::SentencePieceProcessor;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+
+pub(crate) const MAX_NATIVE_ADDED_TOKENS: usize = 4_096;
+pub(crate) const MAX_NATIVE_ADDED_TOKEN_RUNS: usize = 1_024;
+
+pub(crate) fn native_added_token_work_is_bounded(config: &serde_json::Value) -> bool {
+    let Some(decoder) = config
+        .get("added_tokens_decoder")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return true;
+    };
+    if decoder.len() > MAX_NATIVE_ADDED_TOKENS {
+        return false;
+    }
+    let mut entries = Vec::with_capacity(decoder.len());
+    for (id, entry) in decoder {
+        let Ok(id) = id.parse::<u32>() else {
+            // Shape/ID validation reports the semantic error separately.
+            continue;
+        };
+        let special = entry
+            .get("special")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        entries.push((id, special));
+    }
+    entries.sort_unstable_by_key(|&(id, _)| id);
+    let runs = entries
+        .iter()
+        .enumerate()
+        .filter(|(index, (_, special))| *index == 0 || entries[*index - 1].1 != *special)
+        .count();
+    runs <= MAX_NATIVE_ADDED_TOKEN_RUNS
+}
 
 pub use fim::{FimToken, FimTokens, FimTriple};
 pub use thinking::{ThinkingMarkers, find_subseq, rfind_subseq};
@@ -37,10 +71,10 @@ pub enum MlxcelTokenizer {
 
 pub struct SentencePieceTokenizer {
     processor: SentencePieceProcessor,
-    special_token_to_id: HashMap<String, u32>,
+    added_token_to_id: HashMap<String, u32>,
     id_to_special_token: HashMap<u32, String>,
-    /// Special tokens sorted by length descending for greedy longest-match-first splitting
-    special_tokens_sorted: Vec<(String, u32)>,
+    /// All added tokens sorted by length descending for greedy atomic matching.
+    added_tokens_sorted: Vec<(String, u32)>,
     /// Every `added_tokens_decoder` entry (special or not) by id. Added tokens
     /// live OUTSIDE the SentencePiece vocab, so `decode_piece_ids` errors
     /// "Out of range" on them; decode must map them from this table instead.
@@ -169,6 +203,52 @@ impl MlxcelTokenizer {
         );
         let tokenizer = tokenizers::Tokenizer::from_bytes(json.as_bytes())
             .expect("failed to build all-byte-fallback stub tokenizer");
+        Self::HuggingFace(tokenizer)
+    }
+
+    /// Build the exact audited Gemma streaming decoder shape over a compact,
+    /// complete byte-fallback vocabulary. Unlike a fake backend, this is
+    /// serialized and reloaded through the production Hugging Face loader in
+    /// native-runtime tests.
+    #[cfg(test)]
+    pub(crate) fn stub_gemma_sequence_byte_fallback() -> Self {
+        let mut vocab_entries: Vec<String> = (0u16..=255)
+            .map(|byte| format!("\"<0x{byte:02X}>\": {byte}"))
+            .collect();
+        vocab_entries.push("\"▁Hi\": 256".to_owned());
+        let vocab = vocab_entries.join(", ");
+        let json = format!(
+            r#"{{
+                "version": "1.0",
+                "truncation": null,
+                "padding": null,
+                "added_tokens": [],
+                "normalizer": null,
+                "pre_tokenizer": null,
+                "post_processor": null,
+                "decoder": {{
+                    "type": "Sequence",
+                    "decoders": [
+                        {{"type": "Replace", "pattern": {{"String": "▁"}}, "content": " "}},
+                        {{"type": "ByteFallback"}},
+                        {{"type": "Fuse"}}
+                    ]
+                }},
+                "model": {{
+                    "type": "BPE",
+                    "dropout": null,
+                    "unk_token": null,
+                    "continuing_subword_prefix": null,
+                    "end_of_word_suffix": null,
+                    "fuse_unk": false,
+                    "byte_fallback": true,
+                    "vocab": {{{vocab}}},
+                    "merges": []
+                }}
+            }}"#
+        );
+        let tokenizer = tokenizers::Tokenizer::from_bytes(json.as_bytes())
+            .expect("failed to build audited Gemma decoder fixture");
         Self::HuggingFace(tokenizer)
     }
 
@@ -527,18 +607,22 @@ impl SentencePieceTokenizer {
             .map(|(k, &v)| (v, k.clone()))
             .collect();
 
-        let mut special_tokens_sorted: Vec<(String, u32)> = special_tokens
+        let added_token_to_id = added_token_contents
+            .iter()
+            .map(|(&id, content)| (content.clone(), id))
+            .collect::<HashMap<_, _>>();
+        let mut added_tokens_sorted: Vec<(String, u32)> = added_token_to_id
             .iter()
             .map(|(k, &v)| (k.clone(), v))
             .collect();
         // Sort by length descending for greedy longest-match-first
-        special_tokens_sorted.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
+        added_tokens_sorted.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
 
         Self {
             processor,
-            special_token_to_id: special_tokens,
+            added_token_to_id,
             id_to_special_token,
-            special_tokens_sorted,
+            added_tokens_sorted,
             added_token_contents,
             bos_id,
             add_bos,
@@ -573,7 +657,7 @@ impl SentencePieceTokenizer {
 
     /// The id a vocabulary entry holds, by its exact spelling.
     fn token_to_id(&self, token: &str) -> Option<u32> {
-        if let Some(&id) = self.special_token_to_id.get(token) {
+        if let Some(&id) = self.added_token_to_id.get(token) {
             return Some(id);
         }
         // `piece_to_id` answers `Some(unk_id)` for an unknown piece on some
@@ -634,7 +718,7 @@ impl SentencePieceTokenizer {
             result.push(bos);
         }
 
-        if self.special_tokens_sorted.is_empty() {
+        if self.added_tokens_sorted.is_empty() {
             // No special tokens to handle — encode directly
             let pieces = self
                 .processor
@@ -650,8 +734,9 @@ impl SentencePieceTokenizer {
         let segments = self.split_with_special_tokens(text);
 
         for segment in segments {
-            if let Some(&id) = self.special_token_to_id.get(&segment) {
-                // This segment is a special token — insert its ID directly
+            if let Some(&id) = self.added_token_to_id.get(&segment) {
+                // Every declared added token is atomic. The `special` flag
+                // controls only skip-on-decode behavior.
                 result.push(id);
             } else {
                 // Regular text — encode via sentencepiece
@@ -726,7 +811,10 @@ impl SentencePieceTokenizer {
         while !remaining.is_empty() {
             // Try to match a special token at the current position
             let mut matched = false;
-            for (token, _id) in &self.special_tokens_sorted {
+            for (token, _id) in &self.added_tokens_sorted {
+                if token.is_empty() {
+                    continue;
+                }
                 if remaining.starts_with(token.as_str()) {
                     segments.push(token.clone());
                     remaining = &remaining[token.len()..];
@@ -738,7 +826,10 @@ impl SentencePieceTokenizer {
             if !matched {
                 // Find the next special token occurrence
                 let mut next_pos = remaining.len();
-                for (token, _id) in &self.special_tokens_sorted {
+                for (token, _id) in &self.added_tokens_sorted {
+                    if token.is_empty() {
+                        continue;
+                    }
                     if let Some(pos) = remaining.find(token.as_str())
                         && pos < next_pos
                     {
@@ -756,48 +847,215 @@ impl SentencePieceTokenizer {
 }
 
 /// Parse special tokens from tokenizer_config.json's `added_tokens_decoder` field
-fn parse_special_tokens(model_path: &Path) -> (HashMap<String, u32>, HashMap<u32, String>, bool) {
+fn protobuf_varint(bytes: &[u8], cursor: &mut usize) -> Result<u64> {
+    let mut value = 0u64;
+    for shift in (0..=63).step_by(7) {
+        let byte = *bytes
+            .get(*cursor)
+            .ok_or_else(|| anyhow::anyhow!("truncated SentencePiece model protobuf"))?;
+        *cursor += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+    }
+    Err(anyhow::anyhow!(
+        "oversized varint in SentencePiece model protobuf"
+    ))
+}
+
+fn protobuf_length_delimited<'a>(bytes: &'a [u8], cursor: &mut usize) -> Result<&'a [u8]> {
+    let length = usize::try_from(protobuf_varint(bytes, cursor)?)
+        .map_err(|_| anyhow::anyhow!("SentencePiece protobuf field length does not fit host"))?;
+    let end = cursor
+        .checked_add(length)
+        .filter(|&end| end <= bytes.len())
+        .ok_or_else(|| anyhow::anyhow!("truncated SentencePiece protobuf field"))?;
+    let value = &bytes[*cursor..end];
+    *cursor = end;
+    Ok(value)
+}
+
+fn skip_protobuf_field(bytes: &[u8], cursor: &mut usize, wire_type: u64) -> Result<()> {
+    match wire_type {
+        0 => {
+            protobuf_varint(bytes, cursor)?;
+        }
+        1 => {
+            *cursor = cursor
+                .checked_add(8)
+                .filter(|&end| end <= bytes.len())
+                .ok_or_else(|| anyhow::anyhow!("truncated fixed64 SentencePiece field"))?;
+        }
+        2 => {
+            protobuf_length_delimited(bytes, cursor)?;
+        }
+        5 => {
+            *cursor = cursor
+                .checked_add(4)
+                .filter(|&end| end <= bytes.len())
+                .ok_or_else(|| anyhow::anyhow!("truncated fixed32 SentencePiece field"))?;
+        }
+        _ => {
+            return Err(anyhow::anyhow!(
+                "unsupported SentencePiece protobuf wire type"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn sentencepiece_model_pieces(model: &[u8]) -> Result<Vec<String>> {
+    let mut cursor = 0usize;
+    let mut pieces = Vec::new();
+    while cursor < model.len() {
+        let key = protobuf_varint(model, &mut cursor)?;
+        let (field, wire) = (key >> 3, key & 7);
+        if field == 1 && wire == 2 {
+            let piece = protobuf_length_delimited(model, &mut cursor)?;
+            let mut piece_cursor = 0usize;
+            let mut spelling = None;
+            while piece_cursor < piece.len() {
+                let piece_key = protobuf_varint(piece, &mut piece_cursor)?;
+                let (piece_field, piece_wire) = (piece_key >> 3, piece_key & 7);
+                if piece_field == 1 && piece_wire == 2 {
+                    spelling = Some(
+                        std::str::from_utf8(protobuf_length_delimited(piece, &mut piece_cursor)?)
+                            .map(str::to_owned)
+                            .map_err(|_| {
+                                anyhow::anyhow!("SentencePiece vocabulary entry is not UTF-8")
+                            })?,
+                    );
+                } else {
+                    skip_protobuf_field(piece, &mut piece_cursor, piece_wire)?;
+                }
+            }
+            pieces.push(spelling.ok_or_else(|| {
+                anyhow::anyhow!("SentencePiece vocabulary entry has no piece spelling")
+            })?);
+        } else {
+            skip_protobuf_field(model, &mut cursor, wire)?;
+        }
+    }
+    Ok(pieces)
+}
+
+fn parse_special_tokens(
+    model_path: &Path,
+    processor: &SentencePieceProcessor,
+) -> Result<(HashMap<String, u32>, HashMap<u32, String>, bool)> {
+    parse_special_tokens_with_native_bounds(model_path, processor, false)
+}
+
+fn parse_special_tokens_with_native_bounds(
+    model_path: &Path,
+    processor: &SentencePieceProcessor,
+    enforce_native_bounds: bool,
+) -> Result<(HashMap<String, u32>, HashMap<u32, String>, bool)> {
     let config_path = model_path.join("tokenizer_config.json");
     let mut special_tokens = HashMap::new();
     let mut added_token_contents = HashMap::new();
     let mut add_bos = false;
 
-    if let Ok(content) = std::fs::read_to_string(&config_path)
-        && let Ok(config) = serde_json::from_str::<serde_json::Value>(&content)
-    {
+    let content = match std::fs::read_to_string(&config_path) {
+        Ok(content) => Some(content),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if let Some(content) = content {
+        let config_value: serde_json::Value = serde_json::from_str(&content)?;
+        if enforce_native_bounds && !native_added_token_work_is_bounded(&config_value) {
+            return Err(anyhow::anyhow!(
+                "tokenizer_config added-token work exceeds the native bound"
+            ));
+        }
+        let config = config_value
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("tokenizer_config root is not an object"))?;
         // Parse add_bos_token
-        if let Some(v) = config.get("add_bos_token").and_then(|v| v.as_bool()) {
-            add_bos = v;
+        if let Some(value) = config.get("add_bos_token") {
+            add_bos = value.as_bool().ok_or_else(|| {
+                anyhow::anyhow!("tokenizer_config add_bos_token is not a boolean")
+            })?;
         }
 
         // Parse added_tokens_decoder: { "128132": { "content": "<|im_start|>", "special": true }, ... }
-        if let Some(decoder) = config
-            .get("added_tokens_decoder")
-            .and_then(|v| v.as_object())
-        {
+        if let Some(value) = config.get("added_tokens_decoder") {
+            let decoder = value.as_object().ok_or_else(|| {
+                anyhow::anyhow!("tokenizer_config added_tokens_decoder is not an object")
+            })?;
+            let mut seen_content = HashSet::new();
+            let mut seen_ids = HashSet::new();
+            let model_pieces = sentencepiece_model_pieces(&processor.to_serialized_proto())?;
+            if model_pieces.len() != processor.len() {
+                return Err(anyhow::anyhow!(
+                    "SentencePiece model proto and loaded processor disagree on vocabulary length"
+                ));
+            }
+            let mut model_piece_ids = HashMap::with_capacity(model_pieces.len());
+            for (id, piece) in model_pieces.iter().enumerate() {
+                if model_piece_ids.insert(piece.as_str(), id).is_some() {
+                    return Err(anyhow::anyhow!(
+                        "SentencePiece model contains duplicate vocabulary spellings"
+                    ));
+                }
+            }
             for (id_str, entry) in decoder {
-                if let (Ok(id), Some(content)) = (
-                    id_str.parse::<u32>(),
-                    entry.get("content").and_then(|v| v.as_str()),
-                ) {
-                    let is_special = entry
-                        .get("special")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    if is_special {
-                        special_tokens.insert(content.to_string(), id);
-                    } else {
-                        // Non-special added tokens (outside the SentencePiece
-                        // vocab) still need an id -> content mapping so decode
-                        // can render them instead of erroring "Out of range".
-                        added_token_contents.insert(id, content.to_string());
+                let id = id_str.parse::<u32>().map_err(|error| {
+                    anyhow::anyhow!("tokenizer_config special token id {id_str:?}: {error}")
+                })?;
+                if !seen_ids.insert(id) {
+                    return Err(anyhow::anyhow!(
+                        "tokenizer_config has duplicate numeric added-token id {id}"
+                    ));
+                }
+                let content = entry
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("tokenizer_config special token {id} has no string content")
+                    })?;
+                if content.is_empty() || !seen_content.insert(content) {
+                    return Err(anyhow::anyhow!(
+                        "tokenizer_config special token {id} has empty or duplicate content"
+                    ));
+                }
+                let is_special = match entry.get("special") {
+                    Some(value) => value.as_bool().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "tokenizer_config special token {id} has a non-boolean special flag"
+                        )
+                    })?,
+                    None => false,
+                };
+                if (id as usize) < processor.len() {
+                    // `piece_to_id` deliberately hides the unknown id, so use
+                    // the processor's own serialized model to compare every
+                    // in-vocabulary declaration against its exact frozen
+                    // spelling, including custom unknown/control tokens.
+                    let same_frozen_piece = model_pieces[id as usize] == content;
+                    if !is_special || !same_frozen_piece {
+                        return Err(anyhow::anyhow!(
+                            "tokenizer_config added token {id} attempts to relabel a SentencePiece vocabulary id"
+                        ));
                     }
                 }
+                if let Some(&base_id) = model_piece_ids.get(content)
+                    && base_id != id as usize
+                {
+                    return Err(anyhow::anyhow!(
+                        "tokenizer_config added token {id} shadows SentencePiece vocabulary ID {base_id}"
+                    ));
+                }
+                if is_special {
+                    special_tokens.insert(content.to_string(), id);
+                }
+                added_token_contents.insert(id, content.to_string());
             }
         }
     }
 
-    (special_tokens, added_token_contents, add_bos)
+    Ok((special_tokens, added_token_contents, add_bos))
 }
 
 /// Find a `.tiktoken` file in the model directory.
@@ -872,6 +1130,39 @@ fn remote_tokenizer_override_for_model(model_path: &Path) -> Option<&'static str
         return None;
     }
     Some("moondream/starmie-v1")
+}
+
+fn remote_tokenizer_override_for_declared_model(
+    model_path: &Path,
+    declared: &HashSet<&str>,
+) -> Result<Option<&'static str>> {
+    if !declared.contains("config.json") {
+        return Ok(None);
+    }
+    let config = std::fs::read_to_string(model_path.join("config.json"))?;
+    let config: serde_json::Value = serde_json::from_str(&config)?;
+    let model_type = config
+        .get("model_type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if !matches!(model_type, "moondream1" | "moondream2") {
+        return Ok(None);
+    }
+
+    let starmie = if declared.contains("moondream.py") {
+        std::fs::read_to_string(model_path.join("moondream.py"))?.contains("moondream/starmie-v1")
+    } else if declared.contains("tokenizer.json") {
+        std::fs::read_to_string(model_path.join("tokenizer.json"))?.contains("<|md_reserved_0|>")
+    } else {
+        false
+    };
+    if !starmie {
+        return Ok(None);
+    }
+    let local_is_starmie = declared.contains("tokenizer.json")
+        && std::fs::read_to_string(model_path.join("tokenizer.json"))?
+            .contains("<|md_reserved_0|>");
+    Ok((!local_is_starmie).then_some("moondream/starmie-v1"))
 }
 
 fn download_remote_tokenizer(repo_id: &str) -> Result<tokenizers::Tokenizer> {
@@ -1103,6 +1394,15 @@ fn is_qwen2_slow_tokenizer_dir(model_path: &Path) -> bool {
 /// `special` flag; the loop comment records the measured cost of not doing that
 /// and why runs rather than two groups.
 fn build_qwen2_bpe_tokenizer(model_path: &Path) -> Result<tokenizers::Tokenizer> {
+    build_qwen2_bpe_tokenizer_with_sidecars(model_path, true, true, false)
+}
+
+fn build_qwen2_bpe_tokenizer_with_sidecars(
+    model_path: &Path,
+    tokenizer_config_declared: bool,
+    added_tokens_declared: bool,
+    strict_declared_files: bool,
+) -> Result<tokenizers::Tokenizer> {
     use tokenizers::Tokenizer;
     use tokenizers::models::bpe::BPE;
 
@@ -1155,11 +1455,22 @@ fn build_qwen2_bpe_tokenizer(model_path: &Path) -> Result<tokenizers::Tokenizer>
     let mut tokenizer = Tokenizer::new(model);
     tokenizer.with_normalizer(Some(tokenizers::normalizers::unicode::NFC));
 
-    let add_prefix_space = std::fs::read_to_string(model_path.join("tokenizer_config.json"))
-        .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .and_then(|cfg| cfg.get("add_prefix_space").and_then(|v| v.as_bool()))
-        .unwrap_or(false);
+    let add_prefix_space = if tokenizer_config_declared && strict_declared_files {
+        serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(
+            model_path.join("tokenizer_config.json"),
+        )?)?
+        .get("add_prefix_space")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    } else if tokenizer_config_declared {
+        std::fs::read_to_string(model_path.join("tokenizer_config.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .and_then(|cfg| cfg.get("add_prefix_space").and_then(|v| v.as_bool()))
+            .unwrap_or(false)
+    } else {
+        false
+    };
 
     let split = tokenizers::pre_tokenizers::split::Split::new(
         tokenizers::pre_tokenizers::split::SplitPattern::Regex(QWEN2_PRETOKENIZE_REGEX.to_string()),
@@ -1181,7 +1492,12 @@ fn build_qwen2_bpe_tokenizer(model_path: &Path) -> Result<tokenizers::Tokenizer>
         tokenizers::processors::byte_level::ByteLevel::default().trim_offsets(false),
     ));
 
-    let added = read_added_tokens_sorted(model_path)?;
+    let added = read_added_tokens_sorted_with_sidecars(
+        model_path,
+        tokenizer_config_declared,
+        added_tokens_declared,
+        strict_declared_files,
+    )?;
     for (id, token) in &added {
         if *id < base_vocab_size {
             return Err(anyhow::anyhow!(
@@ -1327,13 +1643,41 @@ fn validate_dense_vocab_ids(vocab: &HashMap<String, u32>, vocab_path: &Path) -> 
 /// true)` with no way to undo it. LocateAnything is unaffected either way: its
 /// `added_tokens_decoder` carries an explicit `special` on all 1038 entries.
 fn read_added_tokens_sorted(model_path: &Path) -> Result<Vec<(u32, tokenizers::AddedToken)>> {
+    read_added_tokens_sorted_with_sidecars(model_path, true, true, false)
+}
+
+fn read_added_tokens_sorted_with_sidecars(
+    model_path: &Path,
+    tokenizer_config_declared: bool,
+    added_tokens_declared: bool,
+    strict_declared_files: bool,
+) -> Result<Vec<(u32, tokenizers::AddedToken)>> {
     use tokenizers::AddedToken;
 
     let mut out: Vec<(u32, AddedToken)> = Vec::new();
 
-    let config = std::fs::read_to_string(model_path.join("tokenizer_config.json"))
-        .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+    let config = if !tokenizer_config_declared {
+        None
+    } else {
+        match std::fs::read_to_string(model_path.join("tokenizer_config.json")) {
+            Ok(raw) => Some(serde_json::from_str::<serde_json::Value>(&raw)?),
+            Err(error)
+                if !strict_declared_files && error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                None
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    if strict_declared_files
+        && config
+            .as_ref()
+            .is_some_and(|config| !native_added_token_work_is_bounded(config))
+    {
+        return Err(anyhow::anyhow!(
+            "tokenizer_config added-token work exceeds the native bound"
+        ));
+    }
     let decoder = config
         .as_ref()
         .and_then(|cfg| cfg.get("added_tokens_decoder"))
@@ -1358,9 +1702,24 @@ fn read_added_tokens_sorted(model_path: &Path) -> Result<Vec<(u32, tokenizers::A
                 .normalized(flag("normalized", false));
             out.push((id, token));
         }
-    } else if let Ok(raw) = std::fs::read_to_string(model_path.join("added_tokens.json")) {
+    } else if added_tokens_declared {
+        let raw = match std::fs::read_to_string(model_path.join("added_tokens.json")) {
+            Ok(raw) => raw,
+            Err(error)
+                if !strict_declared_files && error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                out.sort_by_key(|(id, _)| *id);
+                return Ok(out);
+            }
+            Err(error) => return Err(error.into()),
+        };
         let map: HashMap<String, u32> = serde_json::from_str(&raw)
             .map_err(|e| anyhow::anyhow!("Failed to parse added_tokens.json: {}", e))?;
+        if strict_declared_files && map.len() > MAX_NATIVE_ADDED_TOKENS {
+            return Err(anyhow::anyhow!(
+                "added_tokens.json entry count exceeds the native bound"
+            ));
+        }
         for (content, id) in map {
             out.push((id, AddedToken::from(content, false).normalized(false)));
         }
@@ -1393,6 +1752,14 @@ fn read_added_tokens_sorted(model_path: &Path) -> Result<Vec<(u32, tokenizers::A
 /// - an encode probe shows the loaded post-processor does NOT already
 ///   insert that id (so correct exports such as Gemma 3 are untouched).
 fn ensure_bos_post_processor(tokenizer: &mut tokenizers::Tokenizer, model_path: &Path) {
+    ensure_bos_post_processor_with_logging(tokenizer, model_path, true);
+}
+
+fn ensure_bos_post_processor_with_logging(
+    tokenizer: &mut tokenizers::Tokenizer,
+    model_path: &Path,
+    log_path: bool,
+) {
     let config_path = model_path.join("tokenizer_config.json");
     let Ok(raw) = std::fs::read_to_string(&config_path) else {
         return;
@@ -1450,21 +1817,25 @@ fn ensure_bos_post_processor(tokenizer: &mut tokenizers::Tokenizer, model_path: 
     match template {
         Ok(template) => {
             tokenizer.with_post_processor(Some(template));
-            tracing::info!(
-                model_path = %model_path.display(),
-                bos_token,
-                bos_id,
-                "tokenizer.json lacks the Gemma BOS post-processor; installed \
-                 the standard `<bos> $A` TemplateProcessing (issue #686)"
-            );
+            if log_path {
+                tracing::info!(
+                    model_path = %model_path.display(),
+                    bos_token,
+                    bos_id,
+                    "tokenizer.json lacks the Gemma BOS post-processor; installed \
+                     the standard `<bos> $A` TemplateProcessing (issue #686)"
+                );
+            }
         }
         Err(err) => {
-            tracing::warn!(
-                model_path = %model_path.display(),
-                error = %err,
-                "failed to install the Gemma BOS post-processor; raw-text \
-                 encodes will remain BOS-less"
-            );
+            if log_path {
+                tracing::warn!(
+                    model_path = %model_path.display(),
+                    error = %err,
+                    "failed to install the Gemma BOS post-processor; raw-text \
+                     encodes will remain BOS-less"
+                );
+            }
         }
     }
 }
@@ -1547,13 +1918,20 @@ fn demote_tool_parser_markers(tokenizer_json: &mut serde_json::Value) -> Vec<Str
 /// the tool-parser markers (see [`demote_tool_parser_markers`]) before the
 /// `tokenizers::Tokenizer` is deserialized from the patched JSON bytes.
 fn build_diffusion_gemma_tokenizer(tokenizer_json_path: &Path) -> Result<tokenizers::Tokenizer> {
+    build_diffusion_gemma_tokenizer_with_logging(tokenizer_json_path, true)
+}
+
+fn build_diffusion_gemma_tokenizer_with_logging(
+    tokenizer_json_path: &Path,
+    log_path: bool,
+) -> Result<tokenizers::Tokenizer> {
     let raw = std::fs::read_to_string(tokenizer_json_path)
         .map_err(|e| anyhow::anyhow!("Failed to read {:?}: {}", tokenizer_json_path, e))?;
     let mut json: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|e| anyhow::anyhow!("Failed to parse {:?}: {}", tokenizer_json_path, e))?;
 
     let demoted = demote_tool_parser_markers(&mut json);
-    if !demoted.is_empty() {
+    if log_path && !demoted.is_empty() {
         tracing::info!(
             tokenizer_json = %tokenizer_json_path.display(),
             markers = ?demoted,
@@ -1595,60 +1973,8 @@ pub fn load_tokenizer(model_path: &Path) -> Result<MlxcelTokenizer> {
         return Ok(MlxcelTokenizer::HuggingFace(tokenizer));
     }
 
-    // Try HuggingFace tokenizer.json first
-    let tokenizer_json_path = model_path.join("tokenizer.json");
-    if tokenizer_json_path.exists() {
-        let mut tokenizer = if is_diffusion_gemma_model(model_path) {
-            build_diffusion_gemma_tokenizer(&tokenizer_json_path)?
-        } else {
-            tokenizers::Tokenizer::from_file(&tokenizer_json_path)
-                .map_err(|e| anyhow::anyhow!(e))?
-        };
-        ensure_bos_post_processor(&mut tokenizer, model_path);
-        return Ok(MlxcelTokenizer::HuggingFace(tokenizer));
-    }
-
-    // Fall back to SentencePiece tokenizer.model
-    let tokenizer_model_path = model_path.join("tokenizer.model");
-    if tokenizer_model_path.exists() {
-        let processor = SentencePieceProcessor::open(&tokenizer_model_path)
-            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer.model: {}", e))?;
-
-        let bos_id = processor.bos_id();
-
-        let (special_tokens, added_token_contents, add_bos) = parse_special_tokens(model_path);
-
-        let sp_tokenizer = SentencePieceTokenizer::new(
-            processor,
-            special_tokens,
-            added_token_contents,
-            bos_id,
-            add_bos,
-        );
-        return Ok(MlxcelTokenizer::SentencePiece(sp_tokenizer));
-    }
-
-    // Fall back to tiktoken (.tiktoken files)
-    if let Some(tiktoken_path) = find_tiktoken_file(model_path) {
-        let tokenizer = TiktokenTokenizer::from_file(&tiktoken_path, model_path)?;
-        return Ok(MlxcelTokenizer::Tiktoken(tokenizer));
-    }
-
-    // Fall back to PLaMo's `tokenizer.jsonl` (a Unigram vocab shipped instead
-    // of tokenizer.json / tokenizer.model; see build_plamo_tokenizer).
-    if model_path.join("tokenizer.jsonl").exists() {
-        return Ok(MlxcelTokenizer::HuggingFace(build_plamo_tokenizer(
-            model_path,
-        )?));
-    }
-
-    // Fall back to the GPT-2-style slow-tokenizer pair (`vocab.json` +
-    // `merges.txt`) that Qwen2-family repositories ship when they never
-    // exported a fast tokenizer.
-    if is_qwen2_slow_tokenizer_dir(model_path) {
-        return Ok(MlxcelTokenizer::HuggingFace(build_qwen2_bpe_tokenizer(
-            model_path,
-        )?));
+    if let Some(tokenizer) = load_local_tokenizer(model_path)? {
+        return Ok(tokenizer);
     }
 
     if let Some(repo_id) = remote_tokenizer_repo_for_model(model_path) {
@@ -1669,14 +1995,439 @@ pub fn load_tokenizer(model_path: &Path) -> Result<MlxcelTokenizer> {
     ))
 }
 
+/// Load only tokenizer artifacts already present in an immutable local model
+/// package. This path never consults the Hugging Face cache or network and
+/// rejects model families whose root loader requires a remote override.
+pub(crate) fn load_tokenizer_local_only(model_path: &Path) -> Result<MlxcelTokenizer> {
+    if let Some(repo_id) = remote_tokenizer_override_for_model(model_path) {
+        return Err(anyhow::anyhow!(
+            "model requires remote tokenizer override {repo_id}; immutable native inspection accepts only declared local artifacts"
+        ));
+    }
+    if let Some(tokenizer) = load_local_tokenizer(model_path)? {
+        return Ok(tokenizer);
+    }
+    if let Some(repo_id) = remote_tokenizer_repo_for_model(model_path) {
+        return Err(anyhow::anyhow!(
+            "model requires remote fallback tokenizer {repo_id}; immutable native inspection accepts only declared local artifacts"
+        ));
+    }
+    Err(anyhow::anyhow!(
+        "No local tokenizer found in {:?} (tried tokenizer.json, tokenizer.model, *.tiktoken, tokenizer.jsonl, and vocab.json + merges.txt)",
+        model_path
+    ))
+}
+
+fn validate_declared_tokenizer_config(model_path: &Path) -> Result<()> {
+    let raw = std::fs::read_to_string(model_path.join("tokenizer_config.json"))?;
+    let value: serde_json::Value = serde_json::from_str(&raw)?;
+    let config = value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("tokenizer_config root is not an object"))?;
+    for field in ["add_bos_token", "add_prefix_space"] {
+        if config.get(field).is_some_and(|value| !value.is_boolean()) {
+            return Err(anyhow::anyhow!("tokenizer_config {field} is not a boolean"));
+        }
+    }
+    if config
+        .get("tokenizer_class")
+        .is_some_and(|value| !value.is_string())
+    {
+        return Err(anyhow::anyhow!(
+            "tokenizer_config tokenizer_class is not a string"
+        ));
+    }
+    if let Some(value) = config.get("added_tokens_decoder") {
+        let decoder = value.as_object().ok_or_else(|| {
+            anyhow::anyhow!("tokenizer_config added_tokens_decoder is not an object")
+        })?;
+        for (id, entry) in decoder {
+            let entry = entry.as_object().ok_or_else(|| {
+                anyhow::anyhow!("tokenizer_config added_tokens_decoder[{id}] is not an object")
+            })?;
+            let content = entry
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "tokenizer_config added_tokens_decoder[{id}] has no string content"
+                    )
+                })?;
+            if content.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "tokenizer_config added_tokens_decoder[{id}] has empty content"
+                ));
+            }
+            for flag in ["special", "single_word", "lstrip", "rstrip", "normalized"] {
+                if entry.get(flag).is_some_and(|value| !value.is_boolean()) {
+                    return Err(anyhow::anyhow!(
+                        "tokenizer_config added_tokens_decoder[{id}].{flag} is not a boolean"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Load one exact primary tokenizer artifact selected by an immutable package
+/// declaration. Unlike [`load_tokenizer_local_only`], this does not rediscover
+/// a higher-precedence tokenizer by scanning the directory.
+pub(crate) fn load_tokenizer_local_only_selected(
+    model_path: &Path,
+    primary_label: &str,
+) -> Result<MlxcelTokenizer> {
+    load_tokenizer_local_only_selected_impl(model_path, primary_label, None)
+}
+
+pub(crate) fn load_tokenizer_local_only_selected_declared(
+    model_path: &Path,
+    primary_label: &str,
+    declared_labels: &[&str],
+) -> Result<MlxcelTokenizer> {
+    let declared = declared_labels.iter().copied().collect::<HashSet<_>>();
+    if !declared.contains(primary_label) {
+        return Err(anyhow::anyhow!(
+            "selected primary tokenizer is not in the immutable package declaration"
+        ));
+    }
+    load_tokenizer_local_only_selected_impl(model_path, primary_label, Some(&declared))
+}
+
+fn load_tokenizer_local_only_selected_impl(
+    model_path: &Path,
+    primary_label: &str,
+    declared: Option<&HashSet<&str>>,
+) -> Result<MlxcelTokenizer> {
+    let is_declared = |label: &str| declared.is_none_or(|labels| labels.contains(label));
+    if declared.is_some() && is_declared("tokenizer_config.json") {
+        validate_declared_tokenizer_config(model_path)?;
+    }
+    let remote_override = match declared {
+        Some(declared) => remote_tokenizer_override_for_declared_model(model_path, declared)?,
+        None => remote_tokenizer_override_for_model(model_path),
+    };
+    if let Some(repo_id) = remote_override {
+        return Err(anyhow::anyhow!(
+            "model requires remote tokenizer override {repo_id}; immutable native inspection accepts only declared local artifacts"
+        ));
+    }
+    let primary = model_path.join(primary_label);
+    let tokenizer = match primary_label {
+        "tokenizer.json" => {
+            let mut tokenizer =
+                if is_declared("config.json") && is_diffusion_gemma_model(model_path) {
+                    build_diffusion_gemma_tokenizer_with_logging(&primary, false)?
+                } else {
+                    tokenizers::Tokenizer::from_file(&primary)
+                        .map_err(|error| anyhow::anyhow!(error))?
+                };
+            if is_declared("tokenizer_config.json") {
+                ensure_bos_post_processor_with_logging(&mut tokenizer, model_path, false);
+            }
+            MlxcelTokenizer::HuggingFace(tokenizer)
+        }
+        "tokenizer.model" => {
+            let processor = SentencePieceProcessor::open(&primary)
+                .map_err(|error| anyhow::anyhow!("Failed to load tokenizer.model: {error}"))?;
+            let bos_id = processor.bos_id();
+            let (special_tokens, added_token_contents, add_bos) =
+                if is_declared("tokenizer_config.json") {
+                    parse_special_tokens_with_native_bounds(model_path, &processor, true)?
+                } else {
+                    (HashMap::new(), HashMap::new(), false)
+                };
+            MlxcelTokenizer::SentencePiece(SentencePieceTokenizer::new(
+                processor,
+                special_tokens,
+                added_token_contents,
+                bos_id,
+                add_bos,
+            ))
+        }
+        "tokenizer.jsonl" => MlxcelTokenizer::HuggingFace(build_plamo_tokenizer(model_path)?),
+        "vocab.json"
+            if is_declared("merges.txt")
+                && is_declared("tokenizer_config.json")
+                && is_qwen2_slow_tokenizer_dir(model_path) =>
+        {
+            MlxcelTokenizer::HuggingFace(build_qwen2_bpe_tokenizer_with_sidecars(
+                model_path,
+                true,
+                is_declared("added_tokens.json"),
+                true,
+            )?)
+        }
+        label if label == "tiktoken.model" || label.ends_with(".tiktoken") => {
+            MlxcelTokenizer::Tiktoken(TiktokenTokenizer::from_file_with_declared_config(
+                &primary,
+                model_path,
+                is_declared("tokenizer_config.json"),
+            )?)
+        }
+        _ => {
+            return Err(anyhow::anyhow!(
+                "declared primary tokenizer artifact is not a supported exact local family"
+            ));
+        }
+    };
+    Ok(tokenizer)
+}
+
+fn load_local_tokenizer(model_path: &Path) -> Result<Option<MlxcelTokenizer>> {
+    // Try HuggingFace tokenizer.json first
+    let tokenizer_json_path = model_path.join("tokenizer.json");
+    if tokenizer_json_path.exists() {
+        let mut tokenizer = if is_diffusion_gemma_model(model_path) {
+            build_diffusion_gemma_tokenizer(&tokenizer_json_path)?
+        } else {
+            tokenizers::Tokenizer::from_file(&tokenizer_json_path)
+                .map_err(|e| anyhow::anyhow!(e))?
+        };
+        ensure_bos_post_processor(&mut tokenizer, model_path);
+        return Ok(Some(MlxcelTokenizer::HuggingFace(tokenizer)));
+    }
+
+    // Fall back to SentencePiece tokenizer.model
+    let tokenizer_model_path = model_path.join("tokenizer.model");
+    if tokenizer_model_path.exists() {
+        let processor = SentencePieceProcessor::open(&tokenizer_model_path)
+            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer.model: {}", e))?;
+
+        let bos_id = processor.bos_id();
+
+        let (special_tokens, added_token_contents, add_bos) =
+            parse_special_tokens(model_path, &processor)?;
+
+        let sp_tokenizer = SentencePieceTokenizer::new(
+            processor,
+            special_tokens,
+            added_token_contents,
+            bos_id,
+            add_bos,
+        );
+        return Ok(Some(MlxcelTokenizer::SentencePiece(sp_tokenizer)));
+    }
+
+    // Fall back to tiktoken (.tiktoken files)
+    if let Some(tiktoken_path) = find_tiktoken_file(model_path) {
+        let tokenizer = TiktokenTokenizer::from_file(&tiktoken_path, model_path)?;
+        return Ok(Some(MlxcelTokenizer::Tiktoken(tokenizer)));
+    }
+
+    // Fall back to PLaMo's `tokenizer.jsonl` (a Unigram vocab shipped instead
+    // of tokenizer.json / tokenizer.model; see build_plamo_tokenizer).
+    if model_path.join("tokenizer.jsonl").exists() {
+        return Ok(Some(MlxcelTokenizer::HuggingFace(build_plamo_tokenizer(
+            model_path,
+        )?)));
+    }
+
+    // Fall back to the GPT-2-style slow-tokenizer pair (`vocab.json` +
+    // `merges.txt`) that Qwen2-family repositories ship when they never
+    // exported a fast tokenizer.
+    if is_qwen2_slow_tokenizer_dir(model_path) {
+        return Ok(Some(MlxcelTokenizer::HuggingFace(
+            build_qwen2_bpe_tokenizer(model_path)?,
+        )));
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         MlxcelTokenizer, build_qwen2_bpe_tokenizer, is_qwen2_slow_tokenizer_dir,
-        read_added_tokens_sorted, remote_tokenizer_override_for_model,
-        remote_tokenizer_repo_for_model, remote_tokenizer_repo_for_model_type,
+        load_tokenizer_local_only, load_tokenizer_local_only_selected,
+        load_tokenizer_local_only_selected_declared, read_added_tokens_sorted,
+        remote_tokenizer_override_for_model, remote_tokenizer_repo_for_model,
+        remote_tokenizer_repo_for_model_type,
     };
+    use base64::Engine;
     use tokenizers::{AddedToken, Tokenizer, models::bpe::BPE};
+
+    fn all_singleton_tiktoken_vocab() -> String {
+        (0u16..=255)
+            .map(|rank| {
+                let token = base64::engine::general_purpose::STANDARD.encode([rank as u8]);
+                format!("{token} {rank}\n")
+            })
+            .collect()
+    }
+
+    fn pinned_sentencepiece_bytes() -> Vec<u8> {
+        let encoded = include_str!("../../testdata/native_runtime/sentencepiece-toy.model.b64")
+            .bytes()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .collect::<Vec<_>>();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("pinned SentencePiece fixture base64 is corrupt");
+        assert_eq!(bytes.len(), 253_270);
+        bytes
+    }
+
+    fn write_pinned_sentencepiece(root: &std::path::Path) {
+        std::fs::write(root.join("tokenizer.model"), pinned_sentencepiece_bytes()).unwrap();
+    }
+
+    #[test]
+    fn exact_local_selection_does_not_rediscover_a_higher_precedence_primary() {
+        let root = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            root.path().join("tiny.tiktoken"),
+            all_singleton_tiktoken_vocab(),
+        )
+        .unwrap();
+        let MlxcelTokenizer::HuggingFace(hf) = MlxcelTokenizer::stub() else {
+            unreachable!()
+        };
+        std::fs::write(
+            root.path().join("tokenizer.json"),
+            hf.to_string(false).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            load_tokenizer_local_only_selected(root.path(), "tiny.tiktoken").unwrap(),
+            MlxcelTokenizer::Tiktoken(_)
+        ));
+    }
+
+    #[test]
+    fn exact_declared_selection_never_reads_an_undeclared_sidecar() {
+        let root = tempfile::TempDir::new().unwrap();
+        write_pinned_sentencepiece(root.path());
+        std::fs::write(
+            root.path().join("tokenizer_config.json"),
+            r#"{"added_tokens_decoder":{"8":{"content":"<hostile>","special":true}}}"#,
+        )
+        .unwrap();
+
+        assert!(
+            load_tokenizer_local_only_selected_declared(
+                root.path(),
+                "tokenizer.model",
+                &["tokenizer.model"],
+            )
+            .is_ok(),
+            "an undeclared sibling cannot influence the selected tokenizer"
+        );
+        assert!(
+            load_tokenizer_local_only_selected_declared(
+                root.path(),
+                "tokenizer.model",
+                &["tokenizer.model", "tokenizer_config.json"],
+            )
+            .is_err(),
+            "the same bytes are validated once the manifest declares the sidecar"
+        );
+    }
+
+    #[test]
+    fn sentencepiece_local_loader_validates_config_and_added_token_bijection() {
+        let root = tempfile::TempDir::new().unwrap();
+        write_pinned_sentencepiece(root.path());
+        for (name, config) in [
+            (
+                "empty content",
+                r#"{"added_tokens_decoder":{"1000":{"content":"","special":true}}}"#,
+            ),
+            ("non-object root", r#"[]"#),
+            ("non-boolean BOS", r#"{"add_bos_token":"yes"}"#),
+            (
+                "non-boolean special flag",
+                r#"{"added_tokens_decoder":{"1000":{"content":"<x>","special":"yes"}}}"#,
+            ),
+            (
+                "numeric id alias",
+                r#"{"added_tokens_decoder":{"1000":{"content":"<x>","special":true},"01000":{"content":"<y>","special":true}}}"#,
+            ),
+            (
+                "base vocabulary relabel",
+                r#"{"added_tokens_decoder":{"8":{"content":"<evil>","special":true}}}"#,
+            ),
+            (
+                "base vocabulary content shadow",
+                r#"{"added_tokens_decoder":{"1000":{"content":"<unk>","special":true}}}"#,
+            ),
+        ] {
+            std::fs::write(root.path().join("tokenizer_config.json"), config).unwrap();
+            assert!(
+                load_tokenizer_local_only_selected(root.path(), "tokenizer.model").is_err(),
+                "{name} must fail during loading, before any splitter can run"
+            );
+        }
+
+        std::fs::write(
+            root.path().join("tokenizer_config.json"),
+            r#"{"added_tokens_decoder":{"1000":{"content":"<|native|>","special":true},"1001":{"content":"<|IMAGE_PLACEHOLDER|>","special":false}}}"#,
+        )
+        .unwrap();
+        let tokenizer = load_tokenizer_local_only_selected(root.path(), "tokenizer.model").unwrap();
+        assert_eq!(tokenizer.encode("<|native|>", false).unwrap(), vec![1000]);
+        assert_eq!(
+            tokenizer.encode("<|IMAGE_PLACEHOLDER|>", false).unwrap(),
+            vec![1001]
+        );
+        assert_eq!(
+            tokenizer.decode(&[1001], true).unwrap(),
+            "<|IMAGE_PLACEHOLDER|>"
+        );
+
+        std::fs::write(
+            root.path().join("tokenizer_config.json"),
+            r#"{"added_tokens_decoder":{"0":{"content":"<unk>","special":true}}}"#,
+        )
+        .unwrap();
+        assert!(
+            load_tokenizer_local_only_selected(root.path(), "tokenizer.model").is_ok(),
+            "the frozen unknown control token may be marked special without relabeling its id"
+        );
+    }
+
+    #[test]
+    fn sentencepiece_uses_the_model_owned_unknown_piece_spelling() {
+        let root = tempfile::TempDir::new().unwrap();
+        let mut model = pinned_sentencepiece_bytes();
+        let offset = model
+            .windows(b"<unk>".len())
+            .position(|window| window == b"<unk>")
+            .expect("pinned model contains its unknown-piece spelling");
+        model[offset..offset + b"<unk>".len()].copy_from_slice(b"[UNK]");
+        std::fs::write(root.path().join("tokenizer.model"), model).unwrap();
+
+        std::fs::write(
+            root.path().join("tokenizer_config.json"),
+            r#"{"added_tokens_decoder":{"0":{"content":"[UNK]","special":true}}}"#,
+        )
+        .unwrap();
+        assert!(
+            load_tokenizer_local_only_selected(root.path(), "tokenizer.model").is_ok(),
+            "the exact custom unknown spelling frozen into the model is accepted"
+        );
+
+        std::fs::write(
+            root.path().join("tokenizer_config.json"),
+            r#"{"added_tokens_decoder":{"0":{"content":"<unk>","special":true}}}"#,
+        )
+        .unwrap();
+        assert!(
+            load_tokenizer_local_only_selected(root.path(), "tokenizer.model").is_err(),
+            "a conventional literal cannot relabel a custom unknown piece"
+        );
+    }
+
+    #[test]
+    fn sentencepiece_non_byte_fallback_unknown_piece_is_not_reinterpreted_as_raw_byte() {
+        let root = tempfile::TempDir::new().unwrap();
+        write_pinned_sentencepiece(root.path());
+        let tokenizer = load_tokenizer_local_only_selected(root.path(), "tokenizer.model").unwrap();
+        assert_eq!(tokenizer.token_to_id("<0xFF>"), None);
+        assert_eq!(
+            tokenizer.token_piece_bytes(0).unwrap(),
+            tokenizer.decode(&[0], false).unwrap().into_bytes()
+        );
+    }
 
     /// Write a minimal Qwen2 slow-tokenizer directory: a byte-level `vocab.json`
     /// covering the ASCII letters plus a `Ġ` (space) marker, one merge, and two
@@ -2131,6 +2882,88 @@ mod tests {
             Some("moondream/starmie-v1")
         );
         assert_eq!(remote_tokenizer_repo_for_model_type("llama"), None);
+    }
+
+    #[test]
+    fn native_local_only_loader_never_uses_moondream_remote_fallbacks() {
+        let moondream3 = override_test_dir(&[("config.json", r#"{"model_type":"moondream3"}"#)]);
+        let error = match load_tokenizer_local_only(&moondream3) {
+            Ok(_) => panic!("remote-only Moondream3 tokenizer unexpectedly loaded locally"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("remote fallback tokenizer"));
+        let _ = std::fs::remove_dir_all(moondream3);
+
+        let moondream2 = override_test_dir(&[
+            ("config.json", r#"{"model_type":"moondream1"}"#),
+            (
+                "moondream.py",
+                "self.tokenizer = Tokenizer.from_pretrained(\"moondream/starmie-v1\")",
+            ),
+            ("tokenizer.json", r#"{"model":{"vocab":{"!":0}}}"#),
+        ]);
+        let error = match load_tokenizer_local_only(&moondream2) {
+            Ok(_) => panic!("stale Moondream2 tokenizer unexpectedly bypassed override"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("remote tokenizer override"));
+        let _ = std::fs::remove_dir_all(moondream2);
+    }
+
+    fn write_valid_hf_tokenizer(path: &std::path::Path, starmie_marker: bool) {
+        let mut tokenizer = Tokenizer::new(BPE::default());
+        if starmie_marker {
+            tokenizer.add_tokens(&[AddedToken::from("<|md_reserved_0|>", true)]);
+        }
+        std::fs::write(path, tokenizer.to_string(false).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn native_local_only_moondream_matrix_accepts_only_coherent_local_artifacts() {
+        let legacy = override_test_dir(&[
+            ("config.json", r#"{"model_type":"moondream1"}"#),
+            (
+                "moondream.py",
+                "self.tokenizer = Tokenizer.from_pretrained(\n    \"vikhyatk/moondream2\", revision=\"2025-01-09\"\n)",
+            ),
+        ]);
+        write_valid_hf_tokenizer(&legacy.join("tokenizer.json"), false);
+        assert!(matches!(
+            load_tokenizer_local_only_selected(&legacy, "tokenizer.json").unwrap(),
+            MlxcelTokenizer::HuggingFace(_)
+        ));
+        let _ = std::fs::remove_dir_all(legacy);
+
+        let already_starmie = override_test_dir(&[
+            ("config.json", r#"{"model_type":"moondream1"}"#),
+            (
+                "moondream.py",
+                "self.tokenizer = Tokenizer.from_pretrained(\"moondream/starmie-v1\")",
+            ),
+        ]);
+        write_valid_hf_tokenizer(&already_starmie.join("tokenizer.json"), true);
+        assert!(matches!(
+            load_tokenizer_local_only_selected(&already_starmie, "tokenizer.json").unwrap(),
+            MlxcelTokenizer::HuggingFace(_)
+        ));
+        let _ = std::fs::remove_dir_all(already_starmie);
+
+        let local_moondream3 =
+            override_test_dir(&[("config.json", r#"{"model_type":"moondream3"}"#)]);
+        write_valid_hf_tokenizer(&local_moondream3.join("tokenizer.json"), false);
+        assert!(matches!(
+            load_tokenizer_local_only_selected(&local_moondream3, "tokenizer.json").unwrap(),
+            MlxcelTokenizer::HuggingFace(_)
+        ));
+        let _ = std::fs::remove_dir_all(local_moondream3);
+
+        let remote_only = override_test_dir(&[("config.json", r#"{"model_type":"moondream3"}"#)]);
+        let error = match load_tokenizer_local_only(&remote_only) {
+            Ok(_) => panic!("remote-only Moondream3 unexpectedly loaded without local bytes"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("remote fallback tokenizer"));
+        let _ = std::fs::remove_dir_all(remote_only);
     }
 
     #[test]

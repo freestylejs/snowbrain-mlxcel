@@ -26,8 +26,14 @@
 //! the `ForSequenceClassification` reranker head) live in
 //! [`super::bert_heads`].
 
+use std::borrow::Cow;
+
 use anyhow::{Result, bail};
 use mlxcel_core::layers::{LayerNorm, UnifiedEmbedding, UnifiedLinear};
+use mlxcel_core::tensor_metadata::{
+    TensorDtypeRequirement, TensorMetadataLookup, TensorQuantization, validate_optional_tensor,
+    validate_required_matrix, validate_required_tensor,
+};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr, dtype};
 
@@ -50,18 +56,148 @@ pub fn sanitize(weights: WeightMap, keep_pooler: bool) -> WeightMap {
     weights
         .into_iter()
         .filter_map(|(key, value)| {
-            let stripped = key
-                .strip_prefix("bert.")
-                .or_else(|| key.strip_prefix("roberta."))
-                .map(str::to_string);
-            let key = stripped.unwrap_or(key);
-            let drop = key.contains("position_ids")
-                || key.starts_with("cls.")
-                || key.starts_with("lm_head.")
-                || (!keep_pooler && key.starts_with("pooler."));
-            (!drop).then_some((key, value))
+            canonical_native_weight_key(&key, keep_pooler)
+                .map(|canonical| (canonical.into_owned(), value))
         })
         .collect()
+}
+
+/// Pure key projection shared by the array sanitizer and immutable header
+/// inspection. Returning `None` means the BERT constructor never observes the
+/// tensor.
+pub(crate) fn canonical_native_weight_key(key: &str, keep_pooler: bool) -> Option<Cow<'_, str>> {
+    let key = key
+        .strip_prefix("bert.")
+        .or_else(|| key.strip_prefix("roberta."))
+        .map_or(Cow::Borrowed(key), Cow::Borrowed);
+    let drop = key.contains("position_ids")
+        || key.starts_with("cls.")
+        || key.starts_with("lm_head.")
+        || (!keep_pooler && key.starts_with("pooler."));
+    (!drop).then_some(key)
+}
+
+/// Structurally executable BERT encoder facts proved from the exact config and
+/// the same sanitized tensor namespace [`BertEncoder::from_weights`] consumes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NativeBertInspection {
+    pub context_window: usize,
+    pub embedding_dimension: usize,
+}
+
+/// Validate every tensor the BERT embedding constructor consumes.
+///
+/// Linear biases and LayerNorm biases are optional in the real constructors;
+/// when supplied, their shape and learned-float dtype are still checked.
+pub(crate) fn validate_native_tensor_metadata(
+    lookup: &dyn TensorMetadataLookup,
+    config: &serde_json::Value,
+    quantization: TensorQuantization,
+) -> Result<NativeBertInspection, String> {
+    let args = BertArgs::from_config(config, BertVariant::Bert)
+        .map_err(|error| format!("BERT config is not constructible: {error}"))?;
+    Activation::from_name(&args.hidden_act)
+        .map_err(|error| format!("BERT activation is not constructible: {error}"))?;
+    if args.vocab_size == 0
+        || args.num_hidden_layers == 0
+        || args.intermediate_size == 0
+        || args.max_position_embeddings == 0
+        || args.type_vocab_size == 0
+    {
+        return Err("BERT config contains a zero construction dimension".to_string());
+    }
+
+    let h = args.hidden_size;
+    validate_required_matrix(
+        lookup,
+        "embeddings.word_embeddings",
+        args.vocab_size,
+        h,
+        quantization,
+        false,
+    )?;
+    validate_required_matrix(
+        lookup,
+        "embeddings.position_embeddings",
+        args.max_position_embeddings,
+        h,
+        quantization,
+        false,
+    )?;
+    validate_required_matrix(
+        lookup,
+        "embeddings.token_type_embeddings",
+        args.type_vocab_size,
+        h,
+        quantization,
+        false,
+    )?;
+    validate_required_tensor(
+        lookup,
+        "embeddings.LayerNorm.weight",
+        &[h],
+        TensorDtypeRequirement::LearnedFloat,
+    )?;
+    validate_optional_tensor(
+        lookup,
+        "embeddings.LayerNorm.bias",
+        &[h],
+        TensorDtypeRequirement::LearnedFloat,
+    )?;
+
+    for index in 0..args.num_hidden_layers {
+        let base = format!("encoder.layer.{index}");
+        for projection in [
+            "attention.self.query",
+            "attention.self.key",
+            "attention.self.value",
+            "attention.output.dense",
+        ] {
+            validate_required_matrix(
+                lookup,
+                &format!("{base}.{projection}"),
+                h,
+                h,
+                quantization,
+                true,
+            )?;
+        }
+        validate_required_matrix(
+            lookup,
+            &format!("{base}.intermediate.dense"),
+            args.intermediate_size,
+            h,
+            quantization,
+            true,
+        )?;
+        validate_required_matrix(
+            lookup,
+            &format!("{base}.output.dense"),
+            h,
+            args.intermediate_size,
+            quantization,
+            true,
+        )?;
+        for norm in ["attention.output.LayerNorm", "output.LayerNorm"] {
+            validate_required_tensor(
+                lookup,
+                &format!("{base}.{norm}.weight"),
+                &[h],
+                TensorDtypeRequirement::LearnedFloat,
+            )?;
+            validate_optional_tensor(
+                lookup,
+                &format!("{base}.{norm}.bias"),
+                &[h],
+                TensorDtypeRequirement::LearnedFloat,
+            )?;
+        }
+    }
+
+    Ok(NativeBertInspection {
+        context_window: args.max_sequence_length(),
+        embedding_dimension: h,
+    })
 }
 
 fn load_layer_norm(weights: &WeightMap, prefix: &str, eps: f32) -> Result<LayerNorm> {

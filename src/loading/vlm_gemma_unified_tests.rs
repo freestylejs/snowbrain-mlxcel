@@ -12,16 +12,199 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Unit tests for the Gemma 4 Unified loader sanitize remaps.
+//! Unit tests for the Gemma 4 Unified loader sanitize remaps and inspection schema.
 
-use super::{normalize_gemma4_unified_key, sanitize_gemma4_unified_weights};
+use std::collections::BTreeMap;
+
+use super::{
+    normalize_gemma4_unified_key, sanitize_gemma4_unified_weights, validate_native_tensor_metadata,
+};
 use mlxcel_core::dtype;
+use mlxcel_core::tensor_metadata::{TensorMetadata, TensorMetadataDtype};
 use mlxcel_core::utils::slice_axis;
 use mlxcel_core::weights::WeightMap;
 
 /// MLX affine-quantization parameters for the synthetic fused-MoE fixtures.
 const Q_BITS: i32 = 4;
 const Q_GROUP_SIZE: i32 = 32;
+
+fn native_tensor(
+    tensors: &mut BTreeMap<String, TensorMetadata>,
+    name: impl Into<String>,
+    shape: &[usize],
+) {
+    tensors.insert(
+        name.into(),
+        TensorMetadata::new(shape.to_vec(), TensorMetadataDtype::F32),
+    );
+}
+
+fn native_matrix(
+    tensors: &mut BTreeMap<String, TensorMetadata>,
+    prefix: impl AsRef<str>,
+    rows: usize,
+    columns: usize,
+) {
+    native_tensor(
+        tensors,
+        format!("{}.weight", prefix.as_ref()),
+        &[rows, columns],
+    );
+}
+
+fn native_unified_fixture() -> (
+    BTreeMap<String, TensorMetadata>,
+    serde_json::Value,
+    serde_json::Value,
+) {
+    let config = serde_json::json!({
+        "model_type": "gemma4_unified",
+        "text_config": {
+            "model_type": "gemma4_unified_text",
+            "hidden_size": 8,
+            "num_hidden_layers": 2,
+            "intermediate_size": 16,
+            "num_attention_heads": 2,
+            "head_dim": 4,
+            "global_head_dim": 4,
+            "rms_norm_eps": 0.000001,
+            "vocab_size": 32,
+            "num_key_value_heads": 1,
+            "num_global_key_value_heads": 1,
+            "rope_parameters": {},
+            "sliding_window": 16,
+            "max_position_embeddings": 64,
+            "attention_k_eq_v": true,
+            "layer_types": ["sliding_attention", "full_attention"]
+        },
+        "vision_config": {
+            "patch_size": 1,
+            "pooling_kernel_size": 1,
+            "model_patch_size": 2,
+            "mm_embed_dim": 8,
+            "mm_posemb_size": 4,
+            "num_soft_tokens": 4,
+            "output_proj_dims": 8
+        },
+        "audio_config": {
+            "audio_samples_per_token": 4,
+            "audio_embed_dim": 4,
+            "hidden_size": 4,
+            "output_proj_dims": 4
+        },
+        "vision_soft_tokens_per_video_frame": 2,
+        "video_token_id": 31
+    });
+    let processor = serde_json::json!({
+        "processor_class": "Gemma4UnifiedProcessor",
+        "image_processor": {
+            "model_patch_size": 2,
+            "patch_size": 1,
+            "pooling_kernel_size": 1,
+            "max_soft_tokens": 4
+        }
+    });
+    let mut tensors = BTreeMap::new();
+    native_matrix(&mut tensors, "language_model.model.embed_tokens", 32, 8);
+    native_tensor(&mut tensors, "language_model.model.norm.weight", &[8]);
+    for index in 0..2 {
+        let base = format!("language_model.model.layers.{index}");
+        native_matrix(&mut tensors, format!("{base}.self_attn.q_proj"), 8, 8);
+        native_matrix(&mut tensors, format!("{base}.self_attn.o_proj"), 8, 8);
+        native_tensor(
+            &mut tensors,
+            format!("{base}.self_attn.q_norm.weight"),
+            &[4],
+        );
+        native_matrix(&mut tensors, format!("{base}.self_attn.k_proj"), 4, 8);
+        native_tensor(
+            &mut tensors,
+            format!("{base}.self_attn.k_norm.weight"),
+            &[4],
+        );
+        if index == 0 {
+            native_matrix(&mut tensors, format!("{base}.self_attn.v_proj"), 4, 8);
+        }
+        for projection in ["gate_proj", "up_proj"] {
+            native_matrix(&mut tensors, format!("{base}.mlp.{projection}"), 16, 8);
+        }
+        native_matrix(&mut tensors, format!("{base}.mlp.down_proj"), 8, 16);
+        for norm in [
+            "input_layernorm",
+            "post_attention_layernorm",
+            "pre_feedforward_layernorm",
+            "post_feedforward_layernorm",
+        ] {
+            native_tensor(&mut tensors, format!("{base}.{norm}.weight"), &[8]);
+        }
+        native_tensor(&mut tensors, format!("{base}.layer_scalar"), &[1]);
+    }
+    for (name, width) in [("patch_ln1", 12), ("patch_ln2", 8), ("pos_norm", 8)] {
+        native_tensor(
+            &mut tensors,
+            format!("vision_embedder.{name}.weight"),
+            &[width],
+        );
+        native_tensor(
+            &mut tensors,
+            format!("vision_embedder.{name}.bias"),
+            &[width],
+        );
+    }
+    native_matrix(&mut tensors, "vision_embedder.patch_dense", 8, 12);
+    native_tensor(&mut tensors, "vision_embedder.pos_embedding", &[4, 2, 8]);
+    native_matrix(&mut tensors, "embed_vision.embedding_projection", 8, 8);
+    native_matrix(&mut tensors, "embed_audio.embedding_projection", 8, 4);
+    (tensors, config, processor)
+}
+
+#[test]
+fn native_unified_descriptor_requires_the_complete_constructor_schema() {
+    let (tensors, config, processor) = native_unified_fixture();
+    let facts = validate_native_tensor_metadata(&tensors, &config, Some(&processor)).unwrap();
+    assert_eq!(facts.context_window, 64);
+    assert!(facts.image && facts.audio && facts.video);
+
+    let mut incomplete = tensors.clone();
+    incomplete.remove("language_model.model.layers.1.mlp.down_proj.weight");
+    assert!(validate_native_tensor_metadata(&incomplete, &config, Some(&processor)).is_err());
+
+    let mut wrong_shape = tensors.clone();
+    native_tensor(
+        &mut wrong_shape,
+        "vision_embedder.pos_embedding",
+        &[1, 2, 8],
+    );
+    assert!(validate_native_tensor_metadata(&wrong_shape, &config, Some(&processor)).is_err());
+
+    let mut scalar_anchor = BTreeMap::new();
+    native_tensor(&mut scalar_anchor, "language_model.model.norm.weight", &[8]);
+    assert!(validate_native_tensor_metadata(&scalar_anchor, &config, Some(&processor)).is_err());
+}
+
+#[test]
+fn native_unified_audio_truth_matches_the_loader_trigger() {
+    let (mut tensors, config, processor) = native_unified_fixture();
+    tensors.remove("embed_audio.embedding_projection.weight");
+    let facts = validate_native_tensor_metadata(&tensors, &config, Some(&processor)).unwrap();
+    assert!(!facts.audio, "audio_config alone does not construct audio");
+
+    let (tensors, mut config, processor) = native_unified_fixture();
+    config["audio_config"] = serde_json::Value::Null;
+    let facts = validate_native_tensor_metadata(&tensors, &config, Some(&processor)).unwrap();
+    assert!(
+        !facts.audio,
+        "audio weights are ignored without audio_config"
+    );
+
+    let (mut tensors, config, processor) = native_unified_fixture();
+    native_tensor(
+        &mut tensors,
+        "embed_audio.embedding_projection.weight",
+        &[1, 1],
+    );
+    assert!(validate_native_tensor_metadata(&tensors, &config, Some(&processor)).is_err());
+}
 
 /// Build a synthetic quantized fused `gate_up_proj` triplet in the on-disk
 /// layout the runtime expects: `weight`/`scales`/`biases` shaped

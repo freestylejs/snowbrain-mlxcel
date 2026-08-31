@@ -37,4 +37,6 @@ mod tests;
 pub use config::{
     DrafterQuantizationArgs, DrafterRopeParameters, DrafterTextConfig, Gemma4AssistantConfig,
 };
-pub use model::Gemma4AssistantDraftModel;
+pub use model::{
+    Gemma4AssistantDraftModel, NativeGemma4AssistantInspection, validate_native_tensor_metadata,
+};

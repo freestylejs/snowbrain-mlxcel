@@ -16,13 +16,18 @@
 //! sanitization, position-id construction and the forward pass over a tiny
 //! deterministic random-weight checkpoint.
 
+use std::collections::BTreeMap;
 use std::sync::MutexGuard;
 
+use mlxcel_core::tensor_metadata::{TensorMetadata, TensorMetadataDtype, TensorQuantization};
 use mlxcel_core::utils::array_to_vec_f32;
 use mlxcel_core::weights::WeightMap;
 use serde_json::{Value, json};
 
-use super::{BertArgs, BertEncoder, BertVariant, sanitize, xlm_roberta_position_ids};
+use super::{
+    BertArgs, BertEncoder, BertVariant, canonical_native_weight_key, sanitize,
+    validate_native_tensor_metadata, xlm_roberta_position_ids,
+};
 
 /// Serializes every BERT test that drives MLX.
 ///
@@ -106,6 +111,114 @@ pub(crate) fn tiny_config(variant: BertVariant) -> Value {
 /// Resolved args of the fixture checkpoint.
 pub(crate) fn tiny_args(variant: BertVariant) -> BertArgs {
     BertArgs::from_config(&tiny_config(variant), variant).expect("fixture config parses")
+}
+
+fn tiny_tensor_metadata() -> BTreeMap<String, TensorMetadata> {
+    let args = tiny_args(BertVariant::Bert);
+    let h = args.hidden_size;
+    let mut tensors = BTreeMap::new();
+    let mut put = |name: String, shape: Vec<usize>| {
+        tensors.insert(name, TensorMetadata::new(shape, TensorMetadataDtype::F32));
+    };
+    put(
+        "embeddings.word_embeddings.weight".to_string(),
+        vec![args.vocab_size, h],
+    );
+    put(
+        "embeddings.position_embeddings.weight".to_string(),
+        vec![args.max_position_embeddings, h],
+    );
+    put(
+        "embeddings.token_type_embeddings.weight".to_string(),
+        vec![args.type_vocab_size, h],
+    );
+    put("embeddings.LayerNorm.weight".to_string(), vec![h]);
+    for index in 0..args.num_hidden_layers {
+        let base = format!("encoder.layer.{index}");
+        for projection in [
+            "attention.self.query",
+            "attention.self.key",
+            "attention.self.value",
+            "attention.output.dense",
+        ] {
+            put(format!("{base}.{projection}.weight"), vec![h, h]);
+        }
+        put(
+            format!("{base}.intermediate.dense.weight"),
+            vec![args.intermediate_size, h],
+        );
+        put(
+            format!("{base}.output.dense.weight"),
+            vec![h, args.intermediate_size],
+        );
+        for norm in ["attention.output.LayerNorm", "output.LayerNorm"] {
+            put(format!("{base}.{norm}.weight"), vec![h]);
+        }
+    }
+    tensors
+}
+
+#[test]
+fn native_descriptor_validates_the_complete_constructor_schema() {
+    let quantization = TensorQuantization {
+        group_size: 64,
+        bits: 4,
+    };
+    let mut tensors = tiny_tensor_metadata();
+    let result =
+        validate_native_tensor_metadata(&tensors, &tiny_config(BertVariant::Bert), quantization)
+            .unwrap();
+    assert_eq!(result.context_window, MAX_POSITIONS);
+    assert_eq!(result.embedding_dimension, HIDDEN);
+
+    tensors.remove("encoder.layer.1.output.LayerNorm.weight");
+    assert!(
+        validate_native_tensor_metadata(&tensors, &tiny_config(BertVariant::Bert), quantization)
+            .unwrap_err()
+            .contains("encoder.layer.1.output.LayerNorm.weight")
+    );
+}
+
+#[test]
+fn native_descriptor_rejects_wrong_shape_and_dtype_but_keeps_optional_biases_optional() {
+    let quantization = TensorQuantization {
+        group_size: 64,
+        bits: 4,
+    };
+    let mut tensors = tiny_tensor_metadata();
+    tensors.insert(
+        "embeddings.LayerNorm.bias".to_string(),
+        TensorMetadata::new(vec![HIDDEN], TensorMetadataDtype::F16),
+    );
+    validate_native_tensor_metadata(&tensors, &tiny_config(BertVariant::Bert), quantization)
+        .unwrap();
+
+    tensors.insert(
+        "encoder.layer.0.attention.self.query.weight".to_string(),
+        TensorMetadata::new(vec![HIDDEN - 1, HIDDEN], TensorMetadataDtype::F32),
+    );
+    assert!(
+        validate_native_tensor_metadata(&tensors, &tiny_config(BertVariant::Bert), quantization)
+            .is_err()
+    );
+    tensors.insert(
+        "encoder.layer.0.attention.self.query.weight".to_string(),
+        TensorMetadata::new(vec![HIDDEN, HIDDEN], TensorMetadataDtype::I32),
+    );
+    assert!(
+        validate_native_tensor_metadata(&tensors, &tiny_config(BertVariant::Bert), quantization)
+            .is_err()
+    );
+}
+
+#[test]
+fn native_header_key_projection_is_identical_to_the_array_sanitizer() {
+    assert_eq!(
+        canonical_native_weight_key("bert.encoder.layer.0.output.dense.weight", false).unwrap(),
+        "encoder.layer.0.output.dense.weight"
+    );
+    assert!(canonical_native_weight_key("bert.pooler.dense.weight", false).is_none());
+    assert!(canonical_native_weight_key("cls.predictions.bias", false).is_none());
 }
 
 /// Every tensor the encoder reads, in the sanitized (prefix-free) layout.

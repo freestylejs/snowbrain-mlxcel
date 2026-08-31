@@ -20,6 +20,7 @@
 //! loaders) so each file stays under the project's 500-line cap.
 
 use anyhow::Result;
+use mlxcel_core::tensor_metadata::{TensorMetadataLookup, TensorQuantization};
 use std::path::Path;
 
 use crate::LoadedModel;
@@ -203,7 +204,7 @@ fn split_fused_gate_up_component(
 }
 
 /// Normalize a single `gemma4_unified` weight key (prefix handling only).
-fn normalize_gemma4_unified_key(key: &str) -> String {
+pub(crate) fn normalize_gemma4_unified_key(key: &str) -> String {
     // `model.language_model.X` → `language_model.model.X`.
     if let Some(rest) = key.strip_prefix("model.language_model.") {
         if rest.starts_with("model.") {
@@ -226,6 +227,150 @@ fn normalize_gemma4_unified_key(key: &str) -> String {
         return format!("language_model.model.{rest}");
     }
     key.to_string()
+}
+
+/// Complete structural facts proved by the Gemma 4 Unified loader schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NativeGemma4UnifiedInspection {
+    pub context_window: usize,
+    pub image: bool,
+    pub audio: bool,
+    pub video: bool,
+}
+
+/// Validate the exact text, vision, and optional audio tensors consumed by
+/// [`load_gemma4_unified`] using acquisition-bound header metadata only.
+pub(crate) fn validate_native_tensor_metadata(
+    lookup: &dyn TensorMetadataLookup,
+    config: &serde_json::Value,
+    processor_config: Option<&serde_json::Value>,
+) -> std::result::Result<NativeGemma4UnifiedInspection, String> {
+    use crate::vision::encoders::gemma4_unified::validate_native_tensor_metadata as validate_vision;
+    use crate::vision::gemma4_multimodal_embedder::validate_native_tensor_metadata as validate_projection;
+    use crate::vision::gemma4_unified_config::Gemma4UnifiedConfig;
+
+    let unified: Gemma4UnifiedConfig = serde_json::from_value(config.clone())
+        .map_err(|error| format!("Gemma 4 Unified config is invalid: {error}"))?;
+    if unified.model_type != "gemma4_unified" {
+        return Err(format!(
+            "unsupported Gemma 4 Unified model_type {:?}",
+            unified.model_type
+        ));
+    }
+    let text = crate::models::gemma4::validate_native_text_tensor_metadata(
+        lookup,
+        config,
+        "language_model.model",
+    )?;
+
+    let quantization_block = config
+        .get("text_config")
+        .and_then(|text| text.get("quantization"))
+        .or_else(|| config.get("quantization"));
+    let group_size = quantization_block
+        .and_then(|value| value.get("group_size"))
+        .and_then(serde_json::Value::as_u64)
+        .map(i32::try_from)
+        .transpose()
+        .map_err(|_| "Gemma 4 Unified quantization group_size exceeds i32".to_string())?
+        .unwrap_or(64);
+    let bits = quantization_block
+        .and_then(|value| value.get("bits"))
+        .and_then(serde_json::Value::as_u64)
+        .map(i32::try_from)
+        .transpose()
+        .map_err(|_| "Gemma 4 Unified quantization bits exceed i32".to_string())?
+        .unwrap_or(4);
+    let quantization = TensorQuantization { group_size, bits };
+
+    validate_vision(
+        lookup,
+        "vision_embedder",
+        &unified.vision_config,
+        quantization,
+    )?;
+    validate_projection(
+        lookup,
+        "embed_vision",
+        text.hidden_size,
+        unified.vision_config.output_proj_dims,
+        quantization,
+    )?;
+
+    let audio_weight_present = lookup
+        .tensor_metadata("embed_audio.embedding_projection.weight")
+        .is_some();
+    let audio = match (&unified.audio_config, audio_weight_present) {
+        (Some(audio), true) => {
+            if audio.audio_embed_dim == 0
+                || audio.hidden_size != audio.audio_embed_dim
+                || audio.output_proj_dims != audio.audio_embed_dim
+                || audio.audio_samples_per_token != audio.audio_embed_dim
+            {
+                return Err("Gemma 4 Unified audio geometry is inconsistent".to_string());
+            }
+            validate_projection(
+                lookup,
+                "embed_audio",
+                text.hidden_size,
+                audio.output_proj_dims,
+                quantization,
+            )?;
+            true
+        }
+        // The real loader constructs the optional audio embedder only when
+        // both config and the projection weight trigger are present. It
+        // ignores retained audio keys when config is absent, and skips the
+        // entire projection when the trigger is absent.
+        _ => false,
+    };
+
+    let video = if let Some(processor) = processor_config {
+        let image = processor
+            .get("image_processor")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| "Gemma 4 Unified processor has no image_processor".to_string())?;
+        processor
+            .get("processor_class")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| *value == "Gemma4UnifiedProcessor")
+            .ok_or_else(|| "Gemma 4 Unified processor_class is invalid".to_string())?;
+        let exact_usize = |key: &str, expected: usize| -> std::result::Result<(), String> {
+            let observed = image
+                .get(key)
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok());
+            if observed != Some(expected) {
+                return Err(format!(
+                    "Gemma 4 Unified image_processor {key} is {observed:?}, expected {expected}"
+                ));
+            }
+            Ok(())
+        };
+        exact_usize("model_patch_size", unified.vision_config.model_patch_size)?;
+        exact_usize("patch_size", unified.vision_config.patch_size)?;
+        exact_usize(
+            "pooling_kernel_size",
+            unified.vision_config.pooling_kernel_size,
+        )?;
+        exact_usize("max_soft_tokens", unified.vision_config.num_soft_tokens)?;
+        if unified.vision_soft_tokens_per_video_frame == 0
+            || unified.vision_soft_tokens_per_video_frame > unified.vision_config.num_soft_tokens
+            || unified.video_token_id < 0
+        {
+            return Err("Gemma 4 Unified video token geometry is invalid".to_string());
+        }
+        true
+    } else {
+        false
+    };
+
+    Ok(NativeGemma4UnifiedInspection {
+        context_window: text.context_window,
+        image: true,
+        audio,
+        video,
+    })
 }
 
 /// Load a Gemma 4 Unified (`gemma4_unified`) multimodal model.

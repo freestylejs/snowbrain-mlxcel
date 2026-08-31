@@ -21,13 +21,14 @@
 //! ordering, and error propagation.
 
 use super::config::{DrafterRopeParameters, DrafterTextConfig, Gemma4AssistantConfig};
-use super::model::Gemma4AssistantDraftModel;
+use super::model::{Gemma4AssistantDraftModel, validate_native_tensor_metadata};
 use crate::drafter::{Drafter, DrafterError, DrafterKind, SharedKv};
 use crate::ffi::{self, MlxArray};
 use crate::generate::{LanguageModel, SamplingConfig};
+use crate::tensor_metadata::{TensorMetadata, TensorMetadataDtype};
 use crate::weights::WeightMap;
 use cxx::UniquePtr;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Minimal drafter config used by every test. Uses `hidden_size=64`, 2 layers
 /// in a SWA / full pattern, head_dim=32 → 2 heads, all KV-shared. Field
@@ -212,6 +213,141 @@ fn make_test_weights(config: &Gemma4AssistantConfig) -> WeightMap {
     }
 
     w
+}
+
+fn make_test_tensor_metadata(config: &Gemma4AssistantConfig) -> BTreeMap<String, TensorMetadata> {
+    let text = config.text_config();
+    let h = text.hidden_size;
+    let mut tensors = BTreeMap::new();
+    let mut put = |name: String, shape: Vec<usize>, dtype: TensorMetadataDtype| {
+        tensors.insert(name, TensorMetadata::new(shape, dtype));
+    };
+    put(
+        "model.embed_tokens.weight".to_string(),
+        vec![text.vocab_size, h],
+        TensorMetadataDtype::F32,
+    );
+    put(
+        "model.norm.weight".to_string(),
+        vec![h],
+        TensorMetadataDtype::F32,
+    );
+    put(
+        "pre_projection.weight".to_string(),
+        vec![h, config.backbone_hidden_size * 2],
+        TensorMetadataDtype::F32,
+    );
+    put(
+        "post_projection.weight".to_string(),
+        vec![config.backbone_hidden_size, h],
+        TensorMetadataDtype::F32,
+    );
+    if !config.tie_word_embeddings {
+        put(
+            "lm_head.weight".to_string(),
+            vec![text.vocab_size, h],
+            TensorMetadataDtype::F32,
+        );
+    }
+    if config.use_ordered_embeddings {
+        put(
+            "masked_embedding.centroids.weight".to_string(),
+            vec![config.num_centroids, h],
+            TensorMetadataDtype::F32,
+        );
+        put(
+            "masked_embedding.token_ordering".to_string(),
+            vec![text.vocab_size],
+            TensorMetadataDtype::I64,
+        );
+    }
+    for index in 0..text.num_hidden_layers {
+        let base = format!("model.layers.{index}");
+        let head_dim = text.head_dim_for_layer(index) as usize;
+        let q_width = text.num_attention_heads * head_dim;
+        for (name, shape) in [
+            ("self_attn.q_proj", vec![q_width, h]),
+            ("self_attn.o_proj", vec![h, q_width]),
+            ("mlp.gate_proj", vec![text.intermediate_size, h]),
+            ("mlp.up_proj", vec![text.intermediate_size, h]),
+            ("mlp.down_proj", vec![h, text.intermediate_size]),
+        ] {
+            put(
+                format!("{base}.{name}.weight"),
+                shape,
+                TensorMetadataDtype::F32,
+            );
+        }
+        put(
+            format!("{base}.self_attn.q_norm.weight"),
+            vec![head_dim],
+            TensorMetadataDtype::F32,
+        );
+        for norm in [
+            "input_layernorm",
+            "post_attention_layernorm",
+            "pre_feedforward_layernorm",
+            "post_feedforward_layernorm",
+        ] {
+            put(
+                format!("{base}.{norm}.weight"),
+                vec![h],
+                TensorMetadataDtype::F32,
+            );
+        }
+    }
+    tensors
+}
+
+#[test]
+fn native_descriptor_requires_the_complete_drafter_constructor_schema() {
+    let config = make_test_config(2, true);
+    let value = serde_json::to_value(&config).unwrap();
+    let mut tensors = make_test_tensor_metadata(&config);
+    let inspection = validate_native_tensor_metadata(&tensors, &value).unwrap();
+    assert_eq!(inspection.context_window, 256);
+
+    tensors.remove("model.layers.1.mlp.down_proj.weight");
+    assert!(
+        validate_native_tensor_metadata(&tensors, &value)
+            .unwrap_err()
+            .contains("model.layers.1.mlp.down_proj.weight")
+    );
+}
+
+#[test]
+fn native_descriptor_rejects_wrong_shape_dtype_and_non_shared_layers() {
+    let config = make_test_config(2, true);
+    let mut value = serde_json::to_value(&config).unwrap();
+    let mut tensors = make_test_tensor_metadata(&config);
+    tensors.insert(
+        "post_projection.weight".to_string(),
+        TensorMetadata::new(
+            vec![
+                config.backbone_hidden_size - 1,
+                config.text_config().hidden_size,
+            ],
+            TensorMetadataDtype::F32,
+        ),
+    );
+    assert!(validate_native_tensor_metadata(&tensors, &value).is_err());
+
+    tensors = make_test_tensor_metadata(&config);
+    tensors.insert(
+        "model.layers.0.input_layernorm.weight".to_string(),
+        TensorMetadata::new(
+            vec![config.text_config().hidden_size],
+            TensorMetadataDtype::I32,
+        ),
+    );
+    assert!(validate_native_tensor_metadata(&tensors, &value).is_err());
+
+    value["text_config"]["num_kv_shared_layers"] = serde_json::json!(1);
+    assert!(validate_native_tensor_metadata(&make_test_tensor_metadata(&config), &value).is_err());
+
+    value = serde_json::to_value(&config).unwrap();
+    value["block_size"] = serde_json::json!(1);
+    assert!(validate_native_tensor_metadata(&make_test_tensor_metadata(&config), &value).is_err());
 }
 
 /// Mock `LanguageModel` for `bind()` testing. Only `embed_tokens` is

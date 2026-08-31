@@ -35,6 +35,10 @@
 //! (`embed_vision`), exactly as the audio feature path uses `embed_audio`.
 
 use mlxcel_core::layers::{LayerNorm, UnifiedLinear};
+use mlxcel_core::tensor_metadata::{
+    TensorDtypeRequirement, TensorMetadataLookup, TensorQuantization, validate_required_matrix,
+    validate_required_tensor,
+};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 
@@ -67,6 +71,62 @@ fn layer_norm_from_weights(
         .get(&format!("{prefix}.bias"))
         .map(|w| mlxcel_core::copy(w));
     Ok(LayerNorm::new(weight, bias, eps))
+}
+
+/// Validate the complete encoder-free vision constructor schema from tensor
+/// headers only.
+pub(crate) fn validate_native_tensor_metadata(
+    lookup: &dyn TensorMetadataLookup,
+    prefix: &str,
+    config: &Gemma4UnifiedVisionConfig,
+    quantization: TensorQuantization,
+) -> Result<(), String> {
+    if config.model_patch_size == 0
+        || config.mm_embed_dim == 0
+        || config.mm_posemb_size == 0
+        || config.num_soft_tokens == 0
+        || config.output_proj_dims != config.mm_embed_dim
+    {
+        return Err("Gemma 4 Unified vision geometry is not constructible".to_string());
+    }
+    let patch_dim = config
+        .model_patch_size
+        .checked_mul(config.model_patch_size)
+        .and_then(|value| value.checked_mul(3))
+        .ok_or_else(|| "Gemma 4 Unified patch dimension overflowed".to_string())?;
+    for (name, width) in [
+        ("patch_ln1", patch_dim),
+        ("patch_ln2", config.mm_embed_dim),
+        ("pos_norm", config.mm_embed_dim),
+    ] {
+        validate_required_tensor(
+            lookup,
+            &format!("{prefix}.{name}.weight"),
+            &[width],
+            TensorDtypeRequirement::LearnedFloat,
+        )?;
+        validate_required_tensor(
+            lookup,
+            &format!("{prefix}.{name}.bias"),
+            &[width],
+            TensorDtypeRequirement::LearnedFloat,
+        )?;
+    }
+    validate_required_matrix(
+        lookup,
+        &format!("{prefix}.patch_dense"),
+        config.mm_embed_dim,
+        patch_dim,
+        quantization,
+        true,
+    )?;
+    validate_required_tensor(
+        lookup,
+        &format!("{prefix}.pos_embedding"),
+        &[config.mm_posemb_size, 2, config.mm_embed_dim],
+        TensorDtypeRequirement::LearnedFloat,
+    )?;
+    Ok(())
 }
 
 impl Gemma4UnifiedVisionEmbedder {

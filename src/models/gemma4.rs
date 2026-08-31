@@ -41,6 +41,10 @@ use mlxcel_core::layers::{
     FusedQKVLinear, KVCache, RMSNorm, RotatingKVCache, UnifiedEmbedding, UnifiedLinear,
     compiled_gelu_mlp_fp16,
 };
+use mlxcel_core::tensor_metadata::{
+    TensorDtypeRequirement, TensorMetadataLookup, TensorQuantization, validate_required_matrix,
+    validate_required_tensor,
+};
 use mlxcel_core::utils::{
     create_causal_mask, create_causal_mask_with_left_padding, create_causal_mask_with_window,
     create_causal_mask_with_window_and_left_padding, create_sliding_window_prefill_mask,
@@ -391,6 +395,238 @@ impl ModelArgs {
     pub fn eos_token_ids(&self) -> Vec<i32> {
         parse_eos_ids(self.eos_token_id.as_ref())
     }
+}
+
+/// Header-only facts proved by the complete Gemma 4 text constructor schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NativeGemma4TextInspection {
+    pub context_window: usize,
+    pub hidden_size: usize,
+}
+
+/// Validate the canonical tensor namespace consumed by
+/// [`Gemma4TextModel::from_weights`] without allocating an MLX array.
+///
+/// The MoE and per-layer-input constructor branches are rejected until their
+/// distinct schemas are represented here. A family is therefore never
+/// qualified merely because its `model_type` is Gemma 4.
+pub(crate) fn validate_native_text_tensor_metadata(
+    lookup: &dyn TensorMetadataLookup,
+    full_config: &serde_json::Value,
+    prefix: &str,
+) -> Result<NativeGemma4TextInspection, String> {
+    validate_quantization_scheme(full_config)?;
+    let args: ModelArgs = serde_json::from_value(full_config.clone())
+        .map_err(|error| format!("Gemma 4 root config is invalid: {error}"))?;
+    let mut config: TextConfig = serde_json::from_value(args.text_config)
+        .map_err(|error| format!("Gemma 4 text config is invalid: {error}"))?;
+    if config.quantization.is_none() {
+        config.quantization = args.quantization;
+    }
+    if config.quantization.is_none()
+        && let Some(quantization_config) = args.quantization_config
+    {
+        let root = serde_json::json!({ "quantization_config": quantization_config });
+        config.quantization = Some(QuantizationArgs {
+            group_size: super::sanitize::gemma4_configured_group_size(Some(&root)) as usize,
+            bits: super::sanitize::gemma4_configured_bits(Some(&root)) as usize,
+            overrides: HashMap::new(),
+        });
+    }
+    if !matches!(
+        config.model_type.as_str(),
+        "gemma4_text" | "gemma4_unified_text"
+    ) {
+        return Err(format!(
+            "unsupported Gemma 4 text model_type {:?}",
+            config.model_type
+        ));
+    }
+    if config.hidden_size == 0
+        || config.num_hidden_layers == 0
+        || config.intermediate_size == 0
+        || config.num_attention_heads == 0
+        || config.head_dim == 0
+        || config.vocab_size == 0
+        || config.num_key_value_heads == 0
+        || config.max_position_embeddings == 0
+    {
+        return Err("Gemma 4 text config contains a zero construction dimension".to_string());
+    }
+    if config.enable_moe_block {
+        return Err(
+            "Gemma 4 native tensor inspection has no complete MoE constructor descriptor"
+                .to_string(),
+        );
+    }
+    if config.hidden_size_per_layer_input > 0 {
+        return Err(
+            "Gemma 4 native tensor inspection has no complete per-layer-input descriptor"
+                .to_string(),
+        );
+    }
+    if config.layer_types.len() != config.num_hidden_layers
+        || config.layer_types.iter().any(|layer_type| {
+            !matches!(layer_type.as_str(), "sliding_attention" | "full_attention")
+        })
+    {
+        return Err("Gemma 4 layer_types must exactly cover every constructor layer".to_string());
+    }
+    if config.num_kv_shared_layers > config.num_hidden_layers {
+        return Err("Gemma 4 num_kv_shared_layers exceeds num_hidden_layers".to_string());
+    }
+
+    let quantization_for = |module_prefix: &str| {
+        let params = config.quant_params_for(module_prefix);
+        TensorQuantization {
+            group_size: params.group_size,
+            bits: params.bits,
+        }
+    };
+    let embed_prefix = format!("{prefix}.embed_tokens");
+    validate_required_matrix(
+        lookup,
+        &embed_prefix,
+        config.vocab_size,
+        config.hidden_size,
+        quantization_for(&embed_prefix),
+        false,
+    )?;
+    validate_required_tensor(
+        lookup,
+        &format!("{prefix}.norm.weight"),
+        &[config.hidden_size],
+        TensorDtypeRequirement::LearnedFloat,
+    )?;
+
+    let first_shared = config.first_kv_shared_layer_idx();
+    for index in 0..config.num_hidden_layers {
+        let base = format!("{prefix}.layers.{index}");
+        let attention = format!("{base}.self_attn");
+        let head_dim = usize::try_from(config.head_dim_for_layer(index))
+            .map_err(|_| format!("{base} has an invalid attention head dimension"))?;
+        let q_width = config
+            .num_attention_heads
+            .checked_mul(head_dim)
+            .ok_or_else(|| format!("{base} attention output width overflowed"))?;
+        let kv_heads = usize::try_from(config.num_kv_heads_for_layer(index))
+            .map_err(|_| format!("{base} has an invalid K/V head count"))?;
+        let kv_width = kv_heads
+            .checked_mul(head_dim)
+            .ok_or_else(|| format!("{base} K/V output width overflowed"))?;
+        validate_required_matrix(
+            lookup,
+            &format!("{attention}.q_proj"),
+            q_width,
+            config.hidden_size,
+            quantization_for(&format!("{attention}.q_proj")),
+            true,
+        )?;
+        validate_required_matrix(
+            lookup,
+            &format!("{attention}.o_proj"),
+            config.hidden_size,
+            q_width,
+            quantization_for(&format!("{attention}.o_proj")),
+            true,
+        )?;
+        validate_required_tensor(
+            lookup,
+            &format!("{attention}.q_norm.weight"),
+            &[head_dim],
+            TensorDtypeRequirement::LearnedFloat,
+        )?;
+
+        if config.is_kv_shared_layer(index) {
+            if !config.layer_types[..first_shared]
+                .iter()
+                .any(|layer_type| layer_type == &config.layer_types[index])
+            {
+                return Err(format!(
+                    "{base} has no earlier {:?} K/V source layer",
+                    config.layer_types[index]
+                ));
+            }
+        } else {
+            validate_required_matrix(
+                lookup,
+                &format!("{attention}.k_proj"),
+                kv_width,
+                config.hidden_size,
+                quantization_for(&format!("{attention}.k_proj")),
+                true,
+            )?;
+            if !(config.attention_k_eq_v && !config.is_sliding_layer(index)) {
+                validate_required_matrix(
+                    lookup,
+                    &format!("{attention}.v_proj"),
+                    kv_width,
+                    config.hidden_size,
+                    quantization_for(&format!("{attention}.v_proj")),
+                    true,
+                )?;
+            }
+            validate_required_tensor(
+                lookup,
+                &format!("{attention}.k_norm.weight"),
+                &[head_dim],
+                TensorDtypeRequirement::LearnedFloat,
+            )?;
+        }
+
+        let intermediate = if config.use_double_wide_mlp {
+            config
+                .intermediate_size
+                .checked_mul(2)
+                .ok_or_else(|| format!("{base} MLP intermediate width overflowed"))?
+        } else {
+            config.intermediate_size
+        };
+        for projection in ["gate_proj", "up_proj"] {
+            let module = format!("{base}.mlp.{projection}");
+            validate_required_matrix(
+                lookup,
+                &module,
+                intermediate,
+                config.hidden_size,
+                quantization_for(&module),
+                true,
+            )?;
+        }
+        let down = format!("{base}.mlp.down_proj");
+        validate_required_matrix(
+            lookup,
+            &down,
+            config.hidden_size,
+            intermediate,
+            quantization_for(&down),
+            true,
+        )?;
+        for norm in [
+            "input_layernorm",
+            "post_attention_layernorm",
+            "pre_feedforward_layernorm",
+            "post_feedforward_layernorm",
+        ] {
+            validate_required_tensor(
+                lookup,
+                &format!("{base}.{norm}.weight"),
+                &[config.hidden_size],
+                TensorDtypeRequirement::LearnedFloat,
+            )?;
+        }
+        validate_required_tensor(
+            lookup,
+            &format!("{base}.layer_scalar"),
+            &[1],
+            TensorDtypeRequirement::LearnedFloat,
+        )?;
+    }
+
+    Ok(NativeGemma4TextInspection {
+        context_window: config.max_position_embeddings,
+        hidden_size: config.hidden_size,
+    })
 }
 
 pub(crate) fn parse_eos_ids(value: Option<&serde_json::Value>) -> Vec<i32> {

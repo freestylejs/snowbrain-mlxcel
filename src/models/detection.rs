@@ -21,6 +21,7 @@
 use anyhow::Result;
 use mlxcel_core::drafter::dflash::is_dflash_drafter_config;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::path::Path;
 
 use super::ModelType;
@@ -56,9 +57,21 @@ pub(crate) fn has_vision_config(config: &serde_json::Value) -> bool {
     config.get("vision_config").is_some()
 }
 
-fn gemma4_has_vision_weights(model_path: &Path) -> bool {
+fn detection_file_is_allowed(declared: Option<&HashSet<&str>>, label: &str) -> bool {
+    declared.is_none_or(|labels| labels.contains(label))
+}
+
+fn detection_file_exists(model_path: &Path, declared: Option<&HashSet<&str>>, label: &str) -> bool {
+    match declared {
+        Some(labels) => labels.contains(label),
+        None => model_path.join(label).exists(),
+    }
+}
+
+fn gemma4_has_vision_weights(model_path: &Path, declared: Option<&HashSet<&str>>) -> bool {
     let index_path = model_path.join("model.safetensors.index.json");
-    if let Ok(index_str) = std::fs::read_to_string(&index_path)
+    if detection_file_is_allowed(declared, "model.safetensors.index.json")
+        && let Ok(index_str) = std::fs::read_to_string(&index_path)
         && let Ok(index) = serde_json::from_str::<Value>(&index_str)
         && let Some(weight_map) = index.get("weight_map").and_then(Value::as_object)
     {
@@ -76,7 +89,7 @@ fn gemma4_has_vision_weights(model_path: &Path) -> bool {
         });
     }
 
-    model_path.join("processor_config.json").exists()
+    detection_file_exists(model_path, declared, "processor_config.json")
 }
 
 pub(crate) fn detect_text_or_vlm(
@@ -206,7 +219,10 @@ fn has_embedding_architecture(config: &Value) -> bool {
 /// `<model_dir>/modules.json` lists a sentence-transformers module whose
 /// `type` ends with `.Pooling`. A file whose only extra module is
 /// `1_LogitScore` (Qwen3-VL-Reranker) does not qualify.
-fn modules_json_has_pooling(model_path: &Path) -> bool {
+fn modules_json_has_pooling(model_path: &Path, declared: Option<&HashSet<&str>>) -> bool {
+    if !detection_file_is_allowed(declared, "modules.json") {
+        return false;
+    }
     let Ok(raw) = std::fs::read_to_string(model_path.join("modules.json")) else {
         return false;
     };
@@ -261,6 +277,14 @@ pub(crate) fn is_embedding_checkpoint(
     model_path: &Path,
     config: &Value,
 ) -> Result<Option<ModelType>> {
+    is_embedding_checkpoint_with_declared(model_path, config, None)
+}
+
+fn is_embedding_checkpoint_with_declared(
+    model_path: &Path,
+    config: &Value,
+    declared: Option<&HashSet<&str>>,
+) -> Result<Option<ModelType>> {
     let Some(model_type_raw) = config.get("model_type").and_then(Value::as_str) else {
         return Ok(None);
     };
@@ -273,8 +297,8 @@ pub(crate) fn is_embedding_checkpoint(
     let encoder_only = ENCODER_ONLY_MODEL_TYPES.contains(&model_type.as_str());
     let layout_says_embedding = encoder_only
         || has_embedding_architecture(config)
-        || modules_json_has_pooling(model_path)
-        || model_path.join("1_Pooling").join("config.json").exists();
+        || modules_json_has_pooling(model_path, declared)
+        || detection_file_exists(model_path, declared, "1_Pooling/config.json");
     if !layout_says_embedding {
         return Ok(None);
     }
@@ -296,7 +320,48 @@ pub fn get_model_type(model_path: &Path) -> Result<ModelType> {
     let config_str = std::fs::read_to_string(config_path)?;
     let config_str = sanitize_config_json(&config_str);
     let v: serde_json::Value = serde_json::from_str(&config_str)?;
+    get_model_type_from_value(model_path, &v, None)
+}
 
+/// Detect from an immutable package materialization while considering only
+/// exact manifest-declared filesystem signals. This prevents an undeclared
+/// transient sidecar from changing root model classification.
+pub(crate) fn get_model_type_from_declared(
+    model_path: &Path,
+    declared: &HashSet<&str>,
+) -> Result<ModelType> {
+    let config_path = model_path.join("config.json");
+    let config_str = std::fs::read_to_string(config_path)?;
+    let config_str = sanitize_config_json(&config_str);
+    let v: serde_json::Value = serde_json::from_str(&config_str)?;
+    get_model_type_from_value(model_path, &v, Some(declared))
+}
+
+#[cfg(test)]
+mod declared_detection_tests {
+    use super::*;
+
+    #[test]
+    fn declared_kokoro_signal_uses_manifest_membership_without_restat() {
+        let root = tempfile::TempDir::new().unwrap();
+        std::fs::write(root.path().join("config.json"), "{}").unwrap();
+        let declared = HashSet::from(["config.json", super::super::kokoro::KOKORO_WEIGHT_FILE]);
+        assert_eq!(
+            get_model_type_from_declared(root.path(), &declared).unwrap(),
+            ModelType::Kokoro
+        );
+        assert!(
+            get_model_type(root.path()).is_err(),
+            "ordinary discovery must still require the physical weight signal"
+        );
+    }
+}
+
+fn get_model_type_from_value(
+    model_path: &Path,
+    v: &serde_json::Value,
+    declared: Option<&HashSet<&str>>,
+) -> Result<ModelType> {
     // A DFlash speculative drafter is structurally not a standalone model, but
     // it declares an ordinary `"model_type": "qwen3"`, so it would otherwise
     // fall through to the Qwen 3 arm below (#1168). Reject it before any
@@ -312,7 +377,9 @@ pub fn get_model_type(model_path: &Path) -> Result<ModelType> {
     // Kokoro TTS checkpoints carry no top-level `model_type`, so detect them by
     // architecture signal (the `istftnet` config block or the canonical weight
     // filename) before the `model_type`-based dispatch below would error.
-    if super::kokoro::is_kokoro_checkpoint(model_path, &v) {
+    if v.get("istftnet").is_some()
+        || detection_file_exists(model_path, declared, super::kokoro::KOKORO_WEIGHT_FILE)
+    {
         return Ok(ModelType::Kokoro);
     }
 
@@ -328,7 +395,7 @@ pub fn get_model_type(model_path: &Path) -> Result<ModelType> {
     // Embedding exports reuse generator `model_type`s (`qwen3` for
     // Qwen3-Embedding, `gemma3_text` for EmbeddingGemma), so the layout and
     // architecture rules must run before the `model_type` match below.
-    if let Some(embedding) = is_embedding_checkpoint(model_path, &v)? {
+    if let Some(embedding) = is_embedding_checkpoint_with_declared(model_path, v, declared)? {
         return Ok(embedding);
     }
 
@@ -372,7 +439,7 @@ pub fn get_model_type(model_path: &Path) -> Result<ModelType> {
             ModelType::Gemma3,
             ModelType::Gemma3VLM,
         )),
-        "gemma4" | "gemma4_text" => Ok(if gemma4_has_vision_weights(model_path) {
+        "gemma4" | "gemma4_text" => Ok(if gemma4_has_vision_weights(model_path, declared) {
             ModelType::Gemma4VLM
         } else {
             ModelType::Gemma4

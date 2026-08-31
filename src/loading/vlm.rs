@@ -110,7 +110,10 @@ pub(crate) use falcon_ocr::load_falcon_ocr_vl;
 pub(crate) use fastvlm::load_fastvlm_vlm;
 pub(crate) use florence2::load_florence2_vlm;
 pub(crate) use gemma::{load_gemma3_vlm, load_gemma3n_vlm, load_gemma4_vlm};
-pub(crate) use gemma_unified::load_gemma4_unified;
+pub(crate) use gemma_unified::{
+    load_gemma4_unified, normalize_gemma4_unified_key,
+    validate_native_tensor_metadata as validate_native_gemma4_unified_tensor_metadata,
+};
 pub(crate) use granite_vision::load_granite_vision_vlm;
 pub(crate) use granite4_vision::load_granite4_vision_vlm;
 pub(crate) use hunyuan_vl::load_hunyuan_vlm;

@@ -21,8 +21,10 @@
 use anyhow::Result;
 use base64::Engine;
 use fancy_regex::Regex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+
+use super::native_added_token_work_is_bounded;
 
 /// Pre-tokenization regex pattern used by HunYuan's tiktoken tokenizer.
 /// Matches contractions, letter sequences, digits, punctuation runs, and whitespace.
@@ -50,6 +52,23 @@ impl TiktokenTokenizer {
     /// Special tokens are derived from the vocabulary size and the standard
     /// HunYuan special token set.
     pub fn from_file(tiktoken_path: &Path, model_path: &Path) -> Result<Self> {
+        Self::from_file_with_config(tiktoken_path, model_path, true, false)
+    }
+
+    pub(crate) fn from_file_with_declared_config(
+        tiktoken_path: &Path,
+        model_path: &Path,
+        tokenizer_config_declared: bool,
+    ) -> Result<Self> {
+        Self::from_file_with_config(tiktoken_path, model_path, tokenizer_config_declared, true)
+    }
+
+    fn from_file_with_config(
+        tiktoken_path: &Path,
+        model_path: &Path,
+        tokenizer_config_declared: bool,
+        enforce_native_bounds: bool,
+    ) -> Result<Self> {
         let content = std::fs::read_to_string(tiktoken_path)?;
 
         let mut encoder = HashMap::new();
@@ -67,15 +86,50 @@ impl TiktokenTokenizer {
             let rank_str = parts
                 .next()
                 .ok_or_else(|| anyhow::anyhow!("Invalid tiktoken line: missing rank"))?;
+            if parts.next().is_some() {
+                return Err(anyhow::anyhow!(
+                    "Invalid tiktoken line: unexpected trailing fields"
+                ));
+            }
 
             let token_bytes = base64::engine::general_purpose::STANDARD.decode(token_b64)?;
             let rank: u32 = rank_str.parse()?;
-
+            if token_bytes.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "Tiktoken vocabulary contains an empty token"
+                ));
+            }
+            if encoder.contains_key(&token_bytes) {
+                return Err(anyhow::anyhow!(
+                    "Tiktoken vocabulary contains duplicate token bytes"
+                ));
+            }
+            if decoder.contains_key(&rank) {
+                return Err(anyhow::anyhow!(
+                    "Tiktoken vocabulary contains duplicate token ranks"
+                ));
+            }
             decoder.insert(rank, token_bytes.clone());
             encoder.insert(token_bytes, rank);
         }
-
-        let special_start_id = encoder.len() as u32;
+        if encoder.is_empty() {
+            return Err(anyhow::anyhow!("Tiktoken vocabulary is empty"));
+        }
+        let vocabulary_len = u32::try_from(encoder.len())?;
+        if (0..vocabulary_len).any(|rank| !decoder.contains_key(&rank)) {
+            return Err(anyhow::anyhow!(
+                "Tiktoken vocabulary ranks must be the dense range 0..N"
+            ));
+        }
+        for byte in 0u16..=255 {
+            let byte = byte as u8;
+            if !encoder.contains_key([byte].as_slice()) {
+                return Err(anyhow::anyhow!(
+                    "Tiktoken vocabulary is missing singleton byte 0x{byte:02X}"
+                ));
+            }
+        }
+        let special_start_id = vocabulary_len;
 
         // Build special tokens: same order as Python HYTokenizer
         let special_token_names = Self::build_special_token_list();
@@ -83,7 +137,9 @@ impl TiktokenTokenizer {
         let mut special_decoder = HashMap::new();
 
         for (i, name) in special_token_names.iter().enumerate() {
-            let id = special_start_id + i as u32;
+            let id = special_start_id
+                .checked_add(u32::try_from(i)?)
+                .ok_or_else(|| anyhow::anyhow!("Tiktoken special token ID overflowed"))?;
             special_encoder.insert(name.clone(), id);
             special_decoder.insert(id, name.clone());
         }
@@ -91,9 +147,13 @@ impl TiktokenTokenizer {
         // Override with tokenizer_config.json if available
         Self::load_special_tokens_from_config(
             model_path,
+            &encoder,
+            &decoder,
             &mut special_encoder,
             &mut special_decoder,
-        );
+            tokenizer_config_declared,
+            enforce_native_bounds,
+        )?;
 
         let mut special_tokens_sorted: Vec<(String, u32)> = special_encoder
             .iter()
@@ -131,26 +191,96 @@ impl TiktokenTokenizer {
     /// Load additional special token mappings from tokenizer_config.json.
     fn load_special_tokens_from_config(
         model_path: &Path,
+        regular_encoder: &HashMap<Vec<u8>, u32>,
+        regular_decoder: &HashMap<u32, Vec<u8>>,
         special_encoder: &mut HashMap<String, u32>,
         special_decoder: &mut HashMap<u32, String>,
-    ) {
+        tokenizer_config_declared: bool,
+        enforce_native_bounds: bool,
+    ) -> Result<()> {
+        if !tokenizer_config_declared {
+            return Ok(());
+        }
         let config_path = model_path.join("tokenizer_config.json");
-        if let Ok(content) = std::fs::read_to_string(&config_path)
-            && let Ok(config) = serde_json::from_str::<serde_json::Value>(&content)
-            && let Some(decoder_map) = config
-                .get("added_tokens_decoder")
-                .and_then(|v| v.as_object())
-        {
+        let content = match std::fs::read_to_string(&config_path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let config: serde_json::Value = serde_json::from_str(&content)?;
+        if enforce_native_bounds && !native_added_token_work_is_bounded(&config) {
+            return Err(anyhow::anyhow!(
+                "tokenizer_config added-token work exceeds the native bound"
+            ));
+        }
+        let config = config
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("tokenizer_config root is not an object"))?;
+        if let Some(value) = config.get("added_tokens_decoder") {
+            let decoder_map = value.as_object().ok_or_else(|| {
+                anyhow::anyhow!("tokenizer_config added_tokens_decoder is not an object")
+            })?;
+            let mut source_ids = HashSet::new();
+            let mut source_contents = HashSet::new();
             for (id_str, entry) in decoder_map {
-                if let (Ok(id), Some(token_content)) = (
-                    id_str.parse::<u32>(),
-                    entry.get("content").and_then(|v| v.as_str()),
-                ) {
-                    special_encoder.insert(token_content.to_string(), id);
-                    special_decoder.insert(id, token_content.to_string());
+                let id = id_str.parse::<u32>()?;
+                if !source_ids.insert(id) {
+                    return Err(anyhow::anyhow!(
+                        "tokenizer_config has duplicate numeric special token ID {id}"
+                    ));
                 }
+                let token_content = entry
+                    .get("content")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("tokenizer_config special token {id} has no string content")
+                    })?;
+                if token_content.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "tokenizer_config special token {id} has empty content"
+                    ));
+                }
+                if !source_contents.insert(token_content) {
+                    return Err(anyhow::anyhow!(
+                        "tokenizer_config has duplicate special token content {token_content:?}"
+                    ));
+                }
+                if regular_decoder.contains_key(&id) {
+                    return Err(anyhow::anyhow!(
+                        "tokenizer_config special token ID {id} collides with the regular vocabulary"
+                    ));
+                }
+                if let Some(&regular_id) = regular_encoder.get(token_content.as_bytes()) {
+                    return Err(anyhow::anyhow!(
+                        "tokenizer_config special token {token_content:?} at ID {id} shadows regular vocabulary ID {regular_id}"
+                    ));
+                }
+                if let Some(existing) = special_decoder.get(&id)
+                    && existing != token_content
+                {
+                    return Err(anyhow::anyhow!(
+                        "tokenizer_config special token ID {id} has conflicting spellings"
+                    ));
+                }
+                if let Some(previous_id) = special_encoder.get(token_content).copied()
+                    && previous_id != id
+                {
+                    special_decoder.remove(&previous_id);
+                }
+                special_encoder.insert(token_content.to_string(), id);
+                special_decoder.insert(id, token_content.to_string());
             }
         }
+        if special_encoder.len() != special_decoder.len()
+            || special_encoder
+                .iter()
+                .any(|(token, id)| special_decoder.get(id) != Some(token))
+        {
+            return Err(anyhow::anyhow!(
+                "tokenizer_config special token mappings are not one-to-one"
+            ));
+        }
+        Ok(())
     }
 
     /// Encode text into token IDs.
@@ -175,7 +305,7 @@ impl TiktokenTokenizer {
                         result.push(id);
                     } else {
                         // Apply BPE merges
-                        let ids = self.bpe_encode(piece);
+                        let ids = self.bpe_encode(piece)?;
                         result.extend(ids);
                     }
                 }
@@ -196,7 +326,7 @@ impl TiktokenTokenizer {
             if let Some(&id) = self.encoder.get(piece) {
                 result.push(id);
             } else {
-                result.extend(self.bpe_encode(piece));
+                result.extend(self.bpe_encode(piece)?);
             }
         }
         Ok(result)
@@ -233,9 +363,13 @@ impl TiktokenTokenizer {
             } else if let Some(token_bytes) = self.decoder.get(&id) {
                 bytes.extend_from_slice(token_bytes);
             }
-            // Unknown IDs are silently skipped
+            // Preserve the root/server decoder's legacy behavior: unknown IDs
+            // are skipped. The native exact seam validates token_piece_bytes
+            // before decoding and reports a typed InvalidTokenId instead.
         }
 
+        // Preserve existing server/API detokenization semantics. The native
+        // incremental decoder has its own strict no-replacement UTF-8 state.
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
@@ -243,9 +377,9 @@ impl TiktokenTokenizer {
     ///
     /// The algorithm repeatedly finds the pair of adjacent tokens with the lowest
     /// rank in the vocabulary and merges them, until no more merges are possible.
-    fn bpe_encode(&self, piece: &[u8]) -> Vec<u32> {
+    fn bpe_encode(&self, piece: &[u8]) -> Result<Vec<u32>> {
         if piece.is_empty() {
-            return vec![];
+            return Ok(vec![]);
         }
         if piece.len() == 1 {
             // Single byte — must be in the vocabulary (bytes 0-255)
@@ -253,7 +387,7 @@ impl TiktokenTokenizer {
                 .encoder
                 .get(piece)
                 .map(|&id| vec![id])
-                .unwrap_or_default();
+                .ok_or_else(|| anyhow::anyhow!("Tiktoken vocabulary cannot encode input byte"));
         }
 
         // Start with each byte as its own part
@@ -296,7 +430,12 @@ impl TiktokenTokenizer {
         // Convert parts to token IDs
         parts
             .iter()
-            .filter_map(|p| self.encoder.get(p.as_slice()).copied())
+            .map(|part| {
+                self.encoder
+                    .get(part.as_slice())
+                    .copied()
+                    .ok_or_else(|| anyhow::anyhow!("Tiktoken BPE produced an unranked byte span"))
+            })
             .collect()
     }
 
@@ -312,6 +451,9 @@ impl TiktokenTokenizer {
         while !remaining.is_empty() {
             let mut matched = false;
             for (token, _) in &self.special_tokens_sorted {
+                if token.is_empty() {
+                    continue;
+                }
                 if remaining.starts_with(token.as_str()) {
                     segments.push(token.clone());
                     remaining = &remaining[token.len()..];
@@ -324,6 +466,9 @@ impl TiktokenTokenizer {
                 // Find the next special token occurrence
                 let mut next_pos = remaining.len();
                 for (token, _) in &self.special_tokens_sorted {
+                    if token.is_empty() {
+                        continue;
+                    }
                     if let Some(pos) = remaining.find(token.as_str())
                         && pos < next_pos
                     {
@@ -343,6 +488,7 @@ impl TiktokenTokenizer {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use tempfile::TempDir;
 
     fn test_model_path() -> PathBuf {
         PathBuf::from("models/hunyuan-13b")
@@ -350,6 +496,89 @@ mod tests {
 
     fn tiktoken_file() -> PathBuf {
         test_model_path().join("hy.tiktoken")
+    }
+
+    fn load_inline(vocabulary: &str, config: Option<&str>) -> Result<TiktokenTokenizer> {
+        let root = TempDir::new()?;
+        let vocabulary_path = root.path().join("tiny.tiktoken");
+        std::fs::write(&vocabulary_path, vocabulary)?;
+        if let Some(config) = config {
+            std::fs::write(root.path().join("tokenizer_config.json"), config)?;
+        }
+        TiktokenTokenizer::from_file(&vocabulary_path, root.path())
+    }
+
+    fn all_singleton_bytes() -> String {
+        (0u16..=255)
+            .map(|rank| {
+                let encoded = base64::engine::general_purpose::STANDARD.encode([rank as u8]);
+                format!("{encoded} {rank}\n")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn exact_tiktoken_rank_and_special_id_invariants_are_enforced() {
+        let vocabulary = all_singleton_bytes();
+        let valid = load_inline(&vocabulary, None).unwrap();
+        assert_eq!(valid.piece_bytes(b'a' as u32).unwrap(), b"a");
+        assert_eq!(valid.piece_bytes(b'b' as u32).unwrap(), b"b");
+        assert_eq!(valid.encode("all bytes covered", false).unwrap().len(), 17);
+
+        let missing_byte = vocabulary
+            .lines()
+            .filter(|line| !line.ends_with(" 255"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(load_inline(&missing_byte, None).is_err());
+        let mut duplicate_rank = vocabulary.clone();
+        duplicate_rank.push_str("YQ== 0\n");
+        assert!(load_inline(&duplicate_rank, None).is_err());
+        let mut duplicate_token = vocabulary.clone();
+        duplicate_token.push_str("YQ== 256\n");
+        assert!(load_inline(&duplicate_token, None).is_err());
+        assert!(
+            load_inline(
+                &vocabulary,
+                Some(r#"{"added_tokens_decoder":{"1":{"content":"<|hostile|>"}}}"#),
+            )
+            .is_err()
+        );
+        assert!(
+            load_inline(
+                &vocabulary,
+                Some(r#"{"added_tokens_decoder":{"300":{"content":""}}}"#),
+            )
+            .is_err()
+        );
+        assert!(
+            load_inline(
+                &vocabulary,
+                Some(r#"{"added_tokens_decoder":{"500":{"content":"a"}}}"#),
+            )
+            .is_err(),
+            "a special token cannot shadow regular byte content"
+        );
+        assert!(
+            load_inline(
+                &vocabulary,
+                Some(r#"{"added_tokens_decoder":{"500":{"content":"<dup>"},"501":{"content":"<dup>"}}}"#),
+            )
+            .is_err(),
+            "duplicate source content is ambiguous even before the maps are built"
+        );
+        assert!(
+            load_inline(
+                &vocabulary,
+                Some(
+                    r#"{"added_tokens_decoder":{"500":{"content":"<a>"},"0500":{"content":"<b>"}}}"#
+                ),
+            )
+            .is_err(),
+            "numeric key aliases must not silently overwrite each other"
+        );
+        assert!(load_inline(&vocabulary, Some("[]")).is_err());
+        assert!(load_inline(&vocabulary, Some("{}")).is_ok());
     }
 
     #[test]

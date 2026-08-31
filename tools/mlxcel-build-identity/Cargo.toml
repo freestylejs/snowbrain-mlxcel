@@ -1,0 +1,28 @@
+[package]
+name = "mlxcel-build-identity"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Build-only provenance producers for mlxcel qualification runners"
+license = "Apache-2.0"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "mlxcel-build-identity"
+path = "src/main.rs"
+
+[[bin]]
+name = "mlxcel-linker-wrapper"
+path = "src/linker_wrapper.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+toml = "0.8"
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"

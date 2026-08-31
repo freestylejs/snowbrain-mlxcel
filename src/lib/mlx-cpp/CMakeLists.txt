@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.16)
 
 project(mlx-cpp LANGUAGES CXX C)
 set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL
+    "Emit the exact native compile command ledger" FORCE)
 
 # ----------------------------- Fetch MLX C++ -----------------------------
 
@@ -14,6 +16,31 @@ set(MLX_BUILD_TESTS OFF)
 set(MLX_BUILD_EXAMPLES OFF)
 set(MLX_BUILD_BENCHMARKS OFF)
 set(MLX_BUILD_PYTHON_BINDINGS OFF)
+
+# Machine-readable single source of truth for the overlays actually applied by
+# this configure.  mlxcel-core's build script consumes this file after CMake
+# completes; it must not rediscover or reorder the patch set independently.
+set(MLXCEL_OVERLAY_LEDGER "${CMAKE_BINARY_DIR}/mlxcel-active-overlays.tsv")
+file(WRITE "${MLXCEL_OVERLAY_LEDGER}" "mlxcel-overlay-ledger-v1\n")
+set_property(GLOBAL PROPERTY MLXCEL_OVERLAY_ORDINAL 0)
+
+function(mlx_record_source_overlay source_label source_path destination_label destination_path)
+  foreach(_ledger_value IN ITEMS "${source_label}" "${destination_label}")
+    if(_ledger_value MATCHES "[\t\r\n]")
+      message(FATAL_ERROR "Overlay ledger label contains a control character")
+    endif()
+  endforeach()
+  file(SHA256 "${source_path}" _source_sha256)
+  file(SHA256 "${destination_path}" _destination_sha256)
+  if(NOT _source_sha256 STREQUAL _destination_sha256)
+    message(FATAL_ERROR "Overlay destination differs from source: ${destination_label}")
+  endif()
+  get_property(_ordinal GLOBAL PROPERTY MLXCEL_OVERLAY_ORDINAL)
+  file(APPEND "${MLXCEL_OVERLAY_LEDGER}"
+       "${_ordinal}\t${source_label}\t${destination_label}\t${_source_sha256}\n")
+  math(EXPR _next_ordinal "${_ordinal} + 1")
+  set_property(GLOBAL PROPERTY MLXCEL_OVERLAY_ORDINAL "${_next_ordinal}")
+endfunction()
 
 function(mlx_apply_source_overlays mlx_source_dir)
   # Metal patches: JIT type promotion fix + kernel utils (SIMD group matrix).
@@ -43,6 +70,11 @@ function(mlx_apply_source_overlays mlx_source_dir)
         "${CMAKE_CURRENT_SOURCE_DIR}/patches/${_patch_file}"
         "${mlx_source_dir}/${_patch_file}"
         COPYONLY)
+      mlx_record_source_overlay(
+        "src/lib/mlx-cpp/patches/${_patch_file}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/patches/${_patch_file}"
+        "${_patch_file}"
+        "${mlx_source_dir}/${_patch_file}")
     endif()
   endforeach()
   message(STATUS "Applied Metal kernel patches")
@@ -54,11 +86,17 @@ function(mlx_apply_source_overlays mlx_source_dir)
     file(GLOB_RECURSE _cuda_patch_files
          RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}/patches"
          "${CMAKE_CURRENT_SOURCE_DIR}/patches/mlx/backend/cuda/*")
+    list(SORT _cuda_patch_files)
     foreach(_patch_file ${_cuda_patch_files})
       configure_file(
         "${CMAKE_CURRENT_SOURCE_DIR}/patches/${_patch_file}"
         "${mlx_source_dir}/${_patch_file}"
         COPYONLY)
+      mlx_record_source_overlay(
+        "src/lib/mlx-cpp/patches/${_patch_file}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/patches/${_patch_file}"
+        "${_patch_file}"
+        "${mlx_source_dir}/${_patch_file}")
     endforeach()
     message(STATUS "Applied CUDA backend patches (${_cuda_patch_files})")
   endif()
@@ -70,12 +108,18 @@ function(mlx_apply_source_overlays mlx_source_dir)
   if(MLX_BUILD_CUDA AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/patches-cuda")
     file(GLOB _cuda_only_patches
          "${CMAKE_CURRENT_SOURCE_DIR}/patches-cuda/*.cpp")
+    list(SORT _cuda_only_patches)
     foreach(_patch_file ${_cuda_only_patches})
       get_filename_component(_fname "${_patch_file}" NAME)
       configure_file(
         "${_patch_file}"
         "${mlx_source_dir}/mlx/${_fname}"
         COPYONLY)
+      mlx_record_source_overlay(
+        "src/lib/mlx-cpp/patches-cuda/${_fname}"
+        "${_patch_file}"
+        "mlx/${_fname}"
+        "${mlx_source_dir}/mlx/${_fname}")
     endforeach()
     message(STATUS "Applied CUDA-only dtype/precision patches")
   endif()
@@ -154,6 +198,32 @@ endforeach()
 
 add_subdirectory(${mlx_SOURCE_DIR} ${mlx_BINARY_DIR})
 
+# Machine-readable ledger of the nested FetchContent sources that this exact
+# configure activated. Rust validates each physical tree against the strict
+# pre-acquisition manifest; this file records selection only and never invents
+# URL/revision provenance.
+set(MLXCEL_NATIVE_DEPENDENCY_LEDGER
+    "${CMAKE_BINARY_DIR}/mlxcel-active-native-dependencies.tsv")
+file(WRITE "${MLXCEL_NATIVE_DEPENDENCY_LEDGER}"
+     "mlxcel-native-dependency-ledger-v1\n")
+foreach(_dependency IN ITEMS
+        mlx metal_cpp dlfcn-win32 openblas json fmt gguflib cccl nvtx3 cudnn
+        cutlass jaccl)
+  string(TOLOWER "${_dependency}" _dependency_prefix)
+  set(_source_variable "${_dependency_prefix}_SOURCE_DIR")
+  if(DEFINED ${_source_variable}
+     AND IS_DIRECTORY "${${_source_variable}}")
+    foreach(_ledger_value IN ITEMS "${_dependency}" "${${_source_variable}}")
+      if(_ledger_value MATCHES "[\t\r\n]")
+        message(FATAL_ERROR
+                "Native dependency ledger contains a control character")
+      endif()
+    endforeach()
+    file(APPEND "${MLXCEL_NATIVE_DEPENDENCY_LEDGER}"
+         "${_dependency}\t${${_source_variable}}\n")
+  endif()
+endforeach()
+
 # ----------------------------- CUDA CCCL ---------------------------------
 # Ensure MLX_CCCL_DIR is defined for CUDA JIT kernel compilation at runtime.
 # MLX only sets this for test builds, but statically linked binaries need it too.
@@ -185,3 +255,66 @@ if(MLX_BUILD_CUDA)
                                PRIVATE MLX_CUTLASS_DIR="${_cutlass_include}")
   endif()
 endif()
+
+# Record the target graph that this configure actually selected.  The build
+# script role-tokenizes every path before the ledger enters the immutable
+# identity, so this producer deliberately records CMake's ordered target
+# properties instead of guessing the graph again in Rust.
+function(mlxcel_collect_build_targets directory output_variable)
+  get_property(_local_targets DIRECTORY "${directory}" PROPERTY BUILDSYSTEM_TARGETS)
+  get_property(_child_directories DIRECTORY "${directory}" PROPERTY SUBDIRECTORIES)
+  set(_all_targets ${_local_targets})
+  foreach(_child IN LISTS _child_directories)
+    mlxcel_collect_build_targets("${_child}" _child_targets)
+    list(APPEND _all_targets ${_child_targets})
+  endforeach()
+  set(${output_variable} "${_all_targets}" PARENT_SCOPE)
+endfunction()
+
+set(MLXCEL_TARGET_GRAPH_LEDGER
+    "${CMAKE_BINARY_DIR}/mlxcel-active-target-graph.tsv")
+file(WRITE "${MLXCEL_TARGET_GRAPH_LEDGER}" "mlxcel-target-graph-v1\n")
+mlxcel_collect_build_targets("${CMAKE_CURRENT_SOURCE_DIR}" _mlxcel_build_targets)
+list(REMOVE_DUPLICATES _mlxcel_build_targets)
+list(SORT _mlxcel_build_targets)
+set(_mlxcel_target_properties
+    SOURCE_DIR
+    BINARY_DIR
+    LINK_LIBRARIES
+    INTERFACE_LINK_LIBRARIES
+    INCLUDE_DIRECTORIES
+    INTERFACE_INCLUDE_DIRECTORIES
+    COMPILE_DEFINITIONS
+    INTERFACE_COMPILE_DEFINITIONS
+    COMPILE_OPTIONS
+    INTERFACE_COMPILE_OPTIONS
+    LINK_OPTIONS
+    INTERFACE_LINK_OPTIONS
+    LINK_DEPENDS)
+foreach(_target IN LISTS _mlxcel_build_targets)
+  get_target_property(_target_type "${_target}" TYPE)
+  if(NOT _target_type)
+    message(FATAL_ERROR "Target ${_target} has no CMake TYPE")
+  endif()
+  foreach(_ledger_value IN ITEMS "${_target}" "${_target_type}")
+    if(_ledger_value MATCHES "[\t\r\n]")
+      message(FATAL_ERROR "Target graph ledger contains a control character")
+    endif()
+  endforeach()
+  file(APPEND "${MLXCEL_TARGET_GRAPH_LEDGER}"
+       "${_target}\t${_target_type}\tTYPE\t0\t${_target_type}\n")
+  foreach(_property IN LISTS _mlxcel_target_properties)
+    get_target_property(_property_values "${_target}" "${_property}")
+    if(_property_values AND NOT _property_values MATCHES "-NOTFOUND$")
+      if(_property_values MATCHES "[\t\r\n]")
+        message(FATAL_ERROR
+                "Target graph value contains a control character")
+      endif()
+      # Keep CMake's complete semicolon-delimited property in one record.
+      # Splitting it here would tear generator expressions such as
+      # `$<$<COMPILE_LANGUAGE:CXX>:/wd4244;/wd4267>` into invalid fragments.
+      file(APPEND "${MLXCEL_TARGET_GRAPH_LEDGER}"
+           "${_target}\t${_target_type}\t${_property}\t0\t${_property_values}\n")
+    endif()
+  endforeach()
+endforeach()

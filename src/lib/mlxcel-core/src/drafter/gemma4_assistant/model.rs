@@ -43,6 +43,10 @@ use crate::drafter::{Drafter, DrafterError, DrafterKind, SharedKv};
 use crate::ffi::{self, MlxArray};
 use crate::generate::{LanguageModel, SamplingConfig};
 use crate::layers::{KVCache, Linear, RMSNorm, UnifiedEmbedding, UnifiedLinear};
+use crate::tensor_metadata::{
+    TensorDtypeRequirement, TensorMetadataLookup, TensorQuantization, validate_optional_tensor,
+    validate_required_matrix, validate_required_tensor,
+};
 use crate::weights::WeightMap;
 use cxx::UniquePtr;
 use std::collections::HashMap;
@@ -69,6 +73,232 @@ enum LmHead {
     /// requires the tied embed-tokens weight as its `lm_head_weight` input,
     /// which the drafter's `forward` supplies from `inner.embed_tokens`.
     Centroid(MaskedEmbedder),
+}
+
+/// Header-only facts proved by the same construction schema as
+/// [`Gemma4AssistantDraftModel::from_weights`]. This is drafter authority only;
+/// it does not imply a user-facing generation operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeGemma4AssistantInspection {
+    pub context_window: usize,
+}
+
+/// Validate every tensor consumed by the Gemma 4 assistant constructor.
+///
+/// The lookup contains acquisition-verified safetensors metadata. No array is
+/// allocated and no payload is re-read here.
+pub fn validate_native_tensor_metadata(
+    lookup: &dyn TensorMetadataLookup,
+    config: &serde_json::Value,
+) -> Result<NativeGemma4AssistantInspection, String> {
+    let config: Gemma4AssistantConfig = serde_json::from_value(config.clone())
+        .map_err(|error| format!("Gemma 4 assistant config is invalid: {error}"))?;
+    let config = config.normalize()?;
+    if !matches!(
+        config.model_type.as_str(),
+        "gemma4_assistant" | "gemma4_unified_assistant"
+    ) {
+        return Err(format!(
+            "unsupported Gemma 4 assistant model_type {:?}",
+            config.model_type
+        ));
+    }
+    let text = config.text_config();
+    if !matches!(
+        text.model_type.as_str(),
+        "gemma4_text" | "gemma4_unified_text"
+    ) {
+        return Err(format!(
+            "unsupported Gemma 4 assistant text model_type {:?}",
+            text.model_type
+        ));
+    }
+    if text.hidden_size == 0
+        || text.num_hidden_layers == 0
+        || text.intermediate_size == 0
+        || text.num_attention_heads == 0
+        || text.head_dim == 0
+        || text.vocab_size == 0
+        || text.num_key_value_heads == 0
+        || text.max_position_embeddings == 0
+        || config.backbone_hidden_size == 0
+        || config.block_size < 2
+    {
+        return Err(
+            "Gemma 4 assistant config has an unusable construction or draft dimension".to_string(),
+        );
+    }
+    if text.layer_types.len() != text.num_hidden_layers
+        || text.layer_types.iter().any(|layer_type| {
+            !matches!(layer_type.as_str(), "sliding_attention" | "full_attention")
+        })
+    {
+        return Err(
+            "Gemma 4 assistant layer_types must exactly cover every constructor layer".to_string(),
+        );
+    }
+    if text.num_kv_shared_layers != text.num_hidden_layers {
+        return Err(
+            "Gemma 4 assistant constructor requires every drafter layer to share target K/V"
+                .to_string(),
+        );
+    }
+    if config.use_ordered_embeddings
+        && (config.num_centroids == 0
+            || config.centroid_intermediate_top_k == 0
+            || config.centroid_intermediate_top_k > config.num_centroids
+            || !text.vocab_size.is_multiple_of(config.num_centroids))
+    {
+        return Err("Gemma 4 assistant ordered-embedding geometry is invalid".to_string());
+    }
+
+    let quantization = TensorQuantization {
+        group_size: text.group_size(),
+        bits: text.bits(),
+    };
+    validate_required_matrix(
+        lookup,
+        "model.embed_tokens",
+        text.vocab_size,
+        text.hidden_size,
+        quantization,
+        false,
+    )?;
+    validate_required_tensor(
+        lookup,
+        "model.norm.weight",
+        &[text.hidden_size],
+        TensorDtypeRequirement::LearnedFloat,
+    )?;
+
+    for index in 0..text.num_hidden_layers {
+        let base = format!("model.layers.{index}");
+        let head_dim = usize::try_from(text.head_dim_for_layer(index))
+            .map_err(|_| format!("{base} has an invalid attention head dimension"))?;
+        let q_width = text
+            .num_attention_heads
+            .checked_mul(head_dim)
+            .ok_or_else(|| format!("{base} attention output width overflowed"))?;
+        validate_required_matrix(
+            lookup,
+            &format!("{base}.self_attn.q_proj"),
+            q_width,
+            text.hidden_size,
+            quantization,
+            true,
+        )?;
+        validate_required_matrix(
+            lookup,
+            &format!("{base}.self_attn.o_proj"),
+            text.hidden_size,
+            q_width,
+            quantization,
+            true,
+        )?;
+        validate_required_tensor(
+            lookup,
+            &format!("{base}.self_attn.q_norm.weight"),
+            &[head_dim],
+            TensorDtypeRequirement::LearnedFloat,
+        )?;
+        for projection in ["gate_proj", "up_proj"] {
+            validate_required_matrix(
+                lookup,
+                &format!("{base}.mlp.{projection}"),
+                text.intermediate_size,
+                text.hidden_size,
+                quantization,
+                true,
+            )?;
+        }
+        validate_required_matrix(
+            lookup,
+            &format!("{base}.mlp.down_proj"),
+            text.hidden_size,
+            text.intermediate_size,
+            quantization,
+            true,
+        )?;
+        for norm in [
+            "input_layernorm",
+            "post_attention_layernorm",
+            "pre_feedforward_layernorm",
+            "post_feedforward_layernorm",
+        ] {
+            validate_required_tensor(
+                lookup,
+                &format!("{base}.{norm}.weight"),
+                &[text.hidden_size],
+                TensorDtypeRequirement::LearnedFloat,
+            )?;
+        }
+        validate_optional_tensor(
+            lookup,
+            &format!("{base}.layer_scalar"),
+            &[1],
+            TensorDtypeRequirement::LearnedFloat,
+        )?;
+    }
+
+    let doubled_backbone = config
+        .backbone_hidden_size
+        .checked_mul(2)
+        .ok_or_else(|| "Gemma 4 assistant pre-projection input width overflowed".to_string())?;
+    validate_required_matrix(
+        lookup,
+        "pre_projection",
+        text.hidden_size,
+        doubled_backbone,
+        quantization,
+        true,
+    )?;
+    validate_required_matrix(
+        lookup,
+        "post_projection",
+        config.backbone_hidden_size,
+        text.hidden_size,
+        quantization,
+        true,
+    )?;
+
+    if !config.tie_word_embeddings {
+        validate_required_tensor(
+            lookup,
+            "lm_head.weight",
+            &[text.vocab_size, text.hidden_size],
+            TensorDtypeRequirement::LearnedFloat,
+        )?;
+        validate_optional_tensor(
+            lookup,
+            "lm_head.bias",
+            &[text.vocab_size],
+            TensorDtypeRequirement::LearnedFloat,
+        )?;
+    }
+    if config.use_ordered_embeddings {
+        validate_required_tensor(
+            lookup,
+            "masked_embedding.centroids.weight",
+            &[config.num_centroids, text.hidden_size],
+            TensorDtypeRequirement::LearnedFloat,
+        )?;
+        validate_optional_tensor(
+            lookup,
+            "masked_embedding.centroids.bias",
+            &[config.num_centroids],
+            TensorDtypeRequirement::LearnedFloat,
+        )?;
+        validate_required_tensor(
+            lookup,
+            "masked_embedding.token_ordering",
+            &[text.vocab_size],
+            TensorDtypeRequirement::Integer,
+        )?;
+    }
+
+    Ok(NativeGemma4AssistantInspection {
+        context_window: text.max_position_embeddings,
+    })
 }
 
 // ---------------------------------------------------------------------------
