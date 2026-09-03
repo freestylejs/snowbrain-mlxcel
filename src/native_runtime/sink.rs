@@ -571,7 +571,7 @@ mod tests {
             invalid_prefix.validate_for(&accepted).unwrap_err().kind(),
             NativeRuntimeErrorKind::SinkRejected
         );
-        for consumed_units in [0, accepted.units.len()] {
+        for consumed_units in 0..=accepted.units.len() {
             let valid = NativeContinuationDirective::ConsumePrefixAndContinue {
                 consumed_units,
                 constraint: NativeConstraintTransition::Unchanged,
