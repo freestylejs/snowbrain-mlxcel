@@ -1154,19 +1154,80 @@ fn reject_ephemeral_flag_paths(name: &str, values: &[Arc<str>]) -> Result<(), Na
 
 fn reject_ephemeral_path(name: &str, value: &str) -> Result<(), NativeRuntimeError> {
     let normalized = value.replace('\\', "/");
-    let windows_absolute = normalized
-        .as_bytes()
-        .windows(3)
-        .any(|window| window[0].is_ascii_alphabetic() && window[1] == b':' && window[2] == b'/');
-    let unix_checkout_absolute = ["/Users/", "/home/", "/tmp/", "/private/"]
+    let bytes = normalized.as_bytes();
+    let original = value.as_bytes();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if let Some(end) = remote_uri_token_end(original, cursor) {
+            cursor = end;
+            continue;
+        }
+        let windows_absolute = bytes.get(cursor).is_some_and(u8::is_ascii_alphabetic)
+            && bytes.get(cursor + 1) == Some(&b':')
+            && bytes.get(cursor + 2) == Some(&b'/');
+        let unix_checkout_absolute = [
+            b"/Users/".as_slice(),
+            b"/home/".as_slice(),
+            b"/tmp/".as_slice(),
+            b"/private/".as_slice(),
+        ]
         .into_iter()
-        .any(|prefix| normalized.contains(prefix));
-    if windows_absolute || unix_checkout_absolute {
-        return Err(invalid_identity(format!(
-            "{name} contains an ephemeral absolute source/build path"
-        )));
+        .any(|prefix| bytes[cursor..].starts_with(prefix));
+        if windows_absolute || unix_checkout_absolute {
+            return Err(invalid_identity(format!(
+                "{name} contains an ephemeral absolute source/build path"
+            )));
+        }
+        cursor += 1;
     }
     Ok(())
+}
+
+fn remote_uri_token_end(value: &[u8], start: usize) -> Option<usize> {
+    if !value.get(start).is_some_and(u8::is_ascii_alphabetic)
+        || (start > 0 && !is_uri_token_boundary(value[start - 1]))
+    {
+        return None;
+    }
+    let mut colon = start + 1;
+    while value
+        .get(colon)
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+    {
+        colon += 1;
+    }
+    if colon - start < 2 || value.get(colon..colon + 3) != Some(b"://") {
+        return None;
+    }
+    let terminal_scheme = value[start..colon].rsplit(|byte| *byte == b'+').next()?;
+    if terminal_scheme.eq_ignore_ascii_case(b"file") {
+        return None;
+    }
+
+    let mut end = colon + 3;
+    while value
+        .get(end)
+        .is_some_and(|byte| !is_uri_token_delimiter(*byte))
+    {
+        end += 1;
+    }
+    Some(end)
+}
+
+fn is_uri_token_boundary(byte: u8) -> bool {
+    byte.is_ascii_whitespace()
+        || matches!(
+            byte,
+            b'=' | b':' | b'"' | b'\'' | b'[' | b'{' | b'(' | b'<' | b',' | b';' | b'|'
+        )
+}
+
+fn is_uri_token_delimiter(byte: u8) -> bool {
+    byte.is_ascii_whitespace()
+        || matches!(
+            byte,
+            b'\\' | b'"' | b'\'' | b']' | b'}' | b')' | b'>' | b',' | b';' | b'|'
+        )
 }
 
 fn validate_sorted_sources(
@@ -2380,8 +2441,10 @@ mod tests {
         );
     }
 
-    fn consumer() -> NativeConsumerBuildFragment {
-        NativeConsumerBuildFragment::try_from_generated(NativeConsumerBuildRecord {
+    fn consumer_record<'a>(
+        emitted_link_directives: &'a [&'a str],
+    ) -> NativeConsumerBuildRecord<'a> {
+        NativeConsumerBuildRecord {
             canonical_lineage_repository: CANONICAL_MLXCEL_REPOSITORY,
             approved_repository: APPROVED_MLXCEL_REPOSITORY,
             manifest_repository: APPROVED_MLXCEL_REPOSITORY,
@@ -2400,9 +2463,105 @@ mod tests {
             target_triple: "aarch64-apple-darwin",
             target_architecture: "aarch64",
             build_profile: "release",
-            emitted_link_directives: &["lib=mlxcel", "framework=Metal"],
-        })
+            emitted_link_directives,
+        }
+    }
+
+    fn consumer() -> NativeConsumerBuildFragment {
+        NativeConsumerBuildFragment::try_from_generated(consumer_record(&[
+            "lib=mlxcel",
+            "framework=Metal",
+        ]))
         .unwrap()
+    }
+
+    #[test]
+    fn consumer_fragment_accepts_official_https_provenance() {
+        let directives = [
+            "canonical-lineage=https://github.com/lablup/mlxcel.git",
+            "approved-materialization=https://github.com/freestylejs/snowbrain-mlxcel.git",
+            r#"active-cargo-package=["[\"mlxcel\",\"0.6.0\",\"git+https://github.com/freestylejs/snowbrain-mlxcel.git?rev=0123456789abcdef0123456789abcdef01234567#0123456789abcdef0123456789abcdef01234567\",null]",["metal"]]"#,
+            r#"active-cargo-package=["[\"serde\",\"1.0.0\",\"registry+https://github.com/rust-lang/crates.io-index\",\"1111111111111111111111111111111111111111111111111111111111111111\"]",[]]"#,
+        ];
+
+        assert!(
+            NativeConsumerBuildFragment::try_from_generated(consumer_record(&directives)).is_ok()
+        );
+    }
+
+    #[test]
+    fn ephemeral_path_rejection_distinguishes_uri_schemes_from_windows_drives() {
+        for value in [
+            "https://github.com/lablup/mlxcel.git",
+            "git+https://github.com/freestylejs/snowbrain-mlxcel.git?rev=0123456789abcdef0123456789abcdef01234567#0123456789abcdef0123456789abcdef01234567",
+            "registry+https://github.com/rust-lang/crates.io-index",
+            "https://example.invalid/C:/remote/object.obj",
+            "https://example.invalid/?path=C:/remote/object.obj",
+            "-DURL=https://example.invalid/C:/remote/object.obj",
+            "https://example.invalid/Users/remote/source",
+            r#"["https://example.invalid/C:/remote/object.obj","https://example.invalid/Users/remote/source"]"#,
+            "https://one.invalid/C:/remote https://two.invalid/Users/remote",
+            "ab://example.invalid/C:/remote/object.obj",
+            // Percent escapes are literal build-record bytes; this validator does not
+            // invent URL or argv decoding semantics.
+            "C:%2Fephemeral%2Fobject.obj",
+            "%2FUsers%2Frunner%2Fsource",
+            "https://example.invalid/?path=C%3A%2Fremote%2Fobject.obj",
+        ] {
+            assert!(
+                reject_ephemeral_path("test build input", value).is_ok(),
+                "rejected remote URI {value:?}"
+            );
+        }
+
+        for value in [
+            "C:/ephemeral/object.obj",
+            r"C:\ephemeral\object.obj",
+            "key=C:/ephemeral/object.obj",
+            "-IC:/ephemeral/include",
+            "-LC:/ephemeral/lib",
+            "-FC:/ephemeral/framework",
+            "-isystem C:/ephemeral/include",
+            "--sysroot=C:/ephemeral/sdk",
+            "/IC:/ephemeral/include",
+            "/LIBPATH:C:/ephemeral/lib",
+            "C://ephemeral/object.obj",
+            "key=C://ephemeral/object.obj",
+            "-IC://ephemeral/include",
+            "x://ephemeral/object.obj",
+            "1https://example.invalid/C:/ephemeral/object.obj",
+            "ht_tps://example.invalid/C:/ephemeral/object.obj",
+            "https:/C:/ephemeral/object.obj",
+            "file:///var/build/object.obj",
+            "FILE:///var/build/object.obj",
+            "git+file:///var/build/object.obj",
+            "git+FILE:///var/build/object.obj",
+            "registry+file:///var/build/object.obj",
+            r"https://example.invalid\C:\ephemeral\object.obj",
+            "https://example.invalid/C:/remote/object.obj C:/ephemeral/object.obj",
+            "-DURL=https://example.invalid/C:/remote/object.obj;-IC:/ephemeral/include",
+            r#"["https://example.invalid/C:/remote/object.obj","C:/ephemeral/object.obj"]"#,
+            "https://example.invalid/C:/remote/object.obj,D:/ephemeral/object.obj",
+            "$<IF:1,https://example.invalid/C:/remote/object.obj,C:/ephemeral/object.obj>",
+        ] {
+            assert!(
+                reject_ephemeral_path("test build input", value).is_err(),
+                "accepted Windows path {value:?}"
+            );
+        }
+
+        for value in [
+            "/tmp/build/object.o",
+            "-I/Users/runner/include",
+            "key=/home/runner/lib",
+            r"-L\private\var\build\lib",
+            r#"["https://example.invalid/Users/remote/source","/Users/runner/source"]"#,
+        ] {
+            assert!(
+                reject_ephemeral_path("test build input", value).is_err(),
+                "accepted Unix path {value:?}"
+            );
+        }
     }
 
     fn embedded_consumer(revision: &str) -> NativeConsumerBuildFragment {
