@@ -46,6 +46,7 @@ pub mod media_root;
 pub mod model_meta;
 pub mod model_provider;
 pub mod model_source;
+pub(crate) mod native_frontend;
 pub mod prompt_cache;
 mod read_budget;
 pub mod reasoning_format;
@@ -102,11 +103,16 @@ pub use cli_input::{
     env_fallback_ubatch_size, long_cli_flag_was_set, resolve_batch_kv_quant_config,
     resolve_compat_toggle, resolve_kv_cache_mode,
 };
+pub(crate) use config::PromptCacheRequestContext;
+#[cfg(test)]
+pub(crate) use config::ReasoningBudgetOverride;
 pub use config::{
     DecodeStorageBackend, PipelineParallelRuntimeConfig, PreemptionPolicy,
     RemotePipelineStageConfig, ServerConfig, ServerGenerateOptions,
 };
 pub use cors::{CorsPolicy, OriginPolicy};
+#[cfg(test)]
+pub(crate) use media::MediaRequestMetadata;
 pub use media::{
     DEFAULT_MAX_IMAGE_DECODE_ALLOC_BYTES, DEFAULT_MAX_IMAGE_HEIGHT, DEFAULT_MAX_IMAGE_PAYLOAD_SIZE,
     DEFAULT_MAX_IMAGE_WIDTH, DEFAULT_MAX_IMAGES_PER_REQUEST, ImageInputLimits,

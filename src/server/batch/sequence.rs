@@ -36,42 +36,29 @@
 //! scheduler and generation loop: prompt tokens, sampling config, VLM
 //! embeddings, generated output, response channel, and timing data.
 
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::ops::{Deref, DerefMut};
 use std::sync::mpsc;
 use std::time::Instant;
 
 use mlxcel_core::cache::SequenceId;
-use mlxcel_core::generate::SamplingConfig;
-use mlxcel_core::sampling::{LogprobsConfig, SamplerState, TokenLogprobData};
+use mlxcel_core::sampling::{LogprobsConfig, TokenLogprobData};
 
 use super::stop_matcher::StopMatcher;
+use crate::native_runtime::PhysicalSequence;
 use crate::server::model_provider::model_worker::StreamingDecodeState;
 use crate::server::model_provider::{GenerateEvent, PrefillStats};
 use crate::server::thinking_budget::ThinkingState;
-use crate::vision::merge::InputEmbeddings;
+
+pub use crate::native_runtime::sequence::PhysicalPriority as RequestPriority;
+#[doc(hidden)]
+pub use crate::native_runtime::sequence::PhysicalSequence as SequencePhysicalState;
+pub use crate::native_runtime::sequence::{
+    PhysicalFinishReason as FinishReason, PhysicalSequencePhase as SequenceState,
+};
 
 // ---------------------------------------------------------------------------
 // Request priority
 // ---------------------------------------------------------------------------
-
-/// Priority level for a generation request.
-///
-/// Higher-priority requests are prefilled before lower-priority ones.
-/// Within the decode batch, all sequences receive equal treatment regardless
-/// of priority.
-///
-/// Set via the `X-Priority` HTTP header (default: `Normal`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub enum RequestPriority {
-    /// Low priority (e.g., batch processing jobs).
-    Low = 0,
-    /// Default priority for interactive requests.
-    #[default]
-    Normal = 1,
-    /// High priority (e.g., latency-sensitive interactive chat).
-    High = 2,
-}
 
 impl RequestPriority {
     /// Parse a priority string from an HTTP header value.
@@ -89,122 +76,6 @@ impl RequestPriority {
 }
 
 // ---------------------------------------------------------------------------
-// State machine
-// ---------------------------------------------------------------------------
-
-/// Lifecycle state of a single generation sequence.
-///
-/// Valid transitions:
-///
-/// ```text
-/// Queued --> Prefilling --> Decoding --> Finished(reason)
-/// ```
-///
-/// Additionally, any non-terminal state may transition to
-/// `Finished(Cancelled)` or `Finished(Error)` for early abort (e.g. client
-/// disconnect, prefill failure).
-///
-/// The scheduler is the sole authority for driving transitions; HTTP handlers
-/// only observe the current state.
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum SequenceState {
-    /// Waiting in the prefill queue.
-    Queued,
-    /// Currently being prefilled (prompt processing).
-    Prefilling,
-    /// In the active decode batch, generating tokens.
-    Decoding,
-    /// Generation complete.
-    Finished(FinishReason),
-}
-
-/// Why a sequence finished generating.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum FinishReason {
-    /// An EOS token was emitted.
-    Stop,
-    /// A request-supplied string stop sequence matched the decoded text
-    /// (issue #1466). Distinct from [`Stop`](Self::Stop) so the response layer
-    /// can report b10621's `stop_type: "word"` rather than `"eos"`; the string
-    /// that matched is held by the sequence's
-    /// [`StopMatcher`](super::stop_matcher::StopMatcher), which is the single
-    /// source of truth for it on every serving path.
-    StopSequence,
-    /// `max_tokens` was reached.
-    Length,
-    /// The N-gram loop detector tripped: the raw generated stream collapsed
-    /// into a short repeated pattern, so generation was ended early. Mapped to
-    /// the OpenAI `finish_reason` string `"stop"` (an early, non-error stop,
-    /// matching vLLM's behavior) by the completion result builder, which keys
-    /// the wire string off `completion_tokens < max_tokens`.
-    RepetitionLoop,
-    /// The client disconnected or cancelled the request.
-    Cancelled,
-    /// An internal error occurred during generation.
-    Error(String),
-}
-
-impl SequenceState {
-    /// Attempt to transition from the current state to `next`.
-    ///
-    /// Returns `Ok(())` if the transition is valid, or `Err` with a message
-    /// describing the illegal transition.
-    ///
-    /// Valid transitions:
-    /// - `Queued -> Prefilling` (scheduler begins prefill)
-    /// - `Prefilling -> Decoding` (prefill complete, enter decode loop)
-    /// - `Prefilling -> Finished(Stop | StopSequence | Length | RepetitionLoop)` (completed on first token)
-    /// - `Decoding -> Finished(*)` (normal completion)
-    /// - `Decoding -> Queued` (preemptive eviction for re-prefill)
-    /// - Any non-terminal state -> `Finished(Cancelled | Error)` (early abort)
-    pub fn transition_to(&mut self, next: SequenceState) -> Result<(), String> {
-        let valid = match (&*self, &next) {
-            // Normal forward progression
-            (SequenceState::Queued, SequenceState::Prefilling) => true,
-            (SequenceState::Prefilling, SequenceState::Decoding) => true,
-            (SequenceState::Prefilling, SequenceState::Finished(FinishReason::Stop)) => true,
-            // The first sampled token is decoded during prefill, so a stop
-            // string short enough to complete on it finishes the request there.
-            (SequenceState::Prefilling, SequenceState::Finished(FinishReason::StopSequence)) => {
-                true
-            }
-            (SequenceState::Prefilling, SequenceState::Finished(FinishReason::Length)) => true,
-            (SequenceState::Prefilling, SequenceState::Finished(FinishReason::RepetitionLoop)) => {
-                true
-            }
-            (SequenceState::Decoding, SequenceState::Finished(_)) => true,
-            // Preemptive eviction: a decoding sequence can be evicted and
-            // re-queued for re-prefill.
-            (SequenceState::Decoding, SequenceState::Queued) => true,
-            // Early abort: any non-terminal state can transition to
-            // Finished(Cancelled) or Finished(Error) so the scheduler can
-            // clean up sequences when a client disconnects or an error occurs
-            // during prefill.
-            (_, SequenceState::Finished(FinishReason::Cancelled | FinishReason::Error(_)))
-                if !self.is_finished() =>
-            {
-                true
-            }
-            _ => false,
-        };
-
-        if valid {
-            *self = next;
-            Ok(())
-        } else {
-            Err(format!("invalid state transition: {self:?} -> {next:?}"))
-        }
-    }
-
-    /// Returns `true` if the sequence has reached a terminal state.
-    pub fn is_finished(&self) -> bool {
-        matches!(self, SequenceState::Finished(_))
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Per-request context
 // ---------------------------------------------------------------------------
 
@@ -214,36 +85,11 @@ impl SequenceState {
 /// scheduler through prefill and decode phases. The `response_tx` channel
 /// carries streaming `GenerateEvent` values back to the HTTP handler.
 pub struct SequenceInfo {
-    /// Unique identifier assigned by the `CachePool`.
-    pub seq_id: SequenceId,
-    /// Current lifecycle state.
-    pub state: SequenceState,
-
-    // -- Request context --
-    /// Tokenized prompt (integer token IDs).
-    pub prompt_tokens: Vec<i32>,
-    /// Sampling parameters for this request.
-    pub sampling: SamplingConfig,
-    /// Maximum number of tokens to generate.
-    pub max_tokens: usize,
-    /// EOS token IDs that terminate generation.
-    pub eos_token_ids: Vec<i32>,
-    /// Request priority for prefill ordering and eviction decisions.
-    pub priority: RequestPriority,
+    /// Sole model/cache/sampling authority shared by native and server
+    /// frontends. The remaining fields are server-only projection state.
+    pub(crate) physical: PhysicalSequence,
     /// Log probability configuration for this request.
     pub logprobs_config: LogprobsConfig,
-
-    // -- VLM / multimodal context (optional) --
-    /// Pre-computed vision-language embeddings for VLM requests.
-    pub vlm_embeddings: Option<InputEmbeddings>,
-    /// Raw image bytes for VLM requests (empty for text-only).
-    pub images: Vec<Vec<u8>>,
-    /// Raw audio bytes for audio-language models (empty for non-audio).
-    pub audio: Vec<Vec<u8>>,
-
-    // -- Generation state --
-    /// Tokens produced so far during decode.
-    pub generated_tokens: Vec<i32>,
     /// Accumulated decoded text.
     pub generated_text: String,
     /// Streaming decode helper for incremental text emission.
@@ -257,43 +103,6 @@ pub struct SequenceInfo {
     /// when the request supplied no `stop` field, in which case it is an exact
     /// pass-through and the emitted bytes are unchanged.
     pub(crate) stop_matcher: StopMatcher,
-    /// Incrementally maintained token history for penalty-based sampling.
-    /// Initialized from prompt tokens during prefill, then appended per decode
-    /// step. Avoids O(prompt_len + generated_len) Vec reconstruction on every
-    /// decode step. Empty when `sampling.needs_token_history()` is false.
-    pub(crate) token_history: Vec<i32>,
-    /// Incremental per-sequence sampler state for history-based penalties
-    /// (repetition, frequency/presence). Created lazily on the first decode
-    /// step that applies one of those penalties and dropped with the sequence
-    /// (so the default no-penalty path never allocates it). DRY is not
-    /// state-backed and keeps reading `token_history` directly. Kept in sync
-    /// with `token_history` by `sample_token_optimized_with_state`.
-    pub(crate) sampler_state: Option<SamplerState>,
-    /// Merged EOS token IDs (model + per-request stop tokens), computed once
-    /// during prefill and reused for every decode step. Avoids redundant
-    /// allocation on every step.
-    pub(crate) merged_eos: Vec<i32>,
-
-    // -- Chunked prefill state --
-    /// Token offset into `prompt_tokens` for chunked prefill.
-    /// When 0 the prefill has not started; when == `prompt_tokens.len()` it
-    /// is complete. The scheduler advances this in increments of
-    /// `prefill_chunk_size`.
-    pub prefill_offset: usize,
-
-    // -- prompt prefix cache --
-    /// Token count from the head of `prompt_tokens` that was already present
-    /// in the adopted KV cache. When `> 0`, prefill **skips** those leading
-    /// tokens and feeds only `prompt_tokens[prefill_start_offset..]` to the
-    /// model. When `0` (the default) the prefill processes the entire prompt
-    /// exactly as before the scheduler gained cache-adoption support.
-    pub prefill_start_offset: usize,
-
-    /// Mirror of `prefill_start_offset` at adopt time — the counter reported
-    /// to observability / `usage.cached_tokens`. Stored separately so that
-    /// the prefill path can rewrite `prefill_start_offset` for bookkeeping
-    /// (e.g. chunked prefill continuation math) without affecting the stat.
-    pub already_cached_tokens: usize,
 
     // -- thinking-token budget --
     /// Per-sequence thinking-budget state. Drives forced `</think>` injection
@@ -317,23 +126,223 @@ pub struct SequenceInfo {
     // -- Response channel --
     /// Sender for streaming events back to the HTTP handler.
     pub response_tx: mpsc::Sender<GenerateEvent>,
+    /// Server-only stable-byte projection. Native physical state retains only
+    /// the generic output sink; server text, stop, logprob, and response state
+    /// remain reachable through this sequence projection.
+    pub(crate) server_native_projection:
+        Option<crate::server::native_frontend::MlxcelServerProjection>,
+}
 
-    // -- Cancellation --
-    /// Shared flag set to `true` by the SSE sender when the client disconnects.
-    /// The `BatchScheduler` checks this flag in `finalize_completed()` and
-    /// transitions the sequence to `Finished(Cancelled)`.
-    pub cancelled: Arc<AtomicBool>,
+impl Deref for SequenceInfo {
+    type Target = SequencePhysicalState;
 
-    // -- Timing --
-    /// Wall-clock time when the request was received.
-    pub created_at: Instant,
-    /// Wall-clock time when prefill started (set on `Queued -> Prefilling`).
-    pub prefill_start: Option<Instant>,
-    /// Wall-clock time when the first decode token was produced.
-    pub first_token_time: Option<Instant>,
+    fn deref(&self) -> &Self::Target {
+        &self.physical
+    }
+}
+
+impl DerefMut for SequenceInfo {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.physical
+    }
 }
 
 impl SequenceInfo {
+    pub(crate) fn is_native(&self) -> bool {
+        self.native.is_some() && self.server_native_projection.is_none()
+    }
+
+    pub(crate) fn has_native_port(&self) -> bool {
+        self.native.is_some()
+    }
+
+    pub(crate) fn is_server_native(&self) -> bool {
+        self.native.is_some() && self.server_native_projection.is_some()
+    }
+
+    pub(crate) fn server_native_accept_token(
+        &mut self,
+        token_id: i32,
+        source: crate::native_runtime::NativeAcceptedSource,
+        usage: crate::native_runtime::NativeUsageDelta,
+        logprobs: Option<TokenLogprobData>,
+    ) -> Result<
+        crate::native_runtime::sequence::NativeAcceptOutcome,
+        crate::native_runtime::NativeRuntimeError,
+    > {
+        if let Some(projection) = &self.server_native_projection {
+            projection.queue_logprobs(logprobs);
+        }
+        self.native_accept_token_at_step(
+            token_id,
+            source,
+            usage,
+            server_native_output_step(self.generated_tokens.len()),
+        )
+    }
+
+    pub(crate) fn project_server_native_token(
+        &mut self,
+        token_id: i32,
+        source: crate::native_runtime::NativeAcceptedSource,
+        usage: crate::native_runtime::NativeUsageDelta,
+        logprobs: Option<TokenLogprobData>,
+    ) -> Result<Option<String>, crate::native_runtime::NativeRuntimeError> {
+        let outcome = self.server_native_accept_token(token_id, source, usage, logprobs)?;
+        if outcome.discarded_units != 0 || outcome.committed_units != 1 {
+            return Err(crate::native_runtime::NativeRuntimeError::new(
+                crate::native_runtime::NativeRuntimeErrorKind::UnsupportedGuarantee,
+                "server token projection cannot resume after a discarded accepted unit",
+            ));
+        }
+        if !outcome.continue_execution {
+            let matched = self.server_native_matched_stop();
+            let terminal = outcome.terminal.unwrap_or_else(|| {
+                crate::native_runtime::NativePhysicalTerminal::Failed(
+                    crate::native_runtime::NativeRuntimeError::new(
+                        crate::native_runtime::NativeRuntimeErrorKind::Infrastructure,
+                        "server projection stopped without a terminal outcome",
+                    ),
+                )
+            });
+            self.native_terminal(terminal);
+            return Ok(Some(matched.unwrap_or_default()));
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn stream_accepted_token(
+        &mut self,
+        token_id: i32,
+        tokenizer: &crate::tokenizer::MlxcelTokenizer,
+        logprobs: Option<TokenLogprobData>,
+        source: crate::native_runtime::NativeAcceptedSource,
+        usage: crate::native_runtime::NativeUsageDelta,
+    ) -> Result<Option<String>, crate::native_runtime::NativeRuntimeError> {
+        if self.is_server_native() {
+            return self.project_server_native_token(token_id, source, usage, logprobs);
+        }
+        Ok(match self.decode_state.on_token(token_id, tokenizer) {
+            Some(new_text) => self.stream_decoded_text(new_text, logprobs),
+            None => None,
+        })
+    }
+
+    pub(crate) fn fail_server_native_projection(
+        &mut self,
+        error: crate::native_runtime::NativeRuntimeError,
+    ) {
+        let _ = self
+            .state
+            .transition_to(SequenceState::Finished(FinishReason::Error(
+                error.to_string(),
+            )));
+        self.native_terminal(crate::native_runtime::NativePhysicalTerminal::Failed(error));
+    }
+
+    pub(crate) fn emit_terminal_error(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        if self.has_native_port() {
+            self.native_terminal(crate::native_runtime::NativePhysicalTerminal::Failed(
+                crate::native_runtime::NativeRuntimeError::new(
+                    crate::native_runtime::NativeRuntimeErrorKind::Infrastructure,
+                    &message,
+                ),
+            ));
+        } else {
+            let _ = self.response_tx.send(GenerateEvent::Error(message));
+        }
+    }
+
+    pub(crate) fn native_accept_token(
+        &mut self,
+        token_id: i32,
+        source: crate::native_runtime::NativeAcceptedSource,
+        usage: crate::native_runtime::NativeUsageDelta,
+    ) -> Result<
+        crate::native_runtime::sequence::NativeAcceptOutcome,
+        crate::native_runtime::NativeRuntimeError,
+    > {
+        let output_step = self.physical.generated_tokens.len() as u64;
+        self.native_accept_token_at_step(token_id, source, usage, output_step)
+    }
+
+    fn native_accept_token_at_step(
+        &mut self,
+        token_id: i32,
+        source: crate::native_runtime::NativeAcceptedSource,
+        usage: crate::native_runtime::NativeUsageDelta,
+        output_step: u64,
+    ) -> Result<
+        crate::native_runtime::sequence::NativeAcceptOutcome,
+        crate::native_runtime::NativeRuntimeError,
+    > {
+        let physical = &mut self.physical;
+        let decoder = physical.decoder.as_deref_mut().ok_or_else(|| {
+            crate::native_runtime::NativeRuntimeError::new(
+                crate::native_runtime::NativeRuntimeErrorKind::Infrastructure,
+                "native sequence has no worker-owned decoder",
+            )
+        })?;
+        let port = physical.native.as_mut().ok_or_else(|| {
+            crate::native_runtime::NativeRuntimeError::new(
+                crate::native_runtime::NativeRuntimeErrorKind::Infrastructure,
+                "native sequence has no output port",
+            )
+        })?;
+        port.accepted(
+            decoder,
+            &[token_id],
+            source,
+            crate::native_runtime::NativeResumeCapability::WholeChunkOnly,
+            physical.already_cached_tokens,
+            output_step,
+            usage,
+        )
+    }
+
+    pub(crate) fn native_physical(&mut self, event: crate::native_runtime::NativePhysicalEvent) {
+        if let Some(port) = self.physical.native.as_mut() {
+            port.physical(event);
+        }
+    }
+
+    pub(crate) fn native_terminal(
+        &mut self,
+        terminal: crate::native_runtime::NativePhysicalTerminal,
+    ) {
+        let physical = &mut self.physical;
+        let Some(port) = physical.native.as_mut() else {
+            return;
+        };
+        if port.is_terminal() {
+            return;
+        }
+        let Some(decoder) = physical.decoder.as_deref_mut() else {
+            port.terminal(crate::native_runtime::NativePhysicalTerminal::Failed(
+                crate::native_runtime::NativeRuntimeError::new(
+                    crate::native_runtime::NativeRuntimeErrorKind::Infrastructure,
+                    "native sequence has no worker-owned decoder at terminal",
+                ),
+            ));
+            return;
+        };
+        port.terminal_after_decoder(decoder, terminal);
+    }
+
+    pub(crate) fn native_is_terminal(&self) -> bool {
+        self.physical
+            .native
+            .as_ref()
+            .is_some_and(crate::native_runtime::sequence::NativeSequencePort::is_terminal)
+    }
+
+    pub(crate) fn native_mark_dependent_sample(&mut self) {
+        if let Some(port) = self.physical.native.as_mut() {
+            port.mark_dependent_sample();
+        }
+    }
+
     /// Convenience: returns the number of generated tokens so far.
     pub fn completion_count(&self) -> usize {
         self.generated_tokens.len()
@@ -361,6 +370,17 @@ impl SequenceInfo {
         }
         let now = Instant::now();
         self.first_token_time = Some(now);
+        if self.has_native_port() {
+            self.native_physical(crate::native_runtime::NativePhysicalEvent::Prefill {
+                evaluated_tokens: self
+                    .prompt_tokens
+                    .len()
+                    .saturating_sub(self.already_cached_tokens)
+                    as u32,
+                reused_tokens: self.already_cached_tokens as u32,
+            });
+            return;
+        }
         let _ = self.response_tx.send(GenerateEvent::Prefill(PrefillStats {
             prompt_tokens: self.prompt_tokens.len(),
             cached_tokens: self.already_cached_tokens,
@@ -456,7 +476,16 @@ impl SequenceInfo {
     /// The stop string that ended this request, or `None` when no string stop
     /// sequence matched.
     pub(crate) fn matched_stop(&self) -> Option<&str> {
+        if self.is_server_native() {
+            return None;
+        }
         self.stop_matcher.matched()
+    }
+
+    pub(crate) fn server_native_matched_stop(&self) -> Option<String> {
+        self.server_native_projection
+            .as_ref()
+            .and_then(crate::server::native_frontend::MlxcelServerProjection::matched_stop)
     }
 
     /// Build the final [`GenerationResult`] for this sequence, taking the
@@ -498,6 +527,10 @@ impl SequenceInfo {
             }
         }
     }
+}
+
+fn server_native_output_step(generated_tokens_len: usize) -> u64 {
+    generated_tokens_len.saturating_sub(1) as u64
 }
 
 // We cannot derive `Debug` automatically because `InputEmbeddings` contains
@@ -560,6 +593,22 @@ pub enum BatchSchedulerAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_projection_uses_zero_based_steps_after_legacy_token_append() {
+        assert_eq!(server_native_output_step(1), 0);
+        assert_eq!(server_native_output_step(16), 15);
+    }
+
+    #[test]
+    fn public_server_facade_keeps_physical_construction_and_projection_private() {
+        let production = include_str!("sequence.rs")
+            .split_once("#[cfg(test)]")
+            .expect("test module boundary")
+            .0;
+        assert!(production.contains("pub(crate) physical: PhysicalSequence"));
+        assert!(production.contains("pub(crate) server_native_projection:"));
+    }
 
     // -- SequenceState transition tests --
 

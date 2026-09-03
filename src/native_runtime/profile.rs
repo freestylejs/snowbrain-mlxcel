@@ -1736,19 +1736,13 @@ impl NativeWorkerConfig {
         policy: NativeWorkerPolicy,
     ) -> Result<Self, NativeRuntimeError> {
         let expected_driver = match report.operation_class() {
-            super::operation_driver::MlxNativeOperationClass::Autoregressive
-                if report.model_capabilities().generation =>
-            {
+            super::operation_driver::MlxNativeOperationClass::Autoregressive => {
                 NativeOperationDriver::AutoregressiveGenerate
             }
-            super::operation_driver::MlxNativeOperationClass::EncoderDecoder
-                if report.model_capabilities().generation =>
-            {
+            super::operation_driver::MlxNativeOperationClass::EncoderDecoder => {
                 NativeOperationDriver::EncoderDecoderGenerate
             }
-            super::operation_driver::MlxNativeOperationClass::Embedding
-                if report.model_capabilities().embedding =>
-            {
+            super::operation_driver::MlxNativeOperationClass::Embedding => {
                 NativeOperationDriver::Embedding
             }
             super::operation_driver::MlxNativeOperationClass::SpeechToText => {

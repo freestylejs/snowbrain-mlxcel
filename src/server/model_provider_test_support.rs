@@ -19,6 +19,7 @@ impl ModelProvider {
         let worker_handle = thread::spawn(move || {
             while let Ok(request) = request_rx.recv() {
                 match request {
+                    ModelRequest::Native(_) => continue,
                     ModelRequest::Generate {
                         options,
                         queue_reservation,
@@ -36,9 +37,7 @@ impl ModelProvider {
                             .stop_sequences
                             .as_deref()
                             .and_then(<[String]>::first)
-                            .map(|word| {
-                                crate::server::model_provider::StopKind::Word(word.clone())
-                            })
+                            .map(|word| crate::server::model_provider::StopKind::Word(word.clone()))
                             .unwrap_or(crate::server::model_provider::StopKind::Eos);
                         let _ = options_tx.send(options);
                         let _ = response_tx.send(GenerateEvent::Done(GenerationResult {
@@ -62,7 +61,10 @@ impl ModelProvider {
         });
 
         Self {
-            request_tx,
+            native_frontend:
+                crate::server::native_frontend::MlxcelServerFrontend::from_legacy_operation_channel(
+                    request_tx,
+                ),
             model_id: "route-test-model".to_string(),
             created_at: 0,
             loaded,
@@ -91,7 +93,10 @@ impl ModelProvider {
         drop(request_rx);
         let batch_metrics = Arc::new(BatchMetrics::new());
         Self {
-            request_tx,
+            native_frontend:
+                crate::server::native_frontend::MlxcelServerFrontend::from_legacy_operation_channel(
+                    request_tx,
+                ),
             model_id: "route-test-model".to_string(),
             created_at: 0,
             loaded: Arc::new(AtomicBool::new(loaded)),
@@ -130,6 +135,7 @@ impl ModelProvider {
         let worker_handle = thread::spawn(move || {
             while let Ok(request) = request_rx.recv() {
                 match request {
+                    ModelRequest::Native(_) => continue,
                     ModelRequest::Generate {
                         options,
                         queue_reservation,
@@ -181,7 +187,10 @@ impl ModelProvider {
             }
         });
         let provider = Self {
-            request_tx,
+            native_frontend:
+                crate::server::native_frontend::MlxcelServerFrontend::from_legacy_operation_channel(
+                    request_tx,
+                ),
             model_id: "route-test-model".to_string(),
             created_at: 0,
             loaded,
@@ -203,7 +212,6 @@ impl ModelProvider {
             },
         )
     }
-
 }
 
 /// One step of a scripted streaming generation (#1444).
@@ -225,7 +233,9 @@ pub(crate) struct ScriptedStreamHandle {
 
 impl ScriptedStreamHandle {
     pub(crate) fn token(&self, token: &str) {
-        let _ = self.step_tx.send(ScriptedStreamStep::Token(token.to_string()));
+        let _ = self
+            .step_tx
+            .send(ScriptedStreamStep::Token(token.to_string()));
     }
 
     pub(crate) fn finish(&self) {

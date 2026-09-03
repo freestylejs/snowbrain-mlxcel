@@ -389,6 +389,9 @@ pub(crate) fn should_burst_for_sequence(
     dispatch: &crate::server::SpeculativeDispatch,
     seq: &SequenceInfo,
 ) -> bool {
+    if seq.is_native() {
+        return false;
+    }
     if !dispatch.is_kind_specific() {
         return false;
     }
@@ -2016,22 +2019,34 @@ pub(crate) fn stream_burst_tokens(
             break;
         }
         seq.generated_tokens.push(final_token);
-        if let Some(new_text) = seq.decode_state.on_token(final_token, tokenizer) {
-            // `logprobs[idx]` mirrors the classic path's per-token
-            // `compute_logprobs(...)` result: `Some(lp)` → emit
-            // `TokenWithLogprobs`, `None` → emit plain `Token` (the
-            // classic path does the same when `compute_logprobs`
-            // returns `None`, e.g. on a sampler override). A fired
-            // thinking-budget override also forces plain `Token`.
-            let lp = if logprobs_on && !override_fired {
-                logprobs.get(idx).and_then(|lp| lp.clone())
-            } else {
-                None
-            };
-            // Same stop-string enforcement as the classic decode path
-            // (issue #1466): a speculative request must not outrun its own
-            // stop strings just because its tokens arrive several at a time.
-            if seq.stream_decoded_text(new_text, lp).is_some() {
+        // `logprobs[idx]` mirrors the classic path's per-token
+        // `compute_logprobs(...)` result. The native server projection queues
+        // the same sidecar before its stable-byte sink callback.
+        let lp = if logprobs_on && !override_fired {
+            logprobs.get(idx).and_then(|lp| lp.clone())
+        } else {
+            None
+        };
+        match seq.stream_accepted_token(
+            final_token,
+            tokenizer,
+            lp,
+            crate::native_runtime::NativeAcceptedSource::SpeculativeTargetAccepted,
+            crate::native_runtime::NativeUsageDelta {
+                input_tokens_evaluated: 0,
+                input_tokens_reused: 0,
+                output_tokens_accepted: 1,
+                speculative_tokens_evaluated: 1,
+                speculative_tokens_discarded: 0,
+            },
+        ) {
+            Ok(Some(_)) => {
+                stream.done = true;
+                return true;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                seq.fail_server_native_projection(error);
                 stream.done = true;
                 return true;
             }
@@ -2059,7 +2074,8 @@ pub(crate) fn finalize_burst_stream(
     // Final state classification. A matched string stop sequence outranks the
     // budget: the request ended because the caller's own stop string appeared,
     // not because it ran out of tokens (issue #1466).
-    let finish_reason = if seq.matched_stop().is_some() {
+    let server_native_stop = seq.server_native_matched_stop();
+    let finish_reason = if seq.matched_stop().is_some() || server_native_stop.is_some() {
         FinishReason::StopSequence
     } else if stream.hit_eos {
         FinishReason::Stop
@@ -2100,17 +2116,30 @@ pub(crate) fn finalize_burst_stream(
     // before Done so streaming clients receive it (issue #633), through the stop
     // matcher so a stop string that only completes in the tail still fires and
     // the tail is dropped rather than leaked (issue #1466).
-    let tail = seq.decode_state.flush(tokenizer);
-    seq.close_text_stream(tail);
-    let cached = seq.already_cached_tokens;
-    let result = seq.take_generation_result(tokenizer, cached);
-    tracing::info!(
-        prompt_tokens = seq.prompt_tokens.len(),
-        generated_tokens = tokens_generated,
-        burst_ms = result.generation_time_ms,
-        "Speculative burst completed"
-    );
-    let _ = seq.response_tx.send(GenerateEvent::Done(result));
+    if seq.has_native_port() {
+        if !seq.native_is_terminal() {
+            let reason = if matches!(&seq.state, SequenceState::Finished(FinishReason::Length)) {
+                crate::native_runtime::NativeStopReason::Limit
+            } else {
+                crate::native_runtime::NativeStopReason::Eos
+            };
+            seq.native_terminal(crate::native_runtime::NativePhysicalTerminal::Completed {
+                reason,
+            });
+        }
+    } else {
+        let tail = seq.decode_state.flush(tokenizer);
+        seq.close_text_stream(tail);
+        let cached = seq.already_cached_tokens;
+        let result = seq.take_generation_result(tokenizer, cached);
+        tracing::info!(
+            prompt_tokens = seq.prompt_tokens.len(),
+            generated_tokens = tokens_generated,
+            burst_ms = result.generation_time_ms,
+            "Speculative burst completed"
+        );
+        let _ = seq.response_tx.send(GenerateEvent::Done(result));
+    }
     // Move the prompt + committed token vectors out of `seq` for the
     // scheduler's prompt-cache donate. `seq` is dropped
     // immediately after this — these are its last readers.
@@ -2135,10 +2164,19 @@ pub(crate) fn finalize_burst_stream(
 ///   slot via [`crate::server::batch::scheduler::BatchScheduler::release_sequence_caches`].
 ///   We don't take a `&mut Scheduler` here so this module stays
 ///   dependency-free of the scheduler internals.
-fn emit_error_and_finalize(_ctx: BurstContext<'_>, seq: SequenceInfo, msg: &str) {
-    let _ = seq
-        .response_tx
-        .send(GenerateEvent::Error(format!("Speculative burst: {msg}")));
+fn emit_error_and_finalize(_ctx: BurstContext<'_>, mut seq: SequenceInfo, msg: &str) {
+    if seq.has_native_port() {
+        seq.native_terminal(crate::native_runtime::NativePhysicalTerminal::Failed(
+            crate::native_runtime::NativeRuntimeError::new(
+                crate::native_runtime::NativeRuntimeErrorKind::Infrastructure,
+                format!("Speculative burst: {msg}"),
+            ),
+        ));
+    } else {
+        let _ = seq
+            .response_tx
+            .send(GenerateEvent::Error(format!("Speculative burst: {msg}")));
+    }
     drop(seq);
     let _ = msg;
 }

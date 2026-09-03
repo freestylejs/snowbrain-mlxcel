@@ -508,22 +508,56 @@ fn path_sort_key(path: &Path) -> String {
 }
 
 fn replace_case_aware(value: &str, needle: &str, replacement: &str) -> String {
-    if cfg!(windows) {
-        let lower_value = value.to_ascii_lowercase();
-        let lower_needle = needle.to_ascii_lowercase();
-        let mut result = String::new();
-        let mut offset = 0;
-        while let Some(relative) = lower_value[offset..].find(&lower_needle) {
-            let found = offset + relative;
+    let search_value = if cfg!(windows) {
+        value.to_ascii_lowercase()
+    } else {
+        value.to_owned()
+    };
+    let search_needle = if cfg!(windows) {
+        needle.to_ascii_lowercase()
+    } else {
+        needle.to_owned()
+    };
+    let mut result = String::new();
+    let mut offset = 0;
+    while let Some(relative) = search_value[offset..].find(&search_needle) {
+        let found = offset + relative;
+        let end = found + needle.len();
+        if path_root_boundary(value, found, end) {
             result.push_str(&value[offset..found]);
             result.push_str(replacement);
-            offset = found + needle.len();
+            offset = end;
+        } else {
+            let width = value[found..]
+                .chars()
+                .next()
+                .map(char::len_utf8)
+                .unwrap_or(1);
+            result.push_str(&value[offset..found + width]);
+            offset = found + width;
         }
-        result.push_str(&value[offset..]);
-        result
-    } else {
-        value.replace(needle, replacement)
     }
+    result.push_str(&value[offset..]);
+    result
+}
+
+fn path_root_boundary(value: &str, start: usize, end: usize) -> bool {
+    let after = value[end..].chars().next();
+    let after_is_boundary = after.is_none_or(|character| {
+        character.is_ascii_whitespace()
+            || matches!(character, '/' | '"' | '\'' | '=' | ',' | ';' | '>' | ':')
+    });
+    path_prefix_boundary(value, start) && after_is_boundary
+}
+
+fn path_prefix_boundary(value: &str, start: usize) -> bool {
+    value[..start].chars().next_back().is_none_or(|character| {
+        character.is_ascii_whitespace()
+            || matches!(character, '"' | '\'' | '=' | ',' | ';' | '>' | ':')
+            || JOINED_PATH_OPTION_PREFIXES
+                .into_iter()
+                .any(|prefix| value[..start].ends_with(prefix))
+    })
 }
 
 fn contains_unmapped_absolute_path(value: &str, role_tokens: &[String]) -> bool {
@@ -549,20 +583,32 @@ fn contains_unmapped_absolute_path(value: &str, role_tokens: &[String]) -> bool 
     value
         .split(|character: char| character.is_ascii_whitespace() || matches!(character, '=' | ','))
         .any(|part| {
-            let part = part.trim_matches(['\'', '"']);
-            if role_tokens.iter().any(|token| part.contains(token)) {
-                return false;
-            }
-            // MSVC options legitimately start with one slash (`/std:c++20`,
-            // `/D...`, `/DEFAULTLIB:...`). Check only positions that can begin
-            // an absolute path: the whole argument or a known joined path
-            // option. A stable relative argument such as `../mlx-cpp/turbo`
-            // is not an ambient absolute path.
-            unix_absolute_path(part)
+            part.split(';').any(|part| {
+                let part = part.trim_matches(['\'', '"']);
+                if role_tokens.iter().any(|token| part.contains(token)) {
+                    return false;
+                }
+                // MSVC options legitimately start with one slash (`/std:c++20`,
+                // `/D...`, `/DEFAULTLIB:...`). Check only positions that can begin
+                // an absolute path: the whole argument or a known joined path
+                // option. A stable relative argument such as `../mlx-cpp/turbo`
+                // is not an ambient absolute path. CMake semicolon lists are
+                // checked one element at a time so a mapped element cannot hide
+                // a later unmapped absolute path.
+                unix_absolute_path(part)
+            })
         })
 }
 
 fn contains_embedded_unix_absolute_path(value: &str) -> bool {
+    if value.contains("$<")
+        && value.split(';').any(|part| {
+            let part = part.trim_matches(['\'', '"']);
+            part.starts_with('/') && unix_absolute_path(part)
+        })
+    {
+        return true;
+    }
     value.match_indices(":/").any(|(index, _)| {
         let tail = &value[index + 1..];
         let candidate = tail
@@ -571,7 +617,10 @@ fn contains_embedded_unix_absolute_path(value: &str) -> bool {
             })
             .next()
             .unwrap_or(tail);
-        !candidate.starts_with("//") && candidate.get(1..).is_some_and(|rest| rest.contains('/'))
+        if candidate.starts_with("//") {
+            return value.trim_start().starts_with("$<");
+        }
+        unix_absolute_path(candidate)
     })
 }
 
@@ -590,21 +639,40 @@ fn unix_absolute_path(part: &str) -> bool {
     let joined = JOINED_PATH_OPTION_PREFIXES
         .into_iter()
         .find_map(|prefix| part.strip_prefix(prefix));
-    let candidate = joined
-        .unwrap_or(part)
-        .split([';', '>'])
-        .next()
-        .unwrap_or(part);
-    candidate.starts_with('/')
-        && !candidate.starts_with("//")
-        && (joined.is_some() || candidate[1..].contains('/'))
+    joined.unwrap_or(part).split(';').any(|candidate| {
+        let candidate = candidate.trim_matches(['\'', '"']).trim_end_matches('>');
+        if candidate.starts_with("//") {
+            return true;
+        }
+        candidate.starts_with('/')
+            && (joined.is_some()
+                || candidate[1..].contains('/')
+                || (!cfg!(windows) && !known_msvc_switch(candidate)))
+    })
+}
+
+fn known_msvc_switch(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "/debug" | "/incremental" | "/utf-8" | "/bigobj"
+    ) || lower.starts_with("/std:")
+        || lower.starts_with("/defaultlib:")
+        || lower.starts_with("/wd")
+        || lower.starts_with("/zc:")
 }
 
 fn has_windows_drive_prefix(value: &str) -> bool {
     value
         .as_bytes()
         .windows(3)
-        .any(|window| window[0].is_ascii_alphabetic() && window[1] == b':' && window[2] == b'/')
+        .enumerate()
+        .any(|(index, window)| {
+            window[0].is_ascii_alphabetic()
+                && window[1] == b':'
+                && window[2] == b'/'
+                && path_prefix_boundary(value, index)
+        })
 }
 
 #[allow(dead_code)]
@@ -646,18 +714,15 @@ mod tests {
         let root = temp.path().join("workspace");
         fs::create_dir(&root).unwrap();
         let mapping = PathToken::new("<workspace>", &root).unwrap();
-        let argument = format!("-I{}/include", root.display());
+        let argument = format!("-I{}/include", mapping.root.display());
         assert_eq!(
             canonicalize_argument(&argument, &[mapping]).unwrap(),
             "-I<workspace>/include"
         );
-        let nested_argument = format!("-I{}/include/generated", root.display());
+        let nested_mapping = PathToken::new("<workspace>", &root).unwrap();
+        let nested_argument = format!("-I{}/include/generated", nested_mapping.root.display());
         assert_eq!(
-            canonicalize_argument(
-                &nested_argument,
-                &[PathToken::new("<workspace>", &root).unwrap()]
-            )
-            .unwrap(),
+            canonicalize_argument(&nested_argument, &[nested_mapping]).unwrap(),
             "-I<workspace>/include/generated"
         );
         let unmapped = if cfg!(windows) {
@@ -718,6 +783,46 @@ mod tests {
         );
         assert!(canonicalize_argument("$<BUILD_INTERFACE:C:/ambient/include>", &[]).is_err());
         assert!(canonicalize_argument("$<BUILD_INTERFACE:/ambient/include>", &[]).is_err());
+    }
+
+    #[test]
+    fn path_tokenization_rejects_list_tails_and_root_prefix_lookalikes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        let mapping = PathToken::new("<workspace>", &root).unwrap();
+        let framework_list = format!(
+            "-F{}/System/Library/Frameworks;/ambient/include",
+            mapping.root.display()
+        );
+        assert!(canonicalize_argument(&framework_list, &[mapping.clone()]).is_err());
+        let plain_list = format!(
+            "{}/System/Library/Frameworks;/ambient/include",
+            mapping.root.display()
+        );
+        assert!(canonicalize_argument(&plain_list, &[mapping.clone()]).is_err());
+        let expression_list = format!(
+            "$<BUILD_INTERFACE:{}/include;/ambient/include>",
+            mapping.root.display()
+        );
+        assert!(canonicalize_argument(&expression_list, &[mapping.clone()]).is_err());
+        let lookalike = format!("-I{}-evil/include", mapping.root.display());
+        assert!(canonicalize_argument(&lookalike, &[mapping]).is_err());
+    }
+
+    #[test]
+    fn path_tokenization_rejects_single_component_and_unc_absolute_paths() {
+        #[cfg(not(windows))]
+        {
+            assert!(canonicalize_argument("/tmp", &[]).is_err());
+            assert!(canonicalize_argument("$<BUILD_INTERFACE:/tmp>", &[]).is_err());
+        }
+        assert!(canonicalize_argument("-I//server/share", &[]).is_err());
+        assert!(canonicalize_argument("$<BUILD_INTERFACE://server/share>", &[]).is_err());
+        assert_eq!(
+            canonicalize_argument("-DURL=https://example.invalid/model", &[]).unwrap(),
+            "-DURL=https://example.invalid/model"
+        );
     }
 
     #[test]

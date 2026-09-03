@@ -350,7 +350,7 @@ mod tests {
         let mut tensors = BTreeMap::from([
             (
                 "proj.weight".to_string(),
-                metadata(&[8, 2], TensorMetadataDtype::U32),
+                metadata(&[8, 8], TensorMetadataDtype::U32),
             ),
             (
                 "proj.scales".to_string(),
@@ -374,6 +374,23 @@ mod tests {
         )
         .unwrap();
 
+        tensors.get_mut("proj.weight").unwrap().shape = vec![8, 2].into();
+        assert!(
+            validate_required_matrix(
+                &tensors,
+                "proj",
+                8,
+                64,
+                TensorQuantization {
+                    group_size: 64,
+                    bits: 4,
+                },
+                false,
+            )
+            .is_err()
+        );
+        tensors.get_mut("proj.weight").unwrap().shape = vec![8, 8].into();
+
         tensors.get_mut("proj.weight").unwrap().dtype = TensorMetadataDtype::F16;
         assert!(
             validate_required_matrix(
@@ -396,7 +413,7 @@ mod tests {
         let mut tensors = BTreeMap::from([
             (
                 "proj.weight".to_string(),
-                metadata(&[8, 2], TensorMetadataDtype::U32),
+                metadata(&[8, 8], TensorMetadataDtype::U32),
             ),
             (
                 "proj.scales".to_string(),

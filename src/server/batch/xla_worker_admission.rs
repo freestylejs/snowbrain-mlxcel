@@ -506,6 +506,7 @@ impl<E: XlaServingEngine> XlaServeWorker<E> {
 
     fn handle(&mut self, request: ModelRequest) {
         match request {
+            ModelRequest::Native(_) => {}
             ModelRequest::Generate {
                 prompt,
                 prompt_token_ids,

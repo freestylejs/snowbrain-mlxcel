@@ -225,7 +225,7 @@ fn queue_full_returns_queuefull_error() {
 
     let (gate_tx, gate_rx) = mpsc::channel::<()>();
     let (started_tx, started_rx) = mpsc::channel::<()>();
-    let queue_depth = 2;
+    let queue_depth = 1;
     let worker = EmbeddingWorker::spawn(
         "embed-test-queuefull",
         queue_depth,
@@ -248,18 +248,21 @@ fn queue_full_returns_queuefull_error() {
         });
         started_rx.recv().expect("in-flight request started");
 
-        let mut saw_queue_full = false;
-        for _ in 0..(queue_depth + 1) {
-            match worker.embed_tokens(vec![vec![3]], EmbedOptions::default()) {
-                Err(EmbeddingError::QueueFull) => {
-                    saw_queue_full = true;
-                    break;
-                }
-                Err(EmbeddingError::Timeout) => continue,
-                other => panic!("unexpected result while filling the queue: {other:?}"),
-            }
-        }
-        assert!(saw_queue_full, "a full bounded queue must reject admission");
+        let second = worker.embed_tokens(vec![vec![3]], EmbedOptions::default());
+        assert!(
+            matches!(second, Err(EmbeddingError::Timeout)),
+            "the second request is retained in the one-slot queue: {second:?}"
+        );
+        let rejected_at = std::time::Instant::now();
+        let third = worker.embed_tokens(vec![vec![3]], EmbedOptions::default());
+        assert!(
+            matches!(third, Err(EmbeddingError::QueueFull)),
+            "the third request must be rejected while one is active and one queued: {third:?}"
+        );
+        assert!(
+            rejected_at.elapsed() < Duration::from_millis(50),
+            "queue-full admission must not wait for the request timeout"
+        );
         drop(gate_tx);
     });
 }

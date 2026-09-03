@@ -48,34 +48,39 @@ fn make_test_sequence(id_val: u64) -> (SequenceInfo, mpsc::Receiver<GenerateEven
     let decode_state = StreamingDecodeState::new(&tokenizer, &prompt_tokens);
 
     let seq = SequenceInfo {
-        seq_id: SequenceId::from_raw(id_val),
-        state: SequenceState::Queued,
-        prompt_tokens,
-        sampling: SamplingConfig::default(),
-        max_tokens: 100,
-        eos_token_ids: vec![2],
-        priority: crate::server::batch::RequestPriority::Normal,
+        physical: crate::native_runtime::PhysicalSequence {
+            seq_id: SequenceId::from_raw(id_val),
+            state: SequenceState::Queued,
+            prompt_tokens,
+            sampling: SamplingConfig::default(),
+            max_tokens: 100,
+            eos_token_ids: vec![2],
+            priority: crate::server::batch::RequestPriority::Normal,
+            vlm_embeddings: None,
+            images: Vec::new(),
+            audio: Vec::new(),
+            generated_tokens: Vec::new(),
+            prefill_offset: 0,
+            prefill_start_offset: 0,
+            already_cached_tokens: 0,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            created_at: Instant::now(),
+            prefill_start: None,
+            first_token_time: None,
+            token_history: Vec::new(),
+            sampler_state: None,
+            merged_eos: Vec::new(),
+            decoder: None,
+            native: None,
+        },
         logprobs_config: Default::default(),
-        vlm_embeddings: None,
-        images: Vec::new(),
-        audio: Vec::new(),
-        generated_tokens: Vec::new(),
         generated_text: String::new(),
         decode_state,
         stop_matcher: StopMatcher::default(),
-        prefill_offset: 0,
-        prefill_start_offset: 0,
-        already_cached_tokens: 0,
         response_tx: tx,
-        cancelled: Arc::new(AtomicBool::new(false)),
-        created_at: Instant::now(),
-        prefill_start: None,
-        first_token_time: None,
-        token_history: Vec::new(),
-        sampler_state: None,
-        merged_eos: Vec::new(),
         thinking: crate::server::thinking_budget::ThinkingState::disabled(),
         structured: None,
+        server_native_projection: None,
     };
 
     (seq, rx)
@@ -237,34 +242,39 @@ fn make_test_sequence_with_priority(
     let decode_state = StreamingDecodeState::new(&tokenizer, &prompt_tokens);
 
     let seq = SequenceInfo {
-        seq_id: SequenceId::from_raw(id_val),
-        state: SequenceState::Queued,
-        prompt_tokens,
-        sampling: SamplingConfig::default(),
-        max_tokens: 100,
-        eos_token_ids: vec![2],
-        priority,
+        physical: crate::native_runtime::PhysicalSequence {
+            seq_id: SequenceId::from_raw(id_val),
+            state: SequenceState::Queued,
+            prompt_tokens,
+            sampling: SamplingConfig::default(),
+            max_tokens: 100,
+            eos_token_ids: vec![2],
+            priority,
+            vlm_embeddings: None,
+            images: Vec::new(),
+            audio: Vec::new(),
+            generated_tokens: Vec::new(),
+            prefill_offset: 0,
+            prefill_start_offset: 0,
+            already_cached_tokens: 0,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            created_at: Instant::now(),
+            prefill_start: None,
+            first_token_time: None,
+            token_history: Vec::new(),
+            sampler_state: None,
+            merged_eos: Vec::new(),
+            decoder: None,
+            native: None,
+        },
         logprobs_config: Default::default(),
-        vlm_embeddings: None,
-        images: Vec::new(),
-        audio: Vec::new(),
-        generated_tokens: Vec::new(),
         generated_text: String::new(),
         decode_state,
         stop_matcher: StopMatcher::default(),
-        prefill_offset: 0,
-        prefill_start_offset: 0,
-        already_cached_tokens: 0,
         response_tx: tx,
-        cancelled: Arc::new(AtomicBool::new(false)),
-        created_at: Instant::now(),
-        prefill_start: None,
-        first_token_time: None,
-        token_history: Vec::new(),
-        sampler_state: None,
-        merged_eos: Vec::new(),
         thinking: crate::server::thinking_budget::ThinkingState::disabled(),
         structured: None,
+        server_native_projection: None,
     };
 
     (seq, rx)
@@ -1662,7 +1672,7 @@ fn lookahead_engages_when_batch_stable_and_queue_empty() {
     // Steady state: no queued admission, no chunked prefill, no preemption.
     assert!(lookahead_pipeline_safe(
         /* queue_empty */ true, /* chunked_in_progress */ false,
-        /* preempting */ false,
+        /* preempting */ false, /* native_sequence_present */ false,
     ));
 }
 
@@ -1672,14 +1682,14 @@ fn lookahead_invalidated_by_admission_mid_lookahead() {
     // prebuilt step for the old id set must be discarded and the tick run
     // synchronously.
     assert!(!lookahead_pipeline_safe(
-        /* queue_empty */ false, false, false,
+        /* queue_empty */ false, false, false, false,
     ));
 }
 
 #[test]
 fn lookahead_invalidated_by_chunked_prefill_interleave() {
     assert!(!lookahead_pipeline_safe(
-        /* queue_empty */ true, /* chunked_in_progress */ true, false,
+        /* queue_empty */ true, /* chunked_in_progress */ true, false, false,
     ));
 }
 
@@ -1687,7 +1697,15 @@ fn lookahead_invalidated_by_chunked_prefill_interleave() {
 fn lookahead_invalidated_by_preemption() {
     // A pending higher-priority preemption evicts a running sequence next tick.
     assert!(!lookahead_pipeline_safe(
-        /* queue_empty */ true, false, /* preempting */ true,
+        /* queue_empty */ true, false, /* preempting */ true, false,
+    ));
+}
+
+#[test]
+fn lookahead_is_disabled_for_native_client_directives() {
+    assert!(!lookahead_pipeline_safe(
+        /* queue_empty */ true, /* chunked_in_progress */ false,
+        /* preempting */ false, /* native_sequence_present */ true,
     ));
 }
 
@@ -1979,4 +1997,18 @@ fn boundary_capture_applies_respects_adopted_prefix() {
     // A boundary at or past the prompt length would leave no suffix.
     assert!(!boundary_capture_applies(60, 0, 60));
     assert!(!boundary_capture_applies(61, 0, 60));
+}
+
+#[test]
+fn server_native_prestart_drop_releases_the_started_waiter() {
+    let (tx, rx) = mpsc::sync_channel(1);
+    drop(super::ServerStartedHandshake::new(tx));
+    let error = rx
+        .recv_timeout(std::time::Duration::from_millis(50))
+        .expect("pre-start drop answers the waiter")
+        .expect_err("pre-start drop is a rejected admission");
+    assert_eq!(
+        error.kind(),
+        crate::native_runtime::NativeRuntimeErrorKind::InvalidRequest
+    );
 }

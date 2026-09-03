@@ -206,6 +206,7 @@ pub(crate) fn spawn_model_worker_with_batch_config(
     batch_metrics: Arc<BatchMetrics>,
     batch_observability: Arc<BatchObservability>,
     single_stream_queue_admission: Arc<AtomicBool>,
+    native_worker_epoch: Option<u64>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         // Re-impose fail-fast on this core generation thread under release
@@ -600,6 +601,17 @@ pub(crate) fn spawn_model_worker_with_batch_config(
                 );
             }
 
+            let native_tokenizer = native_worker_epoch.and_then(|_| {
+                match crate::native_runtime::bind_server_tokenizer(&model_path) {
+                    Ok(tokenizer) => Some(tokenizer),
+                    Err(error) => {
+                        tracing::warn!(
+                            "server requests will use the legacy projection because the native decoder could not be bound: {error}"
+                        );
+                        None
+                    }
+                }
+            });
             let mut scheduler = super::super::batch::BatchScheduler::with_config(
                 model,
                 tokenizer,
@@ -648,6 +660,9 @@ pub(crate) fn spawn_model_worker_with_batch_config(
                     .file_name()
                     .map(|name| name.to_string_lossy().into_owned()),
             );
+            if let (Some(tokenizer), Some(worker_epoch)) = (native_tokenizer, native_worker_epoch) {
+                scheduler = scheduler.with_native_runtime(tokenizer, worker_epoch);
+            }
 
             // #126 B3b2a: a non-hybrid `--node-role` runs the live disaggregated
             // serving role rather than the standard single-node loop. The role loop

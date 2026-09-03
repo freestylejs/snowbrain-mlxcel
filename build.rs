@@ -24,6 +24,14 @@ use std::{
 mod native_identity;
 
 fn main() {
+    // The outer identity is the complete Git candidate tree, including newly
+    // added root entries. Cargo's package-root directory watch is the small,
+    // fail-closed way to notice those additions and deletions without a
+    // custom watcher. It intentionally makes generated target/model/cache
+    // changes eligible to rerun this producer; those paths remain excluded
+    // from the candidate digest, and the extra change-detection cost is the
+    // price of keeping the identity record current.
+    println!("cargo:rerun-if-changed=.");
     println!("cargo:rerun-if-env-changed=IREE_DIST");
     println!("cargo:rerun-if-env-changed=IREE_CUDA_HOME");
     println!("cargo:rerun-if-env-changed=IREE_MACOS_HOME");

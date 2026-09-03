@@ -240,6 +240,7 @@ fn single_stream_queue_reservation_releases_on_dequeue_before_processing() {
     assert_eq!(metrics.queue_depth(), 1);
     let request = request_rx.recv().unwrap();
     match request {
+        ModelRequest::Native(_) => panic!("unexpected native command"),
         ModelRequest::Generate {
             queue_reservation, ..
         } => {
@@ -256,7 +257,10 @@ fn pre_reserved_single_stream_enqueue_does_not_double_reserve() {
     let metrics = Arc::new(BatchMetrics::new());
     let (request_tx, request_rx) = mpsc::channel::<ModelRequest>();
     let provider = ModelProvider {
-        request_tx,
+        native_frontend:
+            crate::server::native_frontend::MlxcelServerFrontend::from_legacy_operation_channel(
+                request_tx,
+            ),
         model_id: "test-model".to_string(),
         created_at: 0,
         loaded: Arc::new(AtomicBool::new(true)),
@@ -290,6 +294,7 @@ fn pre_reserved_single_stream_enqueue_does_not_double_reserve() {
     assert_eq!(metrics.queue_depth(), 1);
     let request = request_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     match request {
+        ModelRequest::Native(_) => panic!("unexpected native command"),
         ModelRequest::Generate {
             queue_reservation, ..
         } => drop(queue_reservation),
@@ -302,7 +307,10 @@ fn pre_reserved_single_stream_enqueue_does_not_double_reserve() {
 #[test]
 fn scheduler_paths_do_not_create_single_stream_reservations() {
     let provider = ModelProvider {
-        request_tx: mpsc::channel::<ModelRequest>().0,
+        native_frontend:
+            crate::server::native_frontend::MlxcelServerFrontend::from_legacy_operation_channel(
+                mpsc::channel::<ModelRequest>().0,
+            ),
         model_id: "test-model".to_string(),
         created_at: 0,
         loaded: Arc::new(AtomicBool::new(true)),

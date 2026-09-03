@@ -767,6 +767,13 @@ pub(crate) struct NativeReservationGuard {
 }
 
 impl NativeReservationGuard {
+    pub(crate) fn new(reservation_id: u128, release: Arc<dyn NativeReservationRelease>) -> Self {
+        Self {
+            reservation_id,
+            release: Some(release),
+        }
+    }
+
     /// Disarm only after `sink.started(...)` succeeds. Before that handshake,
     /// every error path drops this guard and releases the reservation.
     pub(crate) fn commit_started(mut self) {
@@ -793,10 +800,7 @@ impl NativeGenerateAdmission {
             reservation_id,
             driver,
             request: request.0,
-            guard: NativeReservationGuard {
-                reservation_id,
-                release: Some(release),
-            },
+            guard: NativeReservationGuard::new(reservation_id, release),
         }
     }
 
@@ -843,10 +847,7 @@ impl NativeEmbedAdmission {
         Self {
             reservation_id,
             request: request.0,
-            guard: NativeReservationGuard {
-                reservation_id,
-                release: Some(release),
-            },
+            guard: NativeReservationGuard::new(reservation_id, release),
         }
     }
 

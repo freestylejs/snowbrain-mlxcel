@@ -1249,12 +1249,17 @@ pub struct NativeModelReport {
 /// exact declared artifacts behind a validated worker profile. Fields and
 /// construction stay private to this module so downstream engine code cannot
 /// pair an arbitrary tokenizer with a stronger streaming guarantee.
+#[derive(Clone)]
 pub(crate) struct NativeBoundTokenizer {
     tokenizer: Arc<crate::tokenizer::MlxcelTokenizer>,
     guarantee: IncrementalDecodeGuarantee,
 }
 
 impl NativeBoundTokenizer {
+    pub(crate) const fn guarantee(&self) -> IncrementalDecodeGuarantee {
+        self.guarantee
+    }
+
     pub(crate) fn into_parts(
         self,
     ) -> (
@@ -1262,6 +1267,67 @@ impl NativeBoundTokenizer {
         IncrementalDecodeGuarantee,
     ) {
         (self.tokenizer, self.guarantee)
+    }
+}
+
+/// Bind the existing server worker's tokenizer to the same audited decoder
+/// guarantee used by immutable-package workers. This is crate-private because
+/// the server model directory is not an immutable public package capability.
+pub(crate) fn bind_server_tokenizer(
+    root: &std::path::Path,
+) -> Result<NativeBoundTokenizer, NativeRuntimeError> {
+    let guarantee = server_tokenizer_guarantee(root)?;
+    let tokenizer = crate::tokenizer::load_tokenizer(root).map_err(|error| {
+        NativeRuntimeError::new(
+            NativeRuntimeErrorKind::Tokenizer,
+            format!("server tokenizer load failed: {error}"),
+        )
+    })?;
+    Ok(NativeBoundTokenizer {
+        tokenizer: Arc::new(tokenizer),
+        guarantee,
+    })
+}
+
+pub(crate) fn server_tokenizer_guarantee(
+    root: &std::path::Path,
+) -> Result<IncrementalDecodeGuarantee, NativeRuntimeError> {
+    let tokenizer = crate::tokenizer::load_tokenizer(root).map_err(|error| {
+        NativeRuntimeError::new(
+            NativeRuntimeErrorKind::Tokenizer,
+            format!("server tokenizer inspection failed: {error}"),
+        )
+    })?;
+    match tokenizer {
+        crate::tokenizer::MlxcelTokenizer::Tiktoken(_) => {
+            Ok(IncrementalDecodeGuarantee::RawTokenBytes)
+        }
+        crate::tokenizer::MlxcelTokenizer::HuggingFace(_) => {
+            let bytes = std::fs::read(root.join("tokenizer.json")).map_err(|error| {
+                NativeRuntimeError::new(
+                    NativeRuntimeErrorKind::InvalidPackage,
+                    format!("server tokenizer.json could not be inspected: {error}"),
+                )
+            })?;
+            let value = serde_json::from_slice(&bytes).map_err(|error| {
+                NativeRuntimeError::new(
+                    NativeRuntimeErrorKind::InvalidPackage,
+                    format!("server tokenizer.json is invalid: {error}"),
+                )
+            })?;
+            if is_proven_replace_byte_fallback_fuse(&value) {
+                Ok(IncrementalDecodeGuarantee::ProvenBoundedLookbehind { tokens: 4 })
+            } else {
+                Err(NativeRuntimeError::new(
+                    NativeRuntimeErrorKind::UnsupportedGuarantee,
+                    "server tokenizer has no audited incremental decode guarantee",
+                ))
+            }
+        }
+        crate::tokenizer::MlxcelTokenizer::SentencePiece(_) => Err(NativeRuntimeError::new(
+            NativeRuntimeErrorKind::UnsupportedGuarantee,
+            "server sentencepiece tokenizer remains terminal-only",
+        )),
     }
 }
 
@@ -1439,7 +1505,6 @@ pub(crate) fn inspect_package(
     let mut embedding_input_ceiling = None;
     let mut modalities = NativeModalitySet::default();
     let mut model_capabilities = NativeModelCapabilities::default();
-    let managed_capabilities = NativeManagedCapabilities::default();
     let mut warnings = Vec::new();
     let mut speculative_modes = Vec::new();
 
@@ -1595,6 +1660,14 @@ pub(crate) fn inspect_package(
             "the immutable package has no locally loadable supported tokenizer",
         )?;
     }
+    let managed_capabilities = NativeManagedCapabilities {
+        generation: operation_class == MlxNativeOperationClass::Autoregressive
+            && model_capabilities.generation,
+        embedding: operation_class == MlxNativeOperationClass::Embedding
+            && model_capabilities.embedding,
+        // Prepared media remains deferred to the later media-driver task.
+        prepared_media: false,
+    };
     let mut report = NativeModelReport {
         package_identity: package.identity(),
         report_identity: [0; 32],
@@ -2273,17 +2346,19 @@ fn model_report_identity(report: &NativeModelReport) -> [u8; 32] {
 mod tests {
     use std::io::{Cursor, Write};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use base64::Engine;
     use tempfile::TempDir;
 
     use super::*;
     use crate::native_runtime::{
-        NativeBatchPolicy, NativeCachePolicy, NativeCacheTopology, NativeContextPolicy,
-        NativeDeviceClass, NativeDevicePolicy, NativeDrafterTopology, NativeIncrementalDecoder,
-        NativeModelOwnedStateMode, NativeOffloadPolicy, NativeOperationDriver,
-        NativePreparedMultimodalClass, NativeSchedulerTopology, NativeSequenceStateTopology,
-        NativeTokenizerDecoder, NativeWorkerConfig, NativeWorkerPolicy,
+        NativeBatchPolicy, NativeCachePolicy, NativeCacheTopology, NativeConstraintTransition,
+        NativeContextPolicy, NativeContinuationDirective, NativeDeviceClass, NativeDevicePolicy,
+        NativeDrafterTopology, NativeIncrementalDecoder, NativeModelOwnedStateMode,
+        NativeOffloadPolicy, NativeOperationDriver, NativePreparedMultimodalClass,
+        NativeSchedulerTopology, NativeSequenceStateTopology, NativeTokenizerDecoder,
+        NativeWorkerConfig, NativeWorkerPolicy,
     };
 
     fn digest(bytes: &[u8]) -> [u8; 32] {
@@ -3549,28 +3624,39 @@ mod tests {
     #[test]
     fn incomplete_or_deferred_reports_never_claim_executable_capability() {
         let tokenizer = basic_tokenizer_json();
-        for config in [
+        for (index, config) in [
             br#"{"model_type":"llama","max_position_embeddings":64}"#.as_slice(),
             br#"{"model_type":"bert","architectures":["BertModel"],"max_position_embeddings":64}"#
                 .as_slice(),
             br#"{"model_type":"whisper","max_position_embeddings":64}"#.as_slice(),
             br#"{"istftnet":{},"max_position_embeddings":64}"#.as_slice(),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let root = TempDir::new().unwrap();
-            let package = acquire_from_directory(
-                root.path(),
-                vec![
-                    write_component(root.path(), "config.json", config),
-                    write_component(root.path(), "tokenizer.json", &tokenizer),
-                ],
-                NativePackageLimits::default(),
-            )
-            .unwrap();
+            let mut components = vec![
+                write_component(root.path(), "config.json", config),
+                write_component(root.path(), "tokenizer.json", &tokenizer),
+            ];
+            if index == 1 {
+                components.push(write_minimal_weights(
+                    root.path(),
+                    "bert.embeddings.word_embeddings.weight",
+                ));
+            }
+            let package =
+                acquire_from_directory(root.path(), components, NativePackageLimits::default())
+                    .unwrap();
             let report = inspect_package(&package).unwrap();
             assert!(!report.architecture_supported());
             assert_eq!(
                 report.model_capabilities(),
                 NativeModelCapabilities::default()
+            );
+            assert_eq!(
+                report.managed_capabilities(),
+                NativeManagedCapabilities::default()
             );
             assert_eq!(report.modalities(), NativeModalitySet::default());
             assert!(!report.warnings().is_empty());
@@ -3595,6 +3681,10 @@ mod tests {
         assert_eq!(
             report.model_capabilities(),
             NativeModelCapabilities::default()
+        );
+        assert_eq!(
+            report.managed_capabilities(),
+            NativeManagedCapabilities::default()
         );
         assert!(
             report
@@ -3646,6 +3736,24 @@ mod tests {
                 ..NativeModelCapabilities::default()
             }
         );
+        assert_eq!(
+            report.managed_capabilities(),
+            NativeManagedCapabilities {
+                embedding: true,
+                ..NativeManagedCapabilities::default()
+            }
+        );
+        let mut policy = generation_policy();
+        policy.operation_driver = NativeOperationDriver::Embedding;
+        policy.context.max_context_tokens = 24;
+        policy.context.max_position = 24;
+        policy.max_prompt_tokens = 24;
+        assert_eq!(
+            NativeWorkerConfig::try_from_report(&report, policy)
+                .expect("a qualified inspected BERT package must mint a managed worker config")
+                .operation_driver(),
+            NativeOperationDriver::Embedding
+        );
 
         let unsupported = acquire(br#"{"pooling_mode_weightedmean_tokens":true}"#);
         let report = inspect_package(&unsupported).unwrap();
@@ -3653,6 +3761,10 @@ mod tests {
         assert_eq!(
             report.model_capabilities(),
             NativeModelCapabilities::default()
+        );
+        assert_eq!(
+            report.managed_capabilities(),
+            NativeManagedCapabilities::default()
         );
         assert!(
             report
@@ -3927,8 +4039,13 @@ mod tests {
             })
             .unwrap();
         let ids = [8_u32, 465];
+        let first = tokenizer.decode(&ids[..1], false).unwrap().into_bytes();
         let expected = tokenizer.decode(&ids, false).unwrap().into_bytes();
         assert!(std::str::from_utf8(&expected).is_ok());
+        assert!(
+            expected.starts_with(&first) && first.len() < expected.len(),
+            "the pinned two-token SentencePiece fixture must retain a real proper-prefix choice"
+        );
         let mut decoder =
             NativeTokenizerDecoder::terminal_only(Arc::clone(&tokenizer), &[]).unwrap();
         assert!(
@@ -3946,6 +4063,37 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(decoder.flush().unwrap().stable_bytes(), expected);
+
+        let directives = [
+            NativeContinuationDirective::ConsumePrefixAndContinue {
+                consumed_units: 1,
+                constraint: NativeConstraintTransition::Unchanged,
+            },
+            NativeContinuationDirective::Stop { consumed_units: 1 },
+            NativeContinuationDirective::Fail {
+                consumed_units: 1,
+                error: NativeRuntimeError::new(
+                    NativeRuntimeErrorKind::SinkRejected,
+                    "proper-prefix semantic failure",
+                ),
+            },
+        ];
+        for _directive in directives {
+            let sink_calls = AtomicUsize::new(0);
+            let admission = NativeWorkerConfig::try_from_report(&report, generation_policy());
+            if admission.is_ok() {
+                sink_calls.fetch_add(1, Ordering::Relaxed);
+            }
+            assert_eq!(
+                admission.unwrap_err().kind(),
+                NativeRuntimeErrorKind::UnsupportedGuarantee
+            );
+            assert_eq!(
+                sink_calls.load(Ordering::Relaxed),
+                0,
+                "TerminalOnly must reject before every Continue/Stop/Fail sink shape"
+            );
+        }
         let mut oov = NativeTokenizerDecoder::terminal_only(tokenizer, &[]).unwrap();
         assert_eq!(
             oov.push(i32::MAX).unwrap_err().kind(),
@@ -4215,8 +4363,6 @@ mod tests {
             Ok("1"),
             "the pinned-checkpoint qualification profile must be explicitly enabled"
         );
-        const INVENTORY_ROOT: &str =
-            r"D:\Projects\freestylejs\snowbrain\.qualification-artifacts\mlx";
         const TARGET_REVISION: &str = "73bcf09092aa277861d5a191b989b666f7f32e8f";
         const TARGET_CONTENT_SET: &str =
             "0e420cec93ed42eda64dfb86ce29acd4ab1ab5ff6030d468f6deae9c5f0ea5dc";
@@ -4227,7 +4373,9 @@ mod tests {
         const MINILM_CONTENT_SET: &str =
             "345fbcf14b4d6423e2d46c6b37ff73a0a052f5df8107bd302a192ce5f77b5ec9";
 
-        let inventory_root = Path::new(INVENTORY_ROOT);
+        let inventory_root_text = std::env::var("MLXCEL_PINNED_INVENTORY_ROOT")
+            .expect("MLXCEL_PINNED_INVENTORY_ROOT must name the prepared inventory directory");
+        let inventory_root = PathBuf::from(&inventory_root_text);
         let inventory_path = inventory_root.join("resource-inventory.json");
         let inventory_bytes = std::fs::read(&inventory_path)
             .expect("the pinned qualification inventory is missing or unreadable");
@@ -4238,7 +4386,10 @@ mod tests {
             inventory["mlxcelRevision"].as_str(),
             Some("b2be0d0ab36b17ba35e9ae9d96fe7f19a195d5df")
         );
-        assert_eq!(inventory["destinationRoot"].as_str(), Some(INVENTORY_ROOT));
+        assert_eq!(
+            inventory["destinationRoot"].as_str(),
+            Some(inventory_root_text.as_str())
+        );
         assert_eq!(
             inventory["resources"]
                 .as_array()
@@ -4249,7 +4400,7 @@ mod tests {
         );
 
         let target = acquire_inventory_resource(
-            inventory_root,
+            &inventory_root,
             &inventory,
             "gemma-4-12b-it-4bit",
             "target",
@@ -4285,7 +4436,10 @@ mod tests {
         );
         assert_eq!(
             target_report.managed_capabilities(),
-            NativeManagedCapabilities::default()
+            NativeManagedCapabilities {
+                generation: true,
+                ..NativeManagedCapabilities::default()
+            }
         );
 
         let target_config: serde_json::Value =
@@ -4338,7 +4492,7 @@ mod tests {
         drop(target);
 
         let assistant = acquire_inventory_resource(
-            inventory_root,
+            &inventory_root,
             &inventory,
             "gemma-4-12b-it-assistant-4bit",
             "speculative_drafter",
@@ -4400,7 +4554,7 @@ mod tests {
         drop(assistant);
 
         let minilm = acquire_inventory_resource(
-            inventory_root,
+            &inventory_root,
             &inventory,
             "all-minilm-l6-v2",
             "embedding",
@@ -4434,7 +4588,10 @@ mod tests {
         );
         assert_eq!(
             minilm_report.managed_capabilities(),
-            NativeManagedCapabilities::default()
+            NativeManagedCapabilities {
+                embedding: true,
+                ..NativeManagedCapabilities::default()
+            }
         );
         let minilm_config: serde_json::Value =
             serde_json::from_slice(&minilm.read_component("config.json").unwrap()).unwrap();
@@ -4520,7 +4677,7 @@ mod tests {
         assert!(NativePackageComponent::new(label.as_str(), 0, digest(b"")).is_err());
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn non_utf8_tree_entry_is_rejected_without_lossy_aliasing() {
         use std::ffi::OsString;
@@ -4537,5 +4694,28 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn non_utf8_source_root_is_rejected_as_a_typed_error_without_lossy_aliasing() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = TempDir::new().unwrap();
+        let invalid_root = root.path().join(OsString::from_vec(vec![0xff]));
+        let declaration = write_component(root.path(), "config.json", b"one");
+        let error = match acquire_from_directory(
+            &invalid_root,
+            vec![declaration],
+            NativePackageLimits::default(),
+        ) {
+            Ok(_) => panic!("an invalid macOS source root was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), NativeRuntimeErrorKind::InvalidPackage);
+        let lossy_root = invalid_root.to_string_lossy().into_owned();
+        assert!(!error.to_string().contains(&lossy_root));
+        assert!(!format!("{error:?}").contains(&lossy_root));
     }
 }

@@ -167,6 +167,28 @@ impl EmbeddingEngine {
         self.batch_size
     }
 
+    /// Resolve the exact effective tokenizer length used by `embed_texts`.
+    /// Managed admission calls this on the embedding worker before reserving.
+    pub(crate) fn resolved_text_tokens(&self, text: &str) -> Result<usize, EmbeddingEngineError> {
+        if text.is_empty() {
+            return Err(EmbeddingEngineError::InvalidInput(
+                "embedding text is empty".to_string(),
+            ));
+        }
+        let formatted = self.loaded.model.format_text(text, None);
+        let row = encode_row(
+            &self.loaded.tokenizer,
+            &formatted,
+            EncodeOptions {
+                add_special_tokens: true,
+                max_length: self.max_length(),
+                with_token_type_ids: self.loaded.model.needs_token_type_ids(),
+            },
+        )
+        .map_err(|error| EmbeddingEngineError::Internal(error.to_string()))?;
+        Ok(row.ids.len())
+    }
+
     /// Fold the per-request options and the checkpoint's own `normalize` flag
     /// into what post-processing needs.
     ///

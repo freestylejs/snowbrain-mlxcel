@@ -1125,6 +1125,14 @@ fn build_path_tokens(
     for (name, path) in active_dependencies {
         candidates.push((format!("<native-{name}>"), path.clone()));
     }
+    #[cfg(target_os = "macos")]
+    {
+        candidates.push(("<apple-sdk>".to_owned(), apple_sdk_path()));
+        candidates.push((
+            "<apple-clang-toolchain>".to_owned(),
+            apple_clang_toolchain_path(),
+        ));
+    }
     for (cache_name, token) in [
         ("CMAKE_OSX_SYSROOT", "<apple-sdk>"),
         ("CMAKE_C_COMPILER", "<cmake-c-bin>"),
@@ -1188,11 +1196,14 @@ fn split_command_line(text: &str) -> Vec<String> {
     let mut current = String::new();
     let mut quoted = false;
     let mut escape = false;
-    for character in text.chars() {
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
         if escape {
             current.push(character);
             escape = false;
         } else if character == '\\' && quoted {
+            escape = true;
+        } else if character == '\\' && characters.peek() == Some(&'"') {
             escape = true;
         } else if character == '"' {
             quoted = !quoted;
@@ -1284,7 +1295,10 @@ fn resolve_depfile_path(
 ) -> Option<PathBuf> {
     let value = PathBuf::from(value);
     if value.is_absolute() {
-        return value.is_file().then_some(value);
+        return value
+            .is_file()
+            .then(|| fs::canonicalize(&value).ok())
+            .flatten();
     }
     [base, manifest_dir, out_dir]
         .into_iter()
@@ -1364,8 +1378,10 @@ fn write_native_core_build_record(
     let mut cmake_definitions = selected_cmake_inputs(&cache)
         .into_iter()
         .map(|mut input| {
-            input.value = native_identity::canonicalize_argument(&input.value, &path_tokens)
-                .unwrap_or_else(|err| panic!("mlxcel-core: CMake input {}: {err}", input.name));
+            if input.value != "<empty>" {
+                input.value = native_identity::canonicalize_argument(&input.value, &path_tokens)
+                    .unwrap_or_else(|err| panic!("mlxcel-core: CMake input {}: {err}", input.name));
+            }
             input
         })
         .collect::<Vec<_>>();
@@ -1373,7 +1389,7 @@ fn write_native_core_build_record(
         cmake_definitions.push(input.clone());
     }
     cmake_definitions.extend(read_cmake_target_graph(mlx_dst, &path_tokens));
-    cmake_definitions.extend(selected_native_tool_inputs(&cache));
+    cmake_definitions.extend(selected_native_tool_inputs(&cache, &path_tokens));
     cmake_definitions.sort_by(|left, right| left.name.cmp(&right.name));
     if cmake_definitions
         .windows(2)
@@ -1850,6 +1866,12 @@ fn source_from_manifest_path(manifest_dir: &Path, path: &Path) -> CapturedSource
 }
 
 fn source_from_exact_path(path: &Path, label: &str) -> CapturedSource {
+    let path = fs::canonicalize(path).unwrap_or_else(|err| {
+        panic!(
+            "mlxcel-core: cannot resolve required build input {}: {err}",
+            path.display()
+        )
+    });
     if !path.is_file() {
         panic!(
             "mlxcel-core: required build input is missing: {}",
@@ -1858,7 +1880,7 @@ fn source_from_exact_path(path: &Path, label: &str) -> CapturedSource {
     }
     CapturedSource {
         label: label.to_owned(),
-        sha256: file_digest(path),
+        sha256: file_digest(&path),
     }
 }
 
@@ -1937,10 +1959,12 @@ fn parse_cmake_cache(path: &Path) -> Vec<CapturedNamedInput> {
             let (name, _) = key_and_type.split_once(':')?;
             Some(CapturedNamedInput {
                 name: name.to_owned(),
-                value: if value.is_empty() {
-                    "<empty>".to_owned()
-                } else {
-                    value.to_owned()
+                value: match value {
+                    "" => "<empty>".to_owned(),
+                    "<empty>" => {
+                        panic!("mlxcel-core: CMake cache value uses reserved empty marker: {name}")
+                    }
+                    _ => value.to_owned(),
                 },
             })
         })
@@ -2089,7 +2113,11 @@ fn tool_identity(path: &Path) -> String {
         else {
             continue;
         };
-        if output.status.success() || matches!(lower.as_str(), "cl.exe" | "link.exe" | "lib.exe") {
+        let archive_tool = lower == "ar" || lower == "ranlib" || lower.ends_with("-ar");
+        let archive_help_probe = arguments.len() == 1 && arguments[0] == "-h";
+        let accepts_nonzero_status = matches!(lower.as_str(), "cl.exe" | "link.exe" | "lib.exe")
+            || (archive_tool && archive_help_probe);
+        if output.status.success() || accepts_nonzero_status {
             observed = Some(version);
             break;
         }
@@ -2108,7 +2136,10 @@ fn tool_identity(path: &Path) -> String {
     )
 }
 
-fn selected_native_tool_inputs(cache: &[CapturedNamedInput]) -> Vec<CapturedNamedInput> {
+fn selected_native_tool_inputs(
+    cache: &[CapturedNamedInput],
+    roots: &[native_identity::PathToken],
+) -> Vec<CapturedNamedInput> {
     let strict = env::var("MLXCEL_BUILD_IDENTITY_STRICT").as_deref() == Ok("1");
     let mut values = Vec::new();
     for (name, required) in [
@@ -2130,6 +2161,10 @@ fn selected_native_tool_inputs(cache: &[CapturedNamedInput]) -> Vec<CapturedName
                 let executable = parts.next().unwrap();
                 let mut identity = tool_identity(Path::new(executable));
                 for argument in parts {
+                    let argument = native_identity::canonicalize_argument(argument, roots)
+                        .unwrap_or_else(|err| {
+                            panic!("mlxcel-core: {name} launcher argument: {err}")
+                        });
                     if argument.is_empty()
                         || argument.len() > 64 * 1024
                         || argument
@@ -2139,7 +2174,7 @@ fn selected_native_tool_inputs(cache: &[CapturedNamedInput]) -> Vec<CapturedName
                         panic!("mlxcel-core: invalid {name} launcher argument");
                     }
                     identity.push_str("|arg=");
-                    identity.push_str(argument);
+                    identity.push_str(&argument);
                 }
                 identity
             }
@@ -2374,6 +2409,36 @@ fn apple_sdk_path() -> PathBuf {
     let path = PathBuf::from(value);
     fs::canonicalize(&path)
         .unwrap_or_else(|err| panic!("mlxcel-core: cannot resolve macOS SDK: {err}"))
+}
+
+#[cfg(target_os = "macos")]
+fn apple_clang_toolchain_path() -> PathBuf {
+    let compiler = required_command_text(
+        "xcrun",
+        &["--sdk", "macosx", "--find", "clang"],
+        "xcrun Clang path",
+    );
+    let compiler = fs::canonicalize(&compiler).unwrap_or_else(|err| {
+        panic!("mlxcel-core: cannot resolve xcrun Clang path {compiler}: {err}")
+    });
+    let toolchain = compiler
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| {
+            panic!(
+                "mlxcel-core: xcrun Clang path has no toolchain root: {}",
+                compiler.display()
+            )
+        });
+    if !toolchain.is_dir() {
+        panic!(
+            "mlxcel-core: xcrun Clang toolchain root is not a directory: {}",
+            toolchain.display()
+        );
+    }
+    toolchain
 }
 
 fn selected_link_artifacts(

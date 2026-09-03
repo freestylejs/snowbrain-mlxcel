@@ -33,6 +33,7 @@ use crate::server::state::BatchMetrics;
 
 /// Request to the model thread
 pub(crate) enum ModelRequest {
+    Native(crate::native_runtime::engine::NativeSchedulerCommand),
     Generate {
         prompt: String,
         /// Pre-tokenized prompt ids, produced on the request-dispatch thread via
@@ -254,7 +255,7 @@ pub mod model_worker;
 
 /// Thread-safe model provider using channels
 pub struct ModelProvider {
-    request_tx: mpsc::Sender<ModelRequest>,
+    native_frontend: crate::server::native_frontend::MlxcelServerFrontend,
     model_id: String,
     created_at: i64,
     loaded: Arc<AtomicBool>,
@@ -315,8 +316,9 @@ impl ModelProvider {
 
     /// Create and start a new model provider with full server config.
     ///
-    /// When `config.no_batch` is true, the legacy sequential worker is spawned
-    /// instead of the batch scheduler, regardless of `max_batch_size`.
+    /// When `config.no_batch` is true, the managed scheduler is fixed to one
+    /// physical slot. Tensor-parallel batch-1 remains on its dedicated
+    /// distributed operation driver.
     pub fn new_with_server_config(
         model_path: PathBuf,
         adapter_path: Option<PathBuf>,
@@ -336,8 +338,8 @@ impl ModelProvider {
 
     /// Same as [`Self::new_with_server_config`] but also wires the
     /// cross-request prompt-prefix KV cache store.
-    /// The legacy (`config.no_batch`) worker ignores the store because that
-    /// path never calls the batch scheduler that manages the cache.
+    /// The batch-1 compatibility mode keeps the store visible on the provider
+    /// but disables scheduler cache adoption, matching its previous behavior.
     pub fn new_with_server_config_and_prompt_cache(
         model_path: PathBuf,
         adapter_path: Option<PathBuf>,
@@ -412,7 +414,7 @@ impl ModelProvider {
             );
         }
 
-        if config.no_batch {
+        if config.no_batch && config.tensor_parallel.tp_size > 1 {
             let mut provider = Self::new_with_legacy_worker(
                 model_path,
                 adapter_path,
@@ -428,44 +430,62 @@ impl ModelProvider {
             provider.prompt_cache = prompt_cache_store;
             provider.prompt_tokenizer = prompt_tokenizer;
             provider.decode_hang_timeout = decode_hang_timeout;
-            // log a warning if the operator asked for
-            // speculative decoding but selected `--no-batch`. The legacy
-            // sequential worker bypasses the BatchScheduler entirely so
-            // the dispatch is inactive on this path.
+            // Tensor-parallel batch-1 remains on its dedicated distributed
+            // operation driver until it has a managed native request shape.
             if !matches!(
                 speculative_dispatch,
                 crate::server::SpeculativeDispatch::Disabled
             ) {
                 tracing::warn!(
-                    "Speculative decoding requested ({}) but --no-batch \
-                     is enabled; the legacy sequential worker does not \
-                     run the speculative dispatch. Drop --no-batch to \
-                     enable speculative decoding.",
+                    "Speculative decoding requested ({}) but --no-batch with \
+                     tensor parallel uses the dedicated distributed driver; \
+                     speculative dispatch is disabled on that operation.",
                     speculative_dispatch.summary(),
                 );
             }
             Ok(provider)
         } else {
+            let no_batch = config.no_batch;
             let mut provider = Self::new_with_full_config_and_speculative_dispatch_and_lora(
                 model_path,
                 adapter_path,
                 config.lora_adapters.clone(),
-                config.max_batch_size,
+                if no_batch { 1 } else { config.max_batch_size },
                 config.max_queue_depth,
-                config.prefill_chunk_size,
-                config.enable_preemption,
+                if no_batch {
+                    0
+                } else {
+                    config.prefill_chunk_size
+                },
+                !no_batch && config.enable_preemption,
                 config.preemption_policy,
-                config.max_batch_prefill,
+                if no_batch {
+                    1
+                } else {
+                    config.max_batch_prefill
+                },
                 // forward the --max-batch-prefill-tokens cap to the worker (#715).
-                config.max_batch_prefill_tokens,
+                if no_batch {
+                    None
+                } else {
+                    config.max_batch_prefill_tokens
+                },
                 // forward the --prefill-grant-interval fairness dial (#1011).
-                config.prefill_grant_interval,
+                if no_batch {
+                    None
+                } else {
+                    config.prefill_grant_interval
+                },
                 config.decode_storage_backend,
                 config.pipeline_parallel_runtime.clone(),
                 config.vision_cache_size,
                 config.lang_bias_config.clone(),
                 config.reasoning_budget,
-                prompt_cache_store,
+                if no_batch {
+                    None
+                } else {
+                    prompt_cache_store.clone()
+                },
                 config.kv_cache_mode,
                 config.batch_kv_quant,
                 // forward the --max-kv-size cap to the scheduler.
@@ -481,7 +501,11 @@ impl ModelProvider {
                 // stays in `ServerConfig` for the future dedicated router.
                 config.decode_peers.clone(),
                 config.serving_bind,
-                speculative_dispatch,
+                if no_batch {
+                    crate::server::SpeculativeDispatch::Disabled
+                } else {
+                    speculative_dispatch.clone()
+                },
                 // serve-level diffusion knobs (#217 phase 3).
                 config.max_denoising_steps,
                 config.diffusion_sampler.clone(),
@@ -489,6 +513,19 @@ impl ModelProvider {
                 batch_metrics,
                 batch_observability,
             )?;
+            if no_batch {
+                provider.prompt_cache = prompt_cache_store;
+                if !matches!(
+                    speculative_dispatch,
+                    crate::server::SpeculativeDispatch::Disabled
+                ) {
+                    tracing::warn!(
+                        "Speculative decoding requested ({}) but --no-batch fixes the managed \
+                         scheduler to one physical slot; speculative dispatch is disabled.",
+                        speculative_dispatch.summary(),
+                    );
+                }
+            }
             provider.prompt_tokenizer = prompt_tokenizer;
             provider.decode_hang_timeout = decode_hang_timeout;
             Ok(provider)
@@ -527,7 +564,10 @@ impl ModelProvider {
                 );
             })?;
         Ok(Self {
-            request_tx,
+            native_frontend:
+                crate::server::native_frontend::MlxcelServerFrontend::from_legacy_operation_channel(
+                    request_tx,
+                ),
             model_id,
             created_at: chrono::Utc::now().timestamp(),
             loaded: Arc::new(AtomicBool::new(false)),
@@ -590,7 +630,10 @@ impl ModelProvider {
         );
 
         Ok(Self {
-            request_tx,
+            native_frontend:
+                crate::server::native_frontend::MlxcelServerFrontend::from_legacy_operation_channel(
+                    request_tx,
+                ),
             model_id,
             created_at,
             loaded,
@@ -644,7 +687,10 @@ impl ModelProvider {
         );
 
         Ok(Self {
-            request_tx,
+            native_frontend:
+                crate::server::native_frontend::MlxcelServerFrontend::from_legacy_operation_channel(
+                    request_tx,
+                ),
             model_id,
             created_at,
             loaded,
@@ -887,17 +933,11 @@ impl ModelProvider {
             .unwrap_or_else(|| "unknown".to_string());
 
         let created_at = chrono::Utc::now().timestamp();
-        let (request_tx, request_rx) = mpsc::channel::<ModelRequest>();
         let loaded = Arc::new(AtomicBool::new(false));
-        let loaded_clone = loaded.clone();
         let single_stream_queue_admission = Arc::new(AtomicBool::new(
             uses_single_stream_queue_admission(&model_path),
         ));
         let chat_unavailable = Arc::new(AtomicBool::new(false));
-        let chat_unavailable_clone = chat_unavailable.clone();
-        let worker_model_id = model_id.clone();
-        let metrics_clone = batch_metrics.clone();
-        let obs_clone = batch_observability.clone();
 
         let sched_config = model_worker::WorkerSchedulerConfig {
             lora_adapters,
@@ -948,21 +988,23 @@ impl ModelProvider {
             diffusion_threshold,
         };
 
-        let worker_handle = model_worker::spawn_model_worker_with_batch_config(
-            model_path,
-            adapter_path,
-            request_rx,
-            loaded_clone,
-            chat_unavailable_clone,
-            worker_model_id,
-            sched_config,
-            metrics_clone,
-            obs_clone,
-            single_stream_queue_admission.clone(),
-        );
+        let (native_frontend, worker_handle) =
+            crate::native_runtime::engine::spawn_mlxcel_server_managed_engine(
+                crate::native_runtime::engine::MlxcelServerEngineStartRequest {
+                    model_path,
+                    adapter_path,
+                    loaded: loaded.clone(),
+                    chat_unavailable: chat_unavailable.clone(),
+                    worker_model_id: model_id.clone(),
+                    sched_config,
+                    batch_metrics: batch_metrics.clone(),
+                    batch_observability: batch_observability.clone(),
+                    single_stream_queue_admission: single_stream_queue_admission.clone(),
+                },
+            );
 
         Ok(Self {
-            request_tx,
+            native_frontend,
             model_id,
             created_at,
             loaded,
@@ -990,26 +1032,15 @@ impl ModelProvider {
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "unknown".to_string());
-
         let created_at = chrono::Utc::now().timestamp();
-
-        // Create channel for requests
-        let (request_tx, request_rx) = mpsc::channel::<ModelRequest>();
 
         // Shared loaded flag
         let loaded = Arc::new(AtomicBool::new(false));
-        let loaded_clone = loaded.clone();
         let single_stream_queue_admission = Arc::new(AtomicBool::new(
             uses_single_stream_queue_admission(&model_path),
         ));
         let chat_unavailable = Arc::new(AtomicBool::new(false));
-        let chat_unavailable_clone = chat_unavailable.clone();
-
-        // Clone model_id for the worker thread
-        let worker_model_id = model_id.clone();
-        let metrics_clone = batch_metrics.clone();
         let batch_observability = Arc::new(BatchObservability::new());
-        let obs_clone = batch_observability.clone();
 
         let sched_config = model_worker::WorkerSchedulerConfig {
             max_batch_size,
@@ -1050,21 +1081,23 @@ impl ModelProvider {
             diffusion_threshold: 0.9,
         };
 
-        let worker_handle = model_worker::spawn_model_worker_with_batch_config(
-            model_path,
-            adapter_path,
-            request_rx,
-            loaded_clone,
-            chat_unavailable_clone,
-            worker_model_id,
-            sched_config,
-            metrics_clone,
-            obs_clone,
-            single_stream_queue_admission.clone(),
-        );
+        let (native_frontend, worker_handle) =
+            crate::native_runtime::engine::spawn_mlxcel_server_managed_engine(
+                crate::native_runtime::engine::MlxcelServerEngineStartRequest {
+                    model_path,
+                    adapter_path,
+                    loaded: loaded.clone(),
+                    chat_unavailable: chat_unavailable.clone(),
+                    worker_model_id: model_id.clone(),
+                    sched_config,
+                    batch_metrics: batch_metrics.clone(),
+                    batch_observability: batch_observability.clone(),
+                    single_stream_queue_admission: single_stream_queue_admission.clone(),
+                },
+            );
 
         Ok(Self {
-            request_tx,
+            native_frontend,
             model_id,
             created_at,
             loaded,
@@ -1575,19 +1608,21 @@ impl ModelProvider {
         };
 
         if self
-            .request_tx
-            .send(ModelRequest::Generate {
-                prompt,
-                prompt_token_ids,
-                options,
-                images,
-                audio,
-                videos,
-                media,
-                queue_reservation,
-                response_tx,
-                cancelled,
-            })
+            .native_frontend
+            .start_generate(
+                crate::server::native_frontend::MlxcelServerGenerateRequest {
+                    prompt,
+                    prompt_token_ids,
+                    options,
+                    images,
+                    audio,
+                    videos,
+                    media,
+                    queue_reservation,
+                    response_tx,
+                    cancelled,
+                },
+            )
             .is_err()
         {
             return Err(anyhow::Error::new(ChatWorkerGoneError));
@@ -1644,17 +1679,13 @@ impl ModelProvider {
         ctx: crate::server::config::PromptCacheRequestContext,
     ) {
         if self
-            .request_tx
-            .send(ModelRequest::PromptCacheWarmup { tokens, ctx })
+            .native_frontend
+            .prompt_cache_warmup(tokens, ctx)
             .is_err()
         {
             tracing::debug!("prompt-cache warm-up not submitted: worker channel closed");
         }
     }
-}
-
-fn send_shutdown_signal(request_tx: &mpsc::Sender<ModelRequest>) -> bool {
-    request_tx.send(ModelRequest::Shutdown).is_ok()
 }
 
 /// Default timeout applied after the first generated token has been received
@@ -1903,8 +1934,13 @@ where
 
 impl Drop for ModelProvider {
     fn drop(&mut self) {
-        let _ = send_shutdown_signal(&self.request_tx);
+        let _ = self.native_frontend.shutdown();
     }
+}
+
+#[cfg(test)]
+fn send_shutdown_signal(request_tx: &mpsc::Sender<ModelRequest>) -> bool {
+    request_tx.send(ModelRequest::Shutdown).is_ok()
 }
 
 #[cfg(test)]

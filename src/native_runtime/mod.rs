@@ -18,13 +18,22 @@
 //! arrays, cache objects, or `LoadedModel` variants.
 
 mod builder;
+mod constraint;
 mod detokenizer;
+pub(crate) mod engine;
 mod error;
+pub(crate) mod memory;
 mod model_report;
 mod operation_driver;
 mod profile;
 mod request;
+pub(crate) mod sequence;
 mod sink;
+mod speculation;
+
+pub(crate) use model_report::{NativeBoundTokenizer, bind_server_tokenizer};
+pub(crate) use request::NativeReservationRelease;
+pub(crate) use sequence::PhysicalSequence;
 
 pub use builder::{NativeManagedEngine, NativeRuntimeBuilder, NativeWorkerStartRequest};
 pub use detokenizer::{
@@ -73,3 +82,4 @@ pub use sink::{
     NativePhysicalTerminal, NativePrefixFacts, NativeRecoverability, NativeResumeCapability,
     NativeSequenceIdentity, NativeStopReason, NativeUsageDelta,
 };
+pub use speculation::NativePhysicalAccounting;

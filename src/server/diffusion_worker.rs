@@ -192,6 +192,7 @@ pub(crate) fn run_diffusion_worker_loop(
 
     for request in request_rx {
         match request {
+            ModelRequest::Native(_) => continue,
             ModelRequest::PromptCacheWarmup { .. } => {
                 // Only the BatchScheduler owns a prompt cache; this worker has
                 // no snapshot state to warm and silently drops the job.
@@ -519,6 +520,7 @@ pub(crate) fn run_llada2_worker_loop(
 
     for request in request_rx {
         match request {
+            ModelRequest::Native(_) => continue,
             ModelRequest::PromptCacheWarmup { .. } => {
                 // Only the BatchScheduler owns a prompt cache; this worker has
                 // no snapshot state to warm and silently drops the job.

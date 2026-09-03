@@ -154,6 +154,19 @@ impl fmt::Debug for NativeRuntimeBuilder {
 }
 
 impl NativeRuntimeBuilder {
+    /// Construct the root mlxcel implementation for the current linked build.
+    pub fn current_process(
+        consumer: NativeConsumerBuildFragment,
+    ) -> Result<Self, NativeRuntimeError> {
+        let build_identity = embedded_native_build_identity(consumer)?;
+        Ok(Self {
+            worker_factory: Arc::new(super::engine::NativeEngineFactory::new(
+                build_identity.clone(),
+            )),
+            build_identity,
+        })
+    }
+
     /// Root-only constructor. Order 03 supplies the concrete factory; callers
     /// cannot inject a hand-authored build identity into the public builder.
     pub(crate) fn from_embedded_build(

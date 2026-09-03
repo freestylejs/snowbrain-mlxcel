@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
@@ -76,6 +76,20 @@ struct MetadataPackage {
 }
 
 #[derive(Debug, Deserialize)]
+struct CargoLock {
+    #[serde(default)]
+    package: Vec<CargoLockPackage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoLockPackage {
+    name: String,
+    version: String,
+    source: Option<String>,
+    checksum: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct MetadataResolve {
     root: Option<String>,
     nodes: Vec<MetadataNode>,
@@ -135,6 +149,8 @@ pub fn produce_consumer_fragment(
     let metadata_bytes = cargo_metadata(config)?;
     let metadata: Metadata = serde_json::from_slice(&metadata_bytes)
         .map_err(|err| format!("cargo metadata output is invalid: {err}"))?;
+    let mut metadata = metadata;
+    restore_registry_checksums(&mut metadata, &config.cargo_lock_path)?;
     let root = metadata
         .resolve
         .root
@@ -256,6 +272,61 @@ pub fn produce_consumer_fragment(
     };
     fragment.canonical_digest = canonical::hex_digest(digest_fragment(&fragment));
     Ok(fragment)
+}
+
+fn restore_registry_checksums(metadata: &mut Metadata, lock_path: &Path) -> Result<(), String> {
+    let lock_text = fs::read_to_string(lock_path).map_err(|err| {
+        format!(
+            "cannot read Cargo.lock {} while restoring package checksums: {err}",
+            lock_path.display()
+        )
+    })?;
+    let lock: CargoLock = toml::from_str(&lock_text)
+        .map_err(|err| format!("Cargo.lock is invalid while restoring package checksums: {err}"))?;
+    let mut checksums = BTreeMap::new();
+    for package in lock.package {
+        let Some(source) = package.source else {
+            continue;
+        };
+        let key = (package.name, package.version, source);
+        if checksums.insert(key, package.checksum).is_some() {
+            return Err("Cargo.lock contains duplicate package checksum records".to_owned());
+        }
+    }
+    for package in &mut metadata.packages {
+        let Some(source) = package.source.as_deref() else {
+            continue;
+        };
+        if !source.starts_with("registry+") {
+            continue;
+        }
+        let key = (
+            package.name.clone(),
+            package.version.clone(),
+            source.to_owned(),
+        );
+        let checksum = checksums
+            .get(&key)
+            .and_then(Option::as_deref)
+            .ok_or_else(|| {
+                format!(
+                    "Cargo.lock has no checksum for registry package {:?} {}",
+                    package.name, package.version
+                )
+            })?;
+        if package
+            .checksum
+            .as_deref()
+            .is_some_and(|value| value != checksum)
+        {
+            return Err(format!(
+                "cargo metadata checksum disagrees with Cargo.lock for registry package {:?} {}",
+                package.name, package.version
+            ));
+        }
+        package.checksum = Some(checksum.to_owned());
+    }
+    Ok(())
 }
 
 pub fn parse_git_cargo_source(value: &str) -> Result<GitCargoSource, String> {
@@ -903,5 +974,68 @@ mod tests {
             },
         };
         assert!(active_cargo_closure(&metadata, "root").is_err());
+    }
+
+    #[test]
+    fn registry_checksums_restore_from_exact_lock_records_and_fail_closed() {
+        const REGISTRY: &str = "registry+https://github.com/rust-lang/crates.io-index";
+        let lock = |records: &str| {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("Cargo.lock");
+            std::fs::write(&path, format!("version = 4\n\n{records}")).unwrap();
+            (directory, path)
+        };
+        let metadata = || Metadata {
+            packages: vec![MetadataPackage {
+                id: "serde".to_owned(),
+                name: "serde".to_owned(),
+                version: "1.0.0".to_owned(),
+                source: Some(REGISTRY.to_owned()),
+                checksum: None,
+            }],
+            resolve: MetadataResolve {
+                root: None,
+                nodes: vec![],
+            },
+        };
+        let record = |source: &str, checksum: Option<&str>| {
+            format!(
+                "[[package]]\nname = \"serde\"\nversion = \"1.0.0\"\nsource = \"{source}\"\n{}\n",
+                checksum.map_or_else(String::new, |value| format!("checksum = \"{value}\""))
+            )
+        };
+        let ones = "11".repeat(32);
+        let twos = "22".repeat(32);
+
+        let (directory, path) = lock(&record(REGISTRY, Some(ones.as_str())));
+        let mut valid = metadata();
+        restore_registry_checksums(&mut valid, &path).unwrap();
+        assert_eq!(valid.packages[0].checksum.as_deref(), Some(ones.as_str()));
+        drop(directory);
+
+        let (directory, path) = lock(&record(REGISTRY, None));
+        assert!(restore_registry_checksums(&mut metadata(), &path).is_err());
+        drop(directory);
+
+        let (directory, path) = lock(&record(REGISTRY, Some(twos.as_str())));
+        let mut conflicting = metadata();
+        conflicting.packages[0].checksum = Some(ones.clone());
+        assert!(restore_registry_checksums(&mut conflicting, &path).is_err());
+        drop(directory);
+
+        let (directory, path) = lock(&format!(
+            "{}{}",
+            record(REGISTRY, Some(ones.as_str())),
+            record(REGISTRY, Some(ones.as_str()))
+        ));
+        assert!(restore_registry_checksums(&mut metadata(), &path).is_err());
+        drop(directory);
+
+        let (directory, path) = lock(&record(
+            "registry+https://other.example/index",
+            Some(ones.as_str()),
+        ));
+        assert!(restore_registry_checksums(&mut metadata(), &path).is_err());
+        drop(directory);
     }
 }
