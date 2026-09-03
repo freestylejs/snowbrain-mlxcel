@@ -37,9 +37,10 @@ use super::sink::{
 const _: () = assert!(MAX_STABLE_DELTA_BYTES <= MAX_NATIVE_STABLE_BYTES_PER_UNIT);
 const _: () = assert!(MAX_PENDING_DECODE_BYTES <= MAX_NATIVE_STABLE_BYTES_PER_UNIT);
 
-const BUILD_IDENTITY_SCHEMA: &str = "mlxcel.native-build.v2";
+const BUILD_IDENTITY_SCHEMA: &str = "mlxcel.native-build.v3";
 const WORKER_PROFILE_SCHEMA: &str = "mlxcel.native-worker-profile.v1";
 const CANONICAL_MLXCEL_REPOSITORY: &str = "https://github.com/lablup/mlxcel.git";
+const APPROVED_MLXCEL_REPOSITORY: &str = "https://github.com/freestylejs/snowbrain-mlxcel.git";
 pub const MAX_BUILD_ITEMS: usize = 4_096;
 pub const MAX_BUILD_TEXT_BYTES: usize = 64 * 1024;
 pub const MAX_BUILD_TOTAL_TEXT_BYTES: usize = 8 * 1024 * 1024;
@@ -137,6 +138,8 @@ impl NativeSelfBuildPackage {
 /// recipe. Construction validates every bound before retaining a copy.
 #[derive(Debug, Clone, Copy)]
 pub struct NativeConsumerBuildRecord<'a> {
+    pub canonical_lineage_repository: &'a str,
+    pub approved_repository: &'a str,
     pub manifest_repository: &'a str,
     pub manifest_revision: &'a str,
     pub manifest_default_features: bool,
@@ -159,6 +162,8 @@ pub struct NativeConsumerBuildRecord<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NativeConsumerBuildFragmentInner {
+    canonical_lineage_repository: Arc<str>,
+    approved_repository: Arc<str>,
     manifest_repository: Arc<str>,
     manifest_revision: Arc<str>,
     manifest_default_features: bool,
@@ -185,6 +190,8 @@ impl NativeConsumerBuildFragment {
     ) -> Result<Self, NativeRuntimeError> {
         validate_consumer_record(&record)?;
         Ok(Self(Arc::new(NativeConsumerBuildFragmentInner {
+            canonical_lineage_repository: Arc::from(record.canonical_lineage_repository),
+            approved_repository: Arc::from(record.approved_repository),
             manifest_repository: Arc::from(record.manifest_repository),
             manifest_revision: Arc::from(record.manifest_revision),
             manifest_default_features: record.manifest_default_features,
@@ -219,6 +226,14 @@ impl NativeConsumerBuildFragment {
         })))
     }
 
+    #[must_use]
+    pub fn canonical_lineage_repository(&self) -> &str {
+        &self.0.canonical_lineage_repository
+    }
+    #[must_use]
+    pub fn approved_repository(&self) -> &str {
+        &self.0.approved_repository
+    }
     #[must_use]
     pub fn manifest_repository(&self) -> &str {
         &self.0.manifest_repository
@@ -818,6 +833,11 @@ fn validate_consumer_record(
     record: &NativeConsumerBuildRecord<'_>,
 ) -> Result<(), NativeRuntimeError> {
     let mut bound = BuildBound::default();
+    bound.text(
+        "consumer canonical lineage repository",
+        record.canonical_lineage_repository,
+    )?;
+    bound.text("consumer approved repository", record.approved_repository)?;
     bound.text("consumer manifest repository", record.manifest_repository)?;
     bound.full_git_sha("consumer manifest revision", record.manifest_revision)?;
     for (name, value) in [
@@ -840,7 +860,10 @@ fn validate_consumer_record(
         bound.text(name, value)?;
     }
     let parsed_source = parse_resolved_git_source(record.resolved_package_source);
-    if record.resolved_package_name != "mlxcel"
+    if record.canonical_lineage_repository != CANONICAL_MLXCEL_REPOSITORY
+        || record.approved_repository != APPROVED_MLXCEL_REPOSITORY
+        || record.manifest_repository != record.approved_repository
+        || record.resolved_package_name != "mlxcel"
         || parsed_source.is_none_or(|source| {
             source.repository.trim_end_matches(".git")
                 != record.manifest_repository.trim_end_matches(".git")
@@ -946,6 +969,14 @@ fn validate_consumer_fragment(
 ) -> Result<(), NativeRuntimeError> {
     for (name, value) in [
         (
+            "consumer canonical lineage repository",
+            fragment.canonical_lineage_repository(),
+        ),
+        (
+            "consumer approved repository",
+            fragment.approved_repository(),
+        ),
+        (
             "consumer manifest repository",
             fragment.manifest_repository(),
         ),
@@ -1003,7 +1034,9 @@ fn validate_consumer_matches_self(
     inputs: &NativeEffectiveBuildInputs,
 ) -> Result<(), NativeRuntimeError> {
     let consumer = &inputs.consumer;
-    if inputs.materialized_source_repository.as_ref() != consumer.manifest_repository()
+    if inputs.canonical_source_repository.as_ref() != consumer.canonical_lineage_repository()
+        || inputs.materialized_source_repository.as_ref() != consumer.approved_repository()
+        || consumer.approved_repository() != consumer.manifest_repository()
         || inputs.outer_source_revision.as_ref() != consumer.manifest_revision()
         || inputs.self_package.name() != consumer.resolved_package().name()
         || inputs.self_package.version() != consumer.resolved_package().version()
@@ -1270,7 +1303,6 @@ impl NativeBuildIdentity {
 
 struct GeneratedOuterBuildRecord {
     canonical_source_repository: &'static str,
-    materialized_source_repository: &'static str,
     outer_source_revision: &'static str,
     outer_source_tree_sha256: [u8; 32],
     package_name: &'static str,
@@ -1301,7 +1333,9 @@ pub(crate) fn embedded_native_build_identity(
 ) -> Result<NativeBuildIdentity, NativeRuntimeError> {
     let outer = &embedded_outer_record::GENERATED_OUTER_BUILD_RECORD;
     let core = mlxcel_core::native_core_build_record();
-    if outer.target_triple != core.target_triple
+    if outer.canonical_source_repository != CANONICAL_MLXCEL_REPOSITORY
+        || outer.canonical_source_repository != consumer.canonical_lineage_repository()
+        || outer.target_triple != core.target_triple
         || outer.target_architecture != core.target_architecture
         || outer.build_profile != core.build_profile
     {
@@ -1329,8 +1363,8 @@ pub(crate) fn embedded_native_build_identity(
     };
 
     let inputs = NativeEffectiveBuildInputs {
-        canonical_source_repository: Arc::from(outer.canonical_source_repository),
-        materialized_source_repository: Arc::from(outer.materialized_source_repository),
+        canonical_source_repository: Arc::from(consumer.canonical_lineage_repository()),
+        materialized_source_repository: Arc::from(consumer.approved_repository()),
         outer_source_revision: Arc::from(outer.outer_source_revision),
         outer_source_tree_sha256: outer.outer_source_tree_sha256,
         self_package: NativeSelfBuildPackage {
@@ -1567,6 +1601,8 @@ impl CanonicalEncoder {
     }
 
     fn consumer(&mut self, fragment: &NativeConsumerBuildFragment) {
+        self.text(fragment.canonical_lineage_repository());
+        self.text(fragment.approved_repository());
         self.text(fragment.manifest_repository());
         self.text(fragment.manifest_revision());
         self.boolean(fragment.manifest_default_features());
@@ -2346,13 +2382,15 @@ mod tests {
 
     fn consumer() -> NativeConsumerBuildFragment {
         NativeConsumerBuildFragment::try_from_generated(NativeConsumerBuildRecord {
-            manifest_repository: CANONICAL_MLXCEL_REPOSITORY,
+            canonical_lineage_repository: CANONICAL_MLXCEL_REPOSITORY,
+            approved_repository: APPROVED_MLXCEL_REPOSITORY,
+            manifest_repository: APPROVED_MLXCEL_REPOSITORY,
             manifest_revision: "b2be0d0ab36b17ba35e9ae9d96fe7f19a195d5df",
             manifest_default_features: false,
             manifest_explicit_features: &["accelerate", "metal"],
             resolved_package_name: "mlxcel",
             resolved_package_version: "0.6.0",
-            resolved_package_source: "git+https://github.com/lablup/mlxcel.git?rev=b2be0d0ab36b17ba35e9ae9d96fe7f19a195d5df#b2be0d0ab36b17ba35e9ae9d96fe7f19a195d5df",
+            resolved_package_source: "git+https://github.com/freestylejs/snowbrain-mlxcel.git?rev=b2be0d0ab36b17ba35e9ae9d96fe7f19a195d5df#b2be0d0ab36b17ba35e9ae9d96fe7f19a195d5df",
             resolved_package_checksum: None,
             cargo_lock_sha256: [13; 32],
             effective_cargo_features: &["accelerate", "metal"],
@@ -2367,10 +2405,58 @@ mod tests {
         .unwrap()
     }
 
+    fn embedded_consumer(revision: &str) -> NativeConsumerBuildFragment {
+        let outer = &embedded_outer_record::GENERATED_OUTER_BUILD_RECORD;
+        let source = format!("git+{APPROVED_MLXCEL_REPOSITORY}?rev={revision}#{revision}");
+        NativeConsumerBuildFragment::try_from_generated(NativeConsumerBuildRecord {
+            canonical_lineage_repository: CANONICAL_MLXCEL_REPOSITORY,
+            approved_repository: APPROVED_MLXCEL_REPOSITORY,
+            manifest_repository: APPROVED_MLXCEL_REPOSITORY,
+            manifest_revision: revision,
+            manifest_default_features: outer.default_features_enabled,
+            manifest_explicit_features: outer.cargo_features,
+            resolved_package_name: outer.package_name,
+            resolved_package_version: outer.package_version,
+            resolved_package_source: &source,
+            resolved_package_checksum: None,
+            cargo_lock_sha256: [31; 32],
+            effective_cargo_features: outer.cargo_features,
+            rust_toolchain: outer.rust_toolchain,
+            rustc: outer.rustc,
+            final_linker: "canonical consumer final linker",
+            target_triple: outer.target_triple,
+            target_architecture: outer.target_architecture,
+            build_profile: outer.build_profile,
+            emitted_link_directives: &["consumer-link-plan=fixture"],
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn embedded_identity_uses_consumer_source_authority_and_rejects_wrong_revision() {
+        let outer = &embedded_outer_record::GENERATED_OUTER_BUILD_RECORD;
+        let identity =
+            embedded_native_build_identity(embedded_consumer(outer.outer_source_revision)).unwrap();
+        assert_eq!(
+            identity.inputs().canonical_source_repository(),
+            CANONICAL_MLXCEL_REPOSITORY
+        );
+        assert_eq!(
+            identity.inputs().materialized_source_repository(),
+            APPROVED_MLXCEL_REPOSITORY
+        );
+        assert!(
+            embedded_native_build_identity(embedded_consumer(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ))
+            .is_err()
+        );
+    }
+
     fn inputs() -> NativeEffectiveBuildInputs {
         NativeEffectiveBuildInputs {
             canonical_source_repository: Arc::from("https://github.com/lablup/mlxcel.git"),
-            materialized_source_repository: Arc::from("https://github.com/lablup/mlxcel.git"),
+            materialized_source_repository: Arc::from(APPROVED_MLXCEL_REPOSITORY),
             outer_source_revision: Arc::from("b2be0d0ab36b17ba35e9ae9d96fe7f19a195d5df"),
             outer_source_tree_sha256: [1; 32],
             self_package: NativeSelfBuildPackage {
@@ -2545,13 +2631,15 @@ mod tests {
     #[test]
     fn consumer_fragment_rejects_revision_default_target_and_absolute_link_mismatch() {
         let baseline = NativeConsumerBuildRecord {
-            manifest_repository: CANONICAL_MLXCEL_REPOSITORY,
+            canonical_lineage_repository: CANONICAL_MLXCEL_REPOSITORY,
+            approved_repository: APPROVED_MLXCEL_REPOSITORY,
+            manifest_repository: APPROVED_MLXCEL_REPOSITORY,
             manifest_revision: "b2be0d0ab36b17ba35e9ae9d96fe7f19a195d5df",
             manifest_default_features: false,
             manifest_explicit_features: &["accelerate", "metal"],
             resolved_package_name: "mlxcel",
             resolved_package_version: "0.6.0",
-            resolved_package_source: "git+https://github.com/lablup/mlxcel.git?rev=b2be0d0ab36b17ba35e9ae9d96fe7f19a195d5df#b2be0d0ab36b17ba35e9ae9d96fe7f19a195d5df",
+            resolved_package_source: "git+https://github.com/freestylejs/snowbrain-mlxcel.git?rev=b2be0d0ab36b17ba35e9ae9d96fe7f19a195d5df#b2be0d0ab36b17ba35e9ae9d96fe7f19a195d5df",
             resolved_package_checksum: None,
             cargo_lock_sha256: [20; 32],
             effective_cargo_features: &["accelerate", "metal"],
@@ -2564,23 +2652,43 @@ mod tests {
             emitted_link_directives: &["lib=mlxcel"],
         };
         assert!(NativeConsumerBuildFragment::try_from_generated(baseline).is_ok());
+        for invalid in [
+            NativeConsumerBuildRecord {
+                canonical_lineage_repository: "https://example.invalid/mlxcel.git",
+                ..baseline
+            },
+            NativeConsumerBuildRecord {
+                approved_repository: "https://example.invalid/snowbrain-mlxcel.git",
+                ..baseline
+            },
+            NativeConsumerBuildRecord {
+                manifest_repository: "https://example.invalid/snowbrain-mlxcel.git",
+                ..baseline
+            },
+            NativeConsumerBuildRecord {
+                resolved_package_source: "git+https://example.invalid/snowbrain-mlxcel.git?rev=b2be0d0ab36b17ba35e9ae9d96fe7f19a195d5df#b2be0d0ab36b17ba35e9ae9d96fe7f19a195d5df",
+                ..baseline
+            },
+        ] {
+            assert!(NativeConsumerBuildFragment::try_from_generated(invalid).is_err());
+        }
         assert!(
             NativeConsumerBuildFragment::try_from_generated(NativeConsumerBuildRecord {
-                resolved_package_source: "git+https://github.com/lablup/mlxcel.git?rev=b2be0d0ab36b17ba35e9ae9d96fe7f19a195d5df#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                resolved_package_source: "git+https://github.com/freestylejs/snowbrain-mlxcel.git?rev=b2be0d0ab36b17ba35e9ae9d96fe7f19a195d5df#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 ..baseline
             })
             .is_err()
         );
         assert!(
             NativeConsumerBuildFragment::try_from_generated(NativeConsumerBuildRecord {
-                resolved_package_source: "git+https://github.com/lablup/mlxcel.git?rev=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#b2be0d0ab36b17ba35e9ae9d96fe7f19a195d5df",
+                resolved_package_source: "git+https://github.com/freestylejs/snowbrain-mlxcel.git?rev=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#b2be0d0ab36b17ba35e9ae9d96fe7f19a195d5df",
                 ..baseline
             })
             .is_err()
         );
         assert!(
             NativeConsumerBuildFragment::try_from_generated(NativeConsumerBuildRecord {
-                resolved_package_source: "git+https://github.com/lablup/mlxcel.git?branch=b2be0d0ab36b17ba35e9ae9d96fe7f19a195d5df#b2be0d0ab36b17ba35e9ae9d96fe7f19a195d5df",
+                resolved_package_source: "git+https://github.com/freestylejs/snowbrain-mlxcel.git?branch=b2be0d0ab36b17ba35e9ae9d96fe7f19a195d5df#b2be0d0ab36b17ba35e9ae9d96fe7f19a195d5df",
                 ..baseline
             })
             .is_err()

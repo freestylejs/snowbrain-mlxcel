@@ -299,7 +299,7 @@ fn write_outer_native_build_record(root_link_recipe: &[String]) {
 
     let manifest_dir = PathBuf::from(required_env("CARGO_MANIFEST_DIR"));
     let out_dir = PathBuf::from(required_env("OUT_DIR"));
-    let origin = git_output(&manifest_dir, &["remote", "get-url", "origin"]);
+    verify_manifest_repository(&manifest_dir.join("Cargo.toml"), CANONICAL_REPOSITORY);
     let revision = git_output(&manifest_dir, &["rev-parse", "HEAD"]);
     if revision.len() != 40
         || !revision
@@ -364,7 +364,6 @@ fn write_outer_native_build_record(root_link_recipe: &[String]) {
     let generated = format!(
         "pub(super) static GENERATED_OUTER_BUILD_RECORD: GeneratedOuterBuildRecord = GeneratedOuterBuildRecord {{\n\
          canonical_source_repository: {CANONICAL_REPOSITORY:?},\n\
-         materialized_source_repository: {origin:?},\n\
          outer_source_revision: {revision:?},\n\
          outer_source_tree_sha256: {outer_tree_sha256:?},\n\
          package_name: {package_name:?},\n\
@@ -390,6 +389,31 @@ fn write_outer_native_build_record(root_link_recipe: &[String]) {
         generated,
     )
     .unwrap_or_else(|err| panic!("mlxcel: failed to write outer build record: {err}"));
+}
+
+fn verify_manifest_repository(manifest_path: &Path, expected: &str) {
+    let text = fs::read_to_string(manifest_path).unwrap_or_else(|err| {
+        panic!(
+            "mlxcel: cannot read source-controlled manifest {}: {err}",
+            manifest_path.display()
+        )
+    });
+    let manifest: toml::Value = toml::from_str(&text)
+        .unwrap_or_else(|err| panic!("mlxcel: source-controlled Cargo.toml is invalid: {err}"));
+    let repository = manifest
+        .get("package")
+        .and_then(|value| value.get("repository"))
+        .and_then(toml::Value::as_str)
+        .unwrap_or_else(|| {
+            panic!("mlxcel: source-controlled Cargo.toml has no package.repository")
+        });
+    if repository.trim_end_matches('/').trim_end_matches(".git")
+        != expected.trim_end_matches('/').trim_end_matches(".git")
+    {
+        panic!(
+            "mlxcel: source-controlled package.repository {repository:?} is not canonical {expected:?}"
+        );
+    }
 }
 
 fn git_output(root: &Path, args: &[&str]) -> String {

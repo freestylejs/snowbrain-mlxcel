@@ -27,30 +27,68 @@ pub struct ConsumerProducerConfig {
     pub cargo: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// Producer-owned consumer facts. External callers can inspect or serialize
+/// the fragment, but cannot hand-construct one.
+///
+/// ```compile_fail
+/// use mlxcel_build_identity::ConsumerFragment;
+/// let _ = ConsumerFragment {};
+/// ```
+///
+/// ```compile_fail
+/// use mlxcel_build_identity::ConsumerFragment;
+/// let _: ConsumerFragment = serde_json::from_str("{}").unwrap();
+/// ```
 pub struct ConsumerFragment {
-    pub schema: String,
-    pub canonical_lineage_repository: String,
-    pub approved_repository: String,
-    pub manifest_repository: String,
-    pub manifest_revision: String,
-    pub manifest_default_features: bool,
-    pub manifest_explicit_features: Vec<String>,
-    pub resolved_package_name: String,
-    pub resolved_package_version: String,
-    pub resolved_package_source: String,
-    pub resolved_package_checksum: Option<String>,
-    pub cargo_lock_sha256: String,
-    pub effective_cargo_features: Vec<String>,
-    pub rust_toolchain: String,
-    pub rustc: String,
-    pub final_linker: String,
-    pub target_triple: String,
-    pub target_architecture: String,
-    pub build_profile: String,
-    pub effective_rustflags: Vec<String>,
-    pub emitted_link_directives: Vec<String>,
-    pub canonical_digest: String,
+    schema: String,
+    canonical_lineage_repository: String,
+    approved_repository: String,
+    manifest_repository: String,
+    manifest_revision: String,
+    manifest_default_features: bool,
+    manifest_explicit_features: Vec<String>,
+    resolved_package_name: String,
+    resolved_package_version: String,
+    resolved_package_source: String,
+    resolved_package_checksum: Option<String>,
+    cargo_lock_sha256: String,
+    effective_cargo_features: Vec<String>,
+    rust_toolchain: String,
+    rustc: String,
+    final_linker: String,
+    target_triple: String,
+    target_architecture: String,
+    build_profile: String,
+    effective_rustflags: Vec<String>,
+    emitted_link_directives: Vec<String>,
+    canonical_digest: String,
+}
+
+impl ConsumerFragment {
+    pub fn canonical_lineage_repository(&self) -> &str {
+        &self.canonical_lineage_repository
+    }
+
+    pub fn approved_repository(&self) -> &str {
+        &self.approved_repository
+    }
+
+    pub fn manifest_repository(&self) -> &str {
+        &self.manifest_repository
+    }
+
+    pub fn manifest_revision(&self) -> &str {
+        &self.manifest_revision
+    }
+
+    pub fn emitted_link_directives(&self) -> &[String] {
+        &self.emitted_link_directives
+    }
+
+    pub fn canonical_digest(&self) -> &str {
+        &self.canonical_digest
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +101,8 @@ pub struct GitCargoSource {
 #[derive(Debug, Deserialize)]
 struct Metadata {
     packages: Vec<MetadataPackage>,
+    workspace_root: PathBuf,
+    workspace_members: Vec<String>,
     resolve: MetadataResolve,
 }
 
@@ -73,6 +113,7 @@ struct MetadataPackage {
     version: String,
     source: Option<String>,
     checksum: Option<String>,
+    manifest_path: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
@@ -218,7 +259,14 @@ pub fn produce_consumer_fragment(
         return Err("Cargo resolved the forbidden default feature".to_owned());
     }
 
-    let active_cargo_closure = active_cargo_closure(&metadata, root)?;
+    let workspace = validate_workspace_authority(
+        &metadata,
+        root,
+        &config.manifest_path,
+        &config.cargo_lock_path,
+    )?;
+    let workspace_tree_digest = canonical::git_candidate_tree_digest(&workspace.root)?;
+    let active_cargo_closure = active_cargo_closure(&metadata, root, &workspace)?;
 
     let lock_digest = canonical::file_sha256(&config.cargo_lock_path)?;
     let manifest_digest = canonical::file_sha256(&config.manifest_path)?;
@@ -239,6 +287,10 @@ pub fn produce_consumer_fragment(
         format!(
             "cargo-resolution=locked-offline;filter-platform={}",
             config.target_triple
+        ),
+        format!(
+            "workspace-candidate-tree-sha256={}",
+            canonical::hex_digest(workspace_tree_digest)
         ),
     ];
     provenance.extend(active_cargo_closure);
@@ -365,13 +417,15 @@ pub fn parse_git_cargo_source(value: &str) -> Result<GitCargoSource, String> {
 }
 
 pub fn render_consumer_fragment_rust(fragment: &ConsumerFragment) -> Result<String, String> {
+    validate_fragment_digest(fragment)?;
     let digest = canonical::parse_sha256(&fragment.cargo_lock_sha256, "Cargo.lock")?;
     let features = render_string_slice(&fragment.manifest_explicit_features);
     let effective = render_string_slice(&fragment.effective_cargo_features);
     let directives = render_string_slice(&fragment.emitted_link_directives);
     Ok(format!(
-        "pub fn generated_mlxcel_consumer_fragment() -> Result<mlxcel::NativeConsumerBuildFragment, mlxcel::NativeRuntimeError> {{\n\
-         mlxcel::NativeConsumerBuildFragment::try_from_generated(mlxcel::NativeConsumerBuildRecord {{\n\
+        "pub fn generated_mlxcel_consumer_fragment() -> Result<mlxcel::native_runtime::NativeConsumerBuildFragment, mlxcel::native_runtime::NativeRuntimeError> {{\n\
+         mlxcel::native_runtime::NativeConsumerBuildFragment::try_from_generated(mlxcel::native_runtime::NativeConsumerBuildRecord {{\n\
+         canonical_lineage_repository: {:?}, approved_repository: {:?},\n\
          manifest_repository: {:?}, manifest_revision: {:?}, manifest_default_features: false,\n\
          manifest_explicit_features: {}, resolved_package_name: {:?},\n\
          resolved_package_version: {:?}, resolved_package_source: {:?},\n\
@@ -380,6 +434,8 @@ pub fn render_consumer_fragment_rust(fragment: &ConsumerFragment) -> Result<Stri
          final_linker: {:?}, target_triple: {:?}, target_architecture: {:?},\n\
          build_profile: {:?}, emitted_link_directives: {},\n\
          }})\n}}\n",
+        fragment.canonical_lineage_repository,
+        fragment.approved_repository,
         fragment.manifest_repository,
         fragment.manifest_revision,
         features,
@@ -481,7 +537,117 @@ fn cargo_metadata(config: &ConsumerProducerConfig) -> Result<Vec<u8>, String> {
     Ok(output.stdout)
 }
 
-fn active_cargo_closure(metadata: &Metadata, root: &str) -> Result<Vec<String>, String> {
+struct WorkspaceAuthority {
+    root: PathBuf,
+    members: BTreeSet<String>,
+}
+
+fn validate_workspace_authority(
+    metadata: &Metadata,
+    root: &str,
+    configured_manifest: &Path,
+    configured_lock: &Path,
+) -> Result<WorkspaceAuthority, String> {
+    if metadata.workspace_members.len() > MAX_CANONICAL_ITEMS {
+        return Err("Cargo workspace member list exceeds the item bound".to_owned());
+    }
+    let members = metadata
+        .workspace_members
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if members.len() != metadata.workspace_members.len() {
+        return Err("Cargo metadata contains duplicate workspace members".to_owned());
+    }
+    if !members.contains(root) {
+        return Err("runner root is not a declared Cargo workspace member".to_owned());
+    }
+    let workspace_root = fs::canonicalize(&metadata.workspace_root).map_err(|err| {
+        format!(
+            "cannot canonicalize Cargo workspace root {}: {err}",
+            metadata.workspace_root.display()
+        )
+    })?;
+    let git_root = git_workspace_root(&workspace_root)?;
+    if git_root != workspace_root {
+        return Err("Cargo workspace root is not the authoritative Git worktree root".to_owned());
+    }
+    let root_package = metadata
+        .packages
+        .iter()
+        .find(|package| package.id == root)
+        .ok_or_else(|| "runner root package is absent from Cargo metadata".to_owned())?;
+    let metadata_manifest = canonical_workspace_manifest(root_package, &workspace_root)?;
+    let configured_manifest = fs::canonicalize(configured_manifest).map_err(|err| {
+        format!(
+            "cannot canonicalize configured runner manifest {}: {err}",
+            configured_manifest.display()
+        )
+    })?;
+    if metadata_manifest.0 != configured_manifest {
+        return Err(
+            "Cargo metadata runner manifest disagrees with producer configuration".to_owned(),
+        );
+    }
+    let expected_lock = fs::canonicalize(workspace_root.join("Cargo.lock"))
+        .map_err(|err| format!("cannot canonicalize Cargo workspace lockfile: {err}"))?;
+    let configured_lock = fs::canonicalize(configured_lock).map_err(|err| {
+        format!(
+            "cannot canonicalize configured Cargo.lock {}: {err}",
+            configured_lock.display()
+        )
+    })?;
+    if configured_lock != expected_lock {
+        return Err("configured Cargo.lock is not the Cargo workspace lockfile".to_owned());
+    }
+    Ok(WorkspaceAuthority {
+        root: workspace_root,
+        members,
+    })
+}
+
+fn git_workspace_root(workspace_root: &Path) -> Result<PathBuf, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace_root)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .map_err(|err| format!("cannot execute Git for Cargo workspace authority: {err}"))?;
+    if !output.status.success() {
+        return Err("Cargo workspace has no Git source authority".to_owned());
+    }
+    let text = String::from_utf8(output.stdout)
+        .map_err(|_| "Cargo workspace Git root is not strict UTF-8".to_owned())?;
+    fs::canonicalize(text.trim())
+        .map_err(|err| format!("cannot canonicalize Cargo workspace Git root: {err}"))
+}
+
+fn canonical_workspace_manifest(
+    package: &MetadataPackage,
+    workspace_root: &Path,
+) -> Result<(PathBuf, String), String> {
+    let manifest = fs::canonicalize(&package.manifest_path).map_err(|err| {
+        format!(
+            "cannot canonicalize workspace package {:?} manifest {}: {err}",
+            package.name,
+            package.manifest_path.display()
+        )
+    })?;
+    let relative = manifest.strip_prefix(workspace_root).map_err(|_| {
+        format!(
+            "workspace package {:?} manifest is outside the Cargo workspace root",
+            package.name
+        )
+    })?;
+    let label = canonical::strict_relative_path(relative)?;
+    Ok((manifest, format!("workspace:{label}")))
+}
+
+fn active_cargo_closure(
+    metadata: &Metadata,
+    root: &str,
+    workspace: &WorkspaceAuthority,
+) -> Result<Vec<String>, String> {
     let packages = metadata
         .packages
         .iter()
@@ -526,17 +692,21 @@ fn active_cargo_closure(metadata: &Metadata, root: &str) -> Result<Vec<String>, 
         let node = nodes
             .get(id)
             .ok_or_else(|| format!("cargo metadata omitted active resolve node {id:?}"))?;
+        let workspace_source;
         let source = match package.source.as_deref() {
             Some(source) => source,
-            None if *id == root => "<runner-root>",
+            None if workspace.members.contains(*id) => {
+                workspace_source = canonical_workspace_manifest(package, &workspace.root)?.1;
+                workspace_source.as_str()
+            }
             None => {
                 return Err(format!(
-                    "active Cargo dependency {:?} is an unpinned path package",
+                    "active Cargo dependency {:?} is an unlisted path package",
                     package.name
                 ));
             }
         };
-        validate_resolved_package_source(source, package.checksum.as_deref(), *id == root)?;
+        validate_resolved_package_source(source, package.checksum.as_deref())?;
         let mut features = node.features.clone();
         normalize_unique(&mut features, "active Cargo package feature")?;
         let label = serde_json::to_string(&(
@@ -601,19 +771,32 @@ fn active_cargo_closure(metadata: &Metadata, root: &str) -> Result<Vec<String>, 
     Ok(records)
 }
 
-fn validate_resolved_package_source(
-    source: &str,
-    checksum: Option<&str>,
-    runner_root: bool,
-) -> Result<(), String> {
+fn validate_resolved_package_source(source: &str, checksum: Option<&str>) -> Result<(), String> {
     bounded_text(source, "active Cargo package source")?;
-    if runner_root {
-        if source != "<runner-root>" || checksum.is_some() {
-            return Err("runner root package has contradictory source provenance".to_owned());
+    if source.starts_with("workspace:") {
+        let label = source
+            .strip_prefix("workspace:")
+            .ok_or_else(|| "workspace source label is malformed".to_owned())?;
+        canonical::validate_relative_label(label)?;
+        if checksum.is_some() {
+            return Err("workspace package unexpectedly has a checksum".to_owned());
         }
         return Ok(());
     }
     if source.starts_with("registry+") {
+        let registry = source
+            .strip_prefix("registry+")
+            .ok_or_else(|| "registry package source is malformed".to_owned())?;
+        let registry = Url::parse(registry)
+            .map_err(|err| format!("registry package source URL is invalid: {err}"))?;
+        if registry.scheme() != "https"
+            || !registry.username().is_empty()
+            || registry.password().is_some()
+            || registry.query().is_some()
+            || registry.fragment().is_some()
+        {
+            return Err("registry package source URL is not portable HTTPS authority".to_owned());
+        }
         let checksum = checksum
             .ok_or_else(|| "registry package in active Cargo closure has no checksum".to_owned())?;
         if checksum.len() != 64
@@ -629,12 +812,7 @@ fn validate_resolved_package_source(
                 "Git package in active Cargo closure unexpectedly has a checksum".to_owned(),
             );
         }
-        let (_, revision) = source
-            .rsplit_once('#')
-            .ok_or_else(|| "Git package source has no resolved commit".to_owned())?;
-        if !canonical::is_full_lower_git_sha(revision) {
-            return Err("Git package source commit is not canonical".to_owned());
-        }
+        parse_git_cargo_source(source)?;
     } else {
         return Err("active Cargo package has an unsupported source kind".to_owned());
     }
@@ -666,6 +844,9 @@ fn validate_config(config: &ConsumerProducerConfig) -> Result<(), String> {
     )?;
     if lineage != config.canonical_lineage_repository {
         return Err("canonical lineage URL is not canonical".to_owned());
+    }
+    if lineage != "https://github.com/lablup/mlxcel.git" {
+        return Err("canonical lineage URL is not the fixed mlxcel upstream authority".to_owned());
     }
     Ok(())
 }
@@ -771,6 +952,19 @@ fn digest_fragment(fragment: &ConsumerFragment) -> [u8; 32] {
     encoder.finish()
 }
 
+fn validate_fragment_digest(fragment: &ConsumerFragment) -> Result<(), String> {
+    if fragment.schema != "mlxcel.consumer-build.v1" {
+        return Err("consumer fragment schema is not canonical".to_owned());
+    }
+    let expected = canonical::hex_digest(digest_fragment(fragment));
+    if fragment.canonical_digest != expected {
+        return Err(
+            "consumer fragment canonical digest is empty or does not match its facts".to_owned(),
+        );
+    }
+    Ok(())
+}
+
 fn render_string_slice(values: &[String]) -> String {
     format!(
         "&[{}]",
@@ -787,6 +981,52 @@ mod tests {
     use super::*;
 
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn renderer_fixture() -> ConsumerFragment {
+        let mut fragment = ConsumerFragment {
+            schema: "mlxcel.consumer-build.v1".to_owned(),
+            canonical_lineage_repository: "https://github.com/lablup/mlxcel.git".to_owned(),
+            approved_repository: "https://github.com/freestylejs/snowbrain-mlxcel.git".to_owned(),
+            manifest_repository: "https://github.com/freestylejs/snowbrain-mlxcel.git".to_owned(),
+            manifest_revision: SHA.to_owned(),
+            manifest_default_features: false,
+            manifest_explicit_features: vec!["metal".to_owned()],
+            resolved_package_name: "mlxcel".to_owned(),
+            resolved_package_version: "0.6.0".to_owned(),
+            resolved_package_source: format!(
+                "git+https://github.com/freestylejs/snowbrain-mlxcel.git?rev={SHA}#{SHA}"
+            ),
+            resolved_package_checksum: None,
+            cargo_lock_sha256: "11".repeat(32),
+            effective_cargo_features: vec!["metal".to_owned()],
+            rust_toolchain: "stable-aarch64-apple-darwin".to_owned(),
+            rustc: "rustc fixture".to_owned(),
+            final_linker: "ld fixture".to_owned(),
+            target_triple: "aarch64-apple-darwin".to_owned(),
+            target_architecture: "aarch64".to_owned(),
+            build_profile: "release".to_owned(),
+            effective_rustflags: Vec::new(),
+            emitted_link_directives: vec!["lib=framework=Metal".to_owned()],
+            canonical_digest: String::new(),
+        };
+        fragment.canonical_digest = canonical::hex_digest(digest_fragment(&fragment));
+        fragment
+    }
+
+    #[test]
+    fn renderer_recomputes_schema_and_digest() {
+        let mut fragment = renderer_fixture();
+        assert!(render_consumer_fragment_rust(&fragment).is_ok());
+        fragment.final_linker = "injected linker".to_owned();
+        assert!(render_consumer_fragment_rust(&fragment).is_err());
+        fragment = renderer_fixture();
+        fragment.canonical_digest.clear();
+        assert!(render_consumer_fragment_rust(&fragment).is_err());
+        fragment = renderer_fixture();
+        fragment.schema = "manual.consumer.v1".to_owned();
+        fragment.canonical_digest = canonical::hex_digest(digest_fragment(&fragment));
+        assert!(render_consumer_fragment_rust(&fragment).is_err());
+    }
 
     #[test]
     fn cargo_source_requires_exact_query_and_fragment_commit() {
@@ -806,6 +1046,68 @@ mod tests {
         ] {
             assert!(parse_git_cargo_source(&invalid).is_err(), "{invalid}");
         }
+    }
+
+    #[test]
+    fn active_cargo_sources_reject_local_credentials_and_floating_git() {
+        let checksum = "11".repeat(32);
+        for (source, checksum) in [
+            (
+                format!("git+file:///cargo/cache/mlxcel?rev={SHA}#{SHA}"),
+                None,
+            ),
+            (
+                format!("git+https://user:secret@example.test/mlxcel?rev={SHA}#{SHA}"),
+                None,
+            ),
+            (
+                format!("git+https://example.test/mlxcel?branch=main#{SHA}"),
+                None,
+            ),
+            (
+                "registry+file:///cargo/cache/index".to_owned(),
+                Some(checksum.as_str()),
+            ),
+            (
+                "registry+https://user:secret@example.test/index".to_owned(),
+                Some(checksum.as_str()),
+            ),
+        ] {
+            assert!(
+                validate_resolved_package_source(&source, checksum).is_err(),
+                "accepted non-portable source {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_path_authority_rejects_outside_escape_and_missing_git() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_manifest = outside.path().join("Cargo.toml");
+        fs::write(
+            &outside_manifest,
+            "[package]\nname='outside'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        let package = MetadataPackage {
+            id: "outside".to_owned(),
+            name: "outside".to_owned(),
+            version: "0.1.0".to_owned(),
+            source: None,
+            checksum: None,
+            manifest_path: outside_manifest.clone(),
+        };
+        assert!(canonical_workspace_manifest(&package, workspace.path()).is_err());
+
+        let link = workspace.path().join("escaped-Cargo.toml");
+        std::os::unix::fs::symlink(&outside_manifest, &link).unwrap();
+        let escaped = MetadataPackage {
+            manifest_path: link,
+            ..package
+        };
+        assert!(canonical_workspace_manifest(&escaped, workspace.path()).is_err());
+        assert!(git_workspace_root(workspace.path()).is_err());
     }
 
     #[test]
@@ -829,6 +1131,17 @@ mod tests {
 
     #[test]
     fn active_cargo_closure_binds_packages_features_and_non_dev_edges() {
+        let directory = tempfile::tempdir().unwrap();
+        let root_manifest = directory.path().join("Cargo.toml");
+        fs::write(
+            &root_manifest,
+            "[package]\nname='runner'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        let workspace = WorkspaceAuthority {
+            root: fs::canonicalize(directory.path()).unwrap(),
+            members: BTreeSet::from(["root".to_owned()]),
+        };
         let git_source = format!("git+https://example.test/mlxcel.git?rev={SHA}#{SHA}");
         let metadata = Metadata {
             packages: vec![
@@ -838,6 +1151,7 @@ mod tests {
                     version: "0.1.0".to_owned(),
                     source: None,
                     checksum: None,
+                    manifest_path: root_manifest,
                 },
                 MetadataPackage {
                     id: "mlxcel".to_owned(),
@@ -845,6 +1159,7 @@ mod tests {
                     version: "0.4.0".to_owned(),
                     source: Some(git_source),
                     checksum: None,
+                    manifest_path: PathBuf::from("/cargo/mlxcel/Cargo.toml"),
                 },
                 MetadataPackage {
                     id: "serde".to_owned(),
@@ -854,6 +1169,7 @@ mod tests {
                         "registry+https://github.com/rust-lang/crates.io-index".to_owned(),
                     ),
                     checksum: Some("11".repeat(32)),
+                    manifest_path: PathBuf::from("/cargo/serde/Cargo.toml"),
                 },
                 MetadataPackage {
                     id: "dev-only".to_owned(),
@@ -863,8 +1179,11 @@ mod tests {
                         "registry+https://github.com/rust-lang/crates.io-index".to_owned(),
                     ),
                     checksum: Some("22".repeat(32)),
+                    manifest_path: PathBuf::from("/cargo/dev-only/Cargo.toml"),
                 },
             ],
+            workspace_root: directory.path().to_path_buf(),
+            workspace_members: vec!["root".to_owned()],
             resolve: MetadataResolve {
                 root: Some("root".to_owned()),
                 nodes: vec![
@@ -916,7 +1235,7 @@ mod tests {
             },
         };
 
-        let closure = active_cargo_closure(&metadata, "root").unwrap();
+        let closure = active_cargo_closure(&metadata, "root", &workspace).unwrap();
         assert!(closure.iter().any(|value| value.contains("mlxcel")));
         assert!(closure.iter().any(|value| value.contains("serde")));
         assert!(closure.iter().any(|value| value.contains("derive")));
@@ -931,11 +1250,25 @@ mod tests {
             .unwrap()
             .features
             .push("rc".to_owned());
-        assert_ne!(active_cargo_closure(&changed, "root").unwrap(), closure);
+        assert_ne!(
+            active_cargo_closure(&changed, "root", &workspace).unwrap(),
+            closure
+        );
     }
 
     #[test]
     fn active_cargo_closure_rejects_unpinned_transitive_path_packages() {
+        let directory = tempfile::tempdir().unwrap();
+        let root_manifest = directory.path().join("Cargo.toml");
+        fs::write(
+            &root_manifest,
+            "[package]\nname='runner'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        let workspace = WorkspaceAuthority {
+            root: fs::canonicalize(directory.path()).unwrap(),
+            members: BTreeSet::from(["root".to_owned()]),
+        };
         let metadata = Metadata {
             packages: vec![
                 MetadataPackage {
@@ -944,6 +1277,7 @@ mod tests {
                     version: "0.1.0".to_owned(),
                     source: None,
                     checksum: None,
+                    manifest_path: root_manifest,
                 },
                 MetadataPackage {
                     id: "local".to_owned(),
@@ -951,8 +1285,11 @@ mod tests {
                     version: "0.1.0".to_owned(),
                     source: None,
                     checksum: None,
+                    manifest_path: directory.path().join("local/Cargo.toml"),
                 },
             ],
+            workspace_root: directory.path().to_path_buf(),
+            workspace_members: vec!["root".to_owned()],
             resolve: MetadataResolve {
                 root: Some("root".to_owned()),
                 nodes: vec![
@@ -973,7 +1310,7 @@ mod tests {
                 ],
             },
         };
-        assert!(active_cargo_closure(&metadata, "root").is_err());
+        assert!(active_cargo_closure(&metadata, "root", &workspace).is_err());
     }
 
     #[test]
@@ -992,7 +1329,10 @@ mod tests {
                 version: "1.0.0".to_owned(),
                 source: Some(REGISTRY.to_owned()),
                 checksum: None,
+                manifest_path: PathBuf::from("/cargo/serde/Cargo.toml"),
             }],
+            workspace_root: PathBuf::from("/workspace"),
+            workspace_members: vec![],
             resolve: MetadataResolve {
                 root: None,
                 nodes: vec![],

@@ -17,11 +17,13 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 pub const MAX_CANONICAL_ITEMS: usize = 200_000;
 pub const MAX_CANONICAL_TEXT_BYTES: usize = 64 * 1024;
+pub const MAX_CANONICAL_TREE_BYTES: usize = 256 * 1024 * 1024;
 const JOINED_PATH_OPTION_PREFIXES: [&str; 14] = [
     "-I",
     "-L",
@@ -109,11 +111,13 @@ pub fn canonical_tree_digest(entries: &[TreeEntry]) -> Result<[u8; 32], String> 
             "canonical tree exceeds {MAX_CANONICAL_ITEMS} entries"
         ));
     }
+    let mut budget = TreeByteBudget::default();
     let mut prior = None;
     let mut encoder = CanonicalEncoder::default();
     encoder.domain("mlxcel.canonical-tree.v1");
     encoder.u64(entries.len() as u64);
     for entry in entries {
+        budget.add(entry.bytes.len())?;
         validate_relative_label(&entry.path)?;
         if prior.is_some_and(|value: &str| value >= entry.path.as_str()) {
             return Err("canonical tree entries are not strictly path-sorted".to_owned());
@@ -134,6 +138,7 @@ pub fn directory_tree_entries(root: &Path) -> Result<Vec<TreeEntry>, String> {
         .map_err(|err| format!("cannot canonicalize {}: {err}", root.display()))?;
     let mut pending = vec![root.clone()];
     let mut entries = Vec::new();
+    let mut budget = TreeByteBudget::default();
     while let Some(directory) = pending.pop() {
         let children = fs::read_dir(&directory)
             .map_err(|err| format!("cannot enumerate {}: {err}", directory.display()))?;
@@ -160,12 +165,13 @@ pub fn directory_tree_entries(root: &Path) -> Result<Vec<TreeEntry>, String> {
             let (mode, bytes) = if metadata.file_type().is_symlink() {
                 let target = fs::read_link(&path)
                     .map_err(|err| format!("cannot read symlink {}: {err}", path.display()))?;
-                (0o120000, strict_path_text(&target)?.into_bytes())
+                let bytes = strict_path_text(&target)?.into_bytes();
+                budget.add(bytes.len())?;
+                (0o120000, bytes)
             } else {
                 (
                     filesystem_mode(&metadata),
-                    fs::read(&path)
-                        .map_err(|err| format!("cannot read {}: {err}", path.display()))?,
+                    bounded_file(&path, &mut budget)?,
                 )
             };
             entries.push(TreeEntry {
@@ -189,18 +195,21 @@ pub fn directory_tree_digest(root: &Path) -> Result<[u8; 32], String> {
 }
 
 pub fn git_candidate_tree_digest(root: &Path) -> Result<[u8; 32], String> {
-    let mut entries = git_head_entries(root)?;
+    let mut budget = TreeByteBudget::default();
+    let mut entries = git_head_entries(root, &mut budget)?;
     let skip = git_skip_worktree_paths(root)?;
     for entry in entries.values_mut() {
         let absolute = root.join(&entry.path);
         match fs::symlink_metadata(&absolute) {
             Ok(metadata) => {
-                let (mode, bytes) = candidate_file(&absolute, &metadata, entry.mode)?;
+                budget.remove(entry.bytes.len())?;
+                let (mode, bytes) = candidate_file(&absolute, &metadata, entry.mode, &mut budget)?;
                 entry.mode = mode;
                 entry.bytes = bytes;
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 if !skip.contains(&entry.path) {
+                    budget.remove(entry.bytes.len())?;
                     entry.bytes.clear();
                     entry.mode = 0;
                 }
@@ -213,7 +222,7 @@ pub fn git_candidate_tree_digest(root: &Path) -> Result<[u8; 32], String> {
         let absolute = root.join(&relative);
         let metadata = fs::symlink_metadata(&absolute)
             .map_err(|err| format!("cannot inspect {}: {err}", absolute.display()))?;
-        let (mode, bytes) = candidate_file(&absolute, &metadata, 0o100644)?;
+        let (mode, bytes) = candidate_file(&absolute, &metadata, 0o100644, &mut budget)?;
         if entries
             .insert(
                 relative.clone(),
@@ -232,7 +241,12 @@ pub fn git_candidate_tree_digest(root: &Path) -> Result<[u8; 32], String> {
 }
 
 pub fn git_head_tree_digest(root: &Path) -> Result<[u8; 32], String> {
-    canonical_tree_digest(&git_head_entries(root)?.into_values().collect::<Vec<_>>())
+    let mut budget = TreeByteBudget::default();
+    canonical_tree_digest(
+        &git_head_entries(root, &mut budget)?
+            .into_values()
+            .collect::<Vec<_>>(),
+    )
 }
 
 pub fn canonicalize_argument(value: &str, roots: &[PathToken]) -> Result<String, String> {
@@ -354,7 +368,10 @@ pub fn is_full_lower_git_sha(value: &str) -> bool {
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-fn git_head_entries(root: &Path) -> Result<BTreeMap<String, TreeEntry>, String> {
+fn git_head_entries(
+    root: &Path,
+    budget: &mut TreeByteBudget,
+) -> Result<BTreeMap<String, TreeEntry>, String> {
     let output = git_output(root, &["ls-tree", "-r", "-z", "HEAD"])?;
     let mut entries = BTreeMap::new();
     for record in output
@@ -382,7 +399,7 @@ fn git_head_entries(root: &Path) -> Result<BTreeMap<String, TreeEntry>, String> 
             .ok_or_else(|| "tracked Git object is missing".to_owned())?;
         let path = path.replace('\\', "/");
         validate_relative_label(&path)?;
-        let bytes = git_output(root, &["cat-file", "blob", object])?;
+        let bytes = git_blob(root, object, budget)?;
         entries.insert(path.clone(), TreeEntry { path, mode, bytes });
     }
     Ok(entries)
@@ -458,25 +475,93 @@ fn candidate_file(
     path: &Path,
     metadata: &fs::Metadata,
     base_mode: u32,
+    budget: &mut TreeByteBudget,
 ) -> Result<(u32, Vec<u8>), String> {
     if metadata.file_type().is_symlink() {
         let target = fs::read_link(path)
             .map_err(|err| format!("cannot read symlink {}: {err}", path.display()))?;
-        return Ok((0o120000, strict_path_text(&target)?.into_bytes()));
+        let bytes = strict_path_text(&target)?.into_bytes();
+        budget.add(bytes.len())?;
+        return Ok((0o120000, bytes));
     }
     if !metadata.is_file() {
         return Err(format!("candidate entry is not a file: {}", path.display()));
     }
     #[cfg(unix)]
-    let mode = filesystem_mode(metadata);
+    let mode = {
+        let _ = base_mode;
+        filesystem_mode(metadata)
+    };
     #[cfg(not(unix))]
     let mode = if base_mode == 0o100755 {
         0o100755
     } else {
         0o100644
     };
-    let bytes = fs::read(path).map_err(|err| format!("cannot read {}: {err}", path.display()))?;
+    let bytes = bounded_file(path, budget)?;
     Ok((mode, bytes))
+}
+
+#[derive(Default)]
+struct TreeByteBudget {
+    retained: usize,
+}
+
+impl TreeByteBudget {
+    fn add(&mut self, bytes: usize) -> Result<(), String> {
+        self.retained = self
+            .retained
+            .checked_add(bytes)
+            .ok_or_else(|| "canonical tree byte total overflowed".to_owned())?;
+        if self.retained > MAX_CANONICAL_TREE_BYTES {
+            return Err(format!(
+                "canonical tree exceeds {MAX_CANONICAL_TREE_BYTES} content bytes"
+            ));
+        }
+        Ok(())
+    }
+
+    fn remove(&mut self, bytes: usize) -> Result<(), String> {
+        self.retained = self
+            .retained
+            .checked_sub(bytes)
+            .ok_or_else(|| "canonical tree byte accounting underflowed".to_owned())?;
+        Ok(())
+    }
+
+    fn remaining(&self) -> usize {
+        MAX_CANONICAL_TREE_BYTES - self.retained
+    }
+}
+
+fn bounded_file(path: &Path, budget: &mut TreeByteBudget) -> Result<Vec<u8>, String> {
+    let limit = budget
+        .remaining()
+        .checked_add(1)
+        .ok_or_else(|| "canonical tree read bound overflowed".to_owned())?;
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .map_err(|err| format!("cannot open {}: {err}", path.display()))?
+        .take(limit as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
+    budget.add(bytes.len())?;
+    Ok(bytes)
+}
+
+fn git_blob(root: &Path, object: &str, budget: &mut TreeByteBudget) -> Result<Vec<u8>, String> {
+    let size = git_output(root, &["cat-file", "-s", object])?;
+    let size = std::str::from_utf8(&size)
+        .map_err(|_| "Git blob size is not strict UTF-8".to_owned())?
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| "Git blob size is not canonical".to_owned())?;
+    budget.add(size)?;
+    let bytes = git_output(root, &["cat-file", "blob", object])?;
+    if bytes.len() != size {
+        return Err("Git blob size changed while reading canonical tree".to_owned());
+    }
+    Ok(bytes)
 }
 
 fn filesystem_mode(metadata: &fs::Metadata) -> u32 {
@@ -706,6 +791,23 @@ mod tests {
         ] {
             assert_ne!(canonical_tree_digest(&[changed]).unwrap(), digest);
         }
+    }
+
+    #[test]
+    fn canonical_tree_rejects_content_beyond_its_byte_ceiling() {
+        let mut budget = TreeByteBudget {
+            retained: MAX_CANONICAL_TREE_BYTES,
+        };
+        assert!(budget.add(1).is_err());
+    }
+
+    #[test]
+    fn canonical_tree_accepts_its_exact_content_byte_ceiling() {
+        let mut budget = TreeByteBudget {
+            retained: MAX_CANONICAL_TREE_BYTES - 1,
+        };
+        assert!(budget.add(1).is_ok());
+        assert_eq!(budget.retained, MAX_CANONICAL_TREE_BYTES);
     }
 
     #[test]
