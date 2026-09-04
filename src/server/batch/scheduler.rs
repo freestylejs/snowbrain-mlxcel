@@ -3917,6 +3917,9 @@ impl BatchScheduler {
     ) {
         use crate::native_runtime::engine::NativeSchedulerCommand;
         match command {
+            NativeSchedulerCommand::ResolveGenerate { request, reply } => {
+                let _ = reply.send(self.resolve_native_generate_request(&request));
+            }
             NativeSchedulerCommand::StartGenerate {
                 reservation_id,
                 request,
@@ -4019,6 +4022,55 @@ impl BatchScheduler {
         }
     }
 
+    fn resolve_native_generate_request(
+        &self,
+        request: &crate::native_runtime::NativeGenerateRequest,
+    ) -> Result<
+        crate::native_runtime::engine::NativeGenerateResolution,
+        crate::native_runtime::NativeRuntimeError,
+    > {
+        let tokenizer = self.native_tokenizer.as_ref().ok_or_else(|| {
+            crate::native_runtime::NativeRuntimeError::new(
+                crate::native_runtime::NativeRuntimeErrorKind::Infrastructure,
+                "scheduler is not configured as a native worker",
+            )
+        })?;
+        let prompt_token_ids = match &request.prompt {
+            crate::native_runtime::NativePromptInput::TokenIds(ids) => Arc::clone(ids),
+            crate::native_runtime::NativePromptInput::Rendered(prompt) => {
+                tokenizer.resolve_rendered_prompt(prompt)?.into()
+            }
+            crate::native_runtime::NativePromptInput::Prepared(_) => {
+                return Err(crate::native_runtime::NativeRuntimeError::new(
+                    crate::native_runtime::NativeRuntimeErrorKind::UnsupportedCapability,
+                    "owned prepared-prefill conversion is unavailable for this model driver",
+                ));
+            }
+            crate::native_runtime::NativePromptInput::ModelSpecific(_) => {
+                return Err(crate::native_runtime::NativeRuntimeError::new(
+                    crate::native_runtime::NativeRuntimeErrorKind::UnsupportedCapability,
+                    "model-specific prepared input has no safe driver for this worker",
+                ));
+            }
+        };
+        let model_eos = self.model.eos_token_ids();
+        let eos_token_ids = crate::native_runtime::engine::stable_union_token_ids(&[
+            &model_eos,
+            &self.config_eos,
+            &request.eos_token_ids,
+        ])?;
+        let output_suppressed_token_ids =
+            crate::native_runtime::engine::stable_union_token_ids(&[
+                &self.model_output_suppressed,
+                &request.output_suppressed_token_ids,
+            ])?;
+        Ok(crate::native_runtime::engine::NativeGenerateResolution {
+            prompt_token_ids,
+            eos_token_ids: eos_token_ids.into(),
+            output_suppressed_token_ids: output_suppressed_token_ids.into(),
+        })
+    }
+
     fn enqueue_native_request(
         &mut self,
         request: Arc<crate::native_runtime::NativeGenerateRequest>,
@@ -4042,6 +4094,12 @@ impl BatchScheduler {
         }
         let prompt_tokens = match &request.prompt {
             crate::native_runtime::NativePromptInput::TokenIds(ids) => ids.to_vec(),
+            crate::native_runtime::NativePromptInput::Rendered(_) => {
+                return Err(crate::native_runtime::NativeRuntimeError::new(
+                    crate::native_runtime::NativeRuntimeErrorKind::InvalidRequest,
+                    "rendered prompt was not resolved before generation start",
+                ));
+            }
             crate::native_runtime::NativePromptInput::Prepared(_) => {
                 return Err(crate::native_runtime::NativeRuntimeError::new(
                     crate::native_runtime::NativeRuntimeErrorKind::UnsupportedCapability,
@@ -4072,17 +4130,7 @@ impl BatchScheduler {
                 error.to_string(),
             )
         })?;
-        let mut sampling = mlxcel_core::generate::SamplingConfig::default();
-        sampling.temperature = request.sampling.temperature;
-        sampling.top_p = request.sampling.top_p;
-        sampling.top_k = request.sampling.top_k.map_or(0, |value| value as i32);
-        sampling.min_p = request.sampling.min_p;
-        sampling.repetition_penalty = request.sampling.repetition_penalty;
-        sampling.seed = Some(request.sampling.seed);
-        sampling.stop_token_ids = request.eos_token_ids.to_vec();
-        sampling
-            .token_bias
-            .suppress_tokens(&request.output_suppressed_token_ids);
+        let sampling = native_sampling_config(&request);
         let identity = crate::native_runtime::NativeSequenceIdentity {
             request_id: request.request_id,
             sequence_id: seq_id.as_u64(),
@@ -9316,6 +9364,23 @@ impl BatchScheduler {
         self.prompt_cache_seq_ctx.remove(&seq.seq_id);
         self.release_sequence_caches(seq.seq_id);
     }
+}
+
+fn native_sampling_config(
+    request: &crate::native_runtime::NativeGenerateRequest,
+) -> mlxcel_core::generate::SamplingConfig {
+    let mut sampling = mlxcel_core::generate::SamplingConfig::default();
+    sampling.temperature = request.sampling.temperature;
+    sampling.top_p = request.sampling.top_p;
+    sampling.top_k = request.sampling.top_k.map_or(0, |value| value as i32);
+    sampling.min_p = request.sampling.min_p;
+    sampling.repetition_penalty = request.sampling.repetition_penalty;
+    sampling.seed = Some(request.sampling.seed);
+    sampling.stop_token_ids = request.eos_token_ids.to_vec();
+    sampling
+        .token_bias
+        .suppress_tokens(&request.output_suppressed_token_ids);
+    sampling
 }
 
 #[cfg(test)]

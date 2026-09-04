@@ -26,12 +26,18 @@ pub(crate) mod memory;
 mod model_report;
 mod operation_driver;
 mod profile;
+mod prompt_json;
+mod prompt_renderer;
 mod request;
 pub(crate) mod sequence;
 mod sink;
 mod speculation;
 
 pub(crate) use model_report::{NativeBoundTokenizer, bind_server_tokenizer};
+pub(crate) use prompt_json::{
+    SERVER_PROMPT_JSON_MAX_OUTPUT_BYTES, python_tojson_bounded, python_tojson_for_server,
+};
+pub(crate) use prompt_renderer::configure_neutral_prompt_environment;
 pub(crate) use request::NativeReservationRelease;
 pub(crate) use sequence::PhysicalSequence;
 
@@ -60,6 +66,14 @@ pub use profile::{
     NativePostLinkAttestation, NativePostLinkRecord, NativePreparedMultimodalClass,
     NativeResolvedCargoPackage, NativeSchedulerTopology, NativeSelfBuildPackage,
     NativeSequenceStateTopology, NativeWorkerConfig, NativeWorkerHealth, NativeWorkerPolicy,
+};
+pub use prompt_renderer::{
+    MAX_NATIVE_PROMPT_CONTEXT_BYTES, MAX_NATIVE_PROMPT_CONTEXT_DEPTH,
+    MAX_NATIVE_PROMPT_CONTEXT_NODES, MAX_NATIVE_PROMPT_RENDER_FUEL,
+    MAX_NATIVE_PROMPT_TEMPLATE_BYTES, MAX_NATIVE_RENDERED_PROMPT_BYTES,
+    NATIVE_PROMPT_RENDERER_SCHEMA, NativePromptRenderer, NativePromptRendererBinding,
+    NativePromptRendererKind, NativePromptRendererLimits, NativePromptRendererSpec,
+    NativeRenderedPrompt, NativeTemplateValue,
 };
 pub use request::{
     MAX_NATIVE_CONSTRAINT_BYTES, MAX_NATIVE_EMBED_AGGREGATE_BYTES,

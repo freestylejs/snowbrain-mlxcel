@@ -1253,11 +1253,59 @@ pub struct NativeModelReport {
 pub(crate) struct NativeBoundTokenizer {
     tokenizer: Arc<crate::tokenizer::MlxcelTokenizer>,
     guarantee: IncrementalDecodeGuarantee,
+    package_identity: [u8; 32],
+    report_identity: [u8; 32],
+    tokenizer_identity: [u8; 32],
 }
 
 impl NativeBoundTokenizer {
     pub(crate) const fn guarantee(&self) -> IncrementalDecodeGuarantee {
         self.guarantee
+    }
+
+    pub(crate) const fn package_identity(&self) -> [u8; 32] {
+        self.package_identity
+    }
+
+    pub(crate) const fn report_identity(&self) -> [u8; 32] {
+        self.report_identity
+    }
+
+    pub(crate) const fn tokenizer_identity(&self) -> [u8; 32] {
+        self.tokenizer_identity
+    }
+
+    pub(crate) fn resolve_rendered_prompt(
+        &self,
+        prompt: &super::NativeRenderedPrompt,
+    ) -> Result<Vec<i32>, NativeRuntimeError> {
+        if self.package_identity != prompt.package_identity()
+            || self.report_identity != prompt.report_identity()
+            || self.tokenizer_identity != prompt.tokenizer_identity()
+        {
+            return Err(NativeRuntimeError::new(
+                NativeRuntimeErrorKind::InvalidRequest,
+                "rendered prompt binding disagrees with the worker tokenizer",
+            ));
+        }
+        self.tokenizer
+            .encode(prompt.rendered_utf8(), prompt.add_special_tokens())
+            .map_err(|error| {
+                NativeRuntimeError::new(
+                    NativeRuntimeErrorKind::Tokenizer,
+                    format!("rendered prompt tokenization failed: {error}"),
+                )
+            })?
+            .into_iter()
+            .map(|id| {
+                i32::try_from(id).map_err(|_| {
+                    NativeRuntimeError::new(
+                        NativeRuntimeErrorKind::Tokenizer,
+                        "rendered prompt tokenizer produced an ID outside i32",
+                    )
+                })
+            })
+            .collect()
     }
 
     pub(crate) fn into_parts(
@@ -1286,6 +1334,9 @@ pub(crate) fn bind_server_tokenizer(
     Ok(NativeBoundTokenizer {
         tokenizer: Arc::new(tokenizer),
         guarantee,
+        package_identity: [0; 32],
+        report_identity: [0; 32],
+        tokenizer_identity: [0; 32],
     })
 }
 
@@ -1387,6 +1438,34 @@ impl NativeModelReport {
 }
 
 impl NativeImmutablePackage {
+    pub(crate) fn bind_prompt_tokenizer(
+        &self,
+        report: &NativeModelReport,
+    ) -> Result<NativeBoundTokenizer, NativeRuntimeError> {
+        if self.identity() != report.package_identity()
+            || report.report_identity() != model_report_identity(report)
+        {
+            return Err(NativeRuntimeError::new(
+                NativeRuntimeErrorKind::InvalidRequest,
+                "prompt tokenizer binding disagrees with its immutable package report",
+            ));
+        }
+        let primary = declared_tokenizer_primary(self)?.ok_or_else(|| {
+            NativeRuntimeError::new(
+                NativeRuntimeErrorKind::UnsupportedGuarantee,
+                "prompt package has no declared tokenizer authority",
+            )
+        })?;
+        let tokenizer = Arc::new(load_declared_tokenizer(self, &primary)?);
+        Ok(NativeBoundTokenizer {
+            tokenizer,
+            guarantee: report.tokenizer().incremental_decode(),
+            package_identity: self.identity(),
+            report_identity: report.report_identity(),
+            tokenizer_identity: report.tokenizer().identity(),
+        })
+    }
+
     pub(crate) fn bind_worker_tokenizer(
         &self,
         report: &NativeModelReport,
@@ -1424,6 +1503,9 @@ impl NativeImmutablePackage {
         Ok(NativeBoundTokenizer {
             tokenizer,
             guarantee: report.tokenizer().incremental_decode(),
+            package_identity: self.identity(),
+            report_identity: report.report_identity(),
+            tokenizer_identity: report.tokenizer().identity(),
         })
     }
 }
@@ -1685,6 +1767,17 @@ pub(crate) fn inspect_package(
     };
     report.report_identity = model_report_identity(&report);
     Ok(report)
+}
+
+#[cfg(test)]
+pub(crate) fn qualify_generation_report_for_orchestration_tests(
+    mut report: NativeModelReport,
+) -> NativeModelReport {
+    report.architecture_supported = true;
+    report.model_capabilities.generation = true;
+    report.managed_capabilities.generation = true;
+    report.report_identity = model_report_identity(&report);
+    report
 }
 
 fn classify_model_type(model_type: crate::models::ModelType) -> MlxNativeOperationClass {

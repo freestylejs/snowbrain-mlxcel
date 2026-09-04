@@ -191,6 +191,17 @@ impl NativeRuntimeBuilder {
         inspect_package(package)
     }
 
+    /// Bind the only public prompt-renderer construction path to an exact
+    /// immutable package inspection and its verified tokenizer artifacts.
+    pub fn bind_prompt_renderer(
+        &self,
+        package: &NativeImmutablePackage,
+        report: &NativeModelReport,
+        spec: super::NativePromptRendererSpec,
+    ) -> Result<super::NativePromptRenderer, NativeRuntimeError> {
+        super::NativePromptRenderer::bind(package, report, spec)
+    }
+
     pub fn start_worker(
         &self,
         request: NativeWorkerStartRequest,

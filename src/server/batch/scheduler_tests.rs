@@ -2012,3 +2012,46 @@ fn server_native_prestart_drop_releases_the_started_waiter() {
         crate::native_runtime::NativeRuntimeErrorKind::InvalidRequest
     );
 }
+
+#[test]
+fn native_sampling_uses_the_frozen_worker_token_policy() {
+    let request = crate::native_runtime::NativeGenerateRequest {
+        request_id: 7,
+        prompt: crate::native_runtime::NativePromptInput::TokenIds(Arc::from([1])),
+        sampling: crate::native_runtime::NativeSamplingConfig {
+            temperature: 0.25,
+            top_p: 0.75,
+            top_k: Some(12),
+            min_p: 0.05,
+            repetition_penalty: 1.1,
+            seed: 19,
+        },
+        limits: crate::native_runtime::NativeGenerationLimits {
+            max_new_tokens: 1,
+            max_total_tokens: 2,
+        },
+        eos_token_ids: Arc::from([2, 3, 5]),
+        output_suppressed_token_ids: Arc::from([11, 13]),
+        scheduling: crate::native_runtime::NativeSchedulingHints::default(),
+        cache: crate::native_runtime::NativeCacheContext {
+            namespace: Arc::from("test"),
+            input_identity: [1; 32],
+            allow_read: false,
+            allow_write: false,
+        },
+        constraint: crate::native_runtime::NativeConstraintPlan::None,
+        speculation: crate::native_runtime::NativeSpeculationPolicy {
+            preference: crate::native_runtime::NativeSpeculationPreference::Disabled,
+            minimum_fidelity:
+                crate::native_runtime::NativeSpeculativeFidelity::ExactTargetDistribution,
+            allow_ordinary_fallback: true,
+        },
+    };
+
+    let sampling = super::native_sampling_config(&request);
+    assert_eq!(sampling.stop_token_ids, vec![2, 3, 5]);
+    for id in [11, 13] {
+        assert_eq!(sampling.token_bias.get(&id), Some(&f32::NEG_INFINITY));
+    }
+    assert_eq!(sampling.seed, Some(19));
+}

@@ -128,6 +128,10 @@ fn project_reclaim_result(
 }
 
 pub(crate) enum NativeSchedulerCommand {
+    ResolveGenerate {
+        request: Arc<NativeGenerateRequest>,
+        reply: mpsc::SyncSender<Result<NativeGenerateResolution, NativeRuntimeError>>,
+    },
     StartGenerate {
         reservation_id: u128,
         request: Arc<NativeGenerateRequest>,
@@ -145,6 +149,12 @@ pub(crate) enum NativeSchedulerCommand {
     },
     MemorySnapshot(mpsc::SyncSender<NativeMemorySnapshot>),
     Reclaim(NativeReclaimRequest, mpsc::SyncSender<NativeReclaimResult>),
+}
+
+pub(crate) struct NativeGenerateResolution {
+    pub prompt_token_ids: Arc<[i32]>,
+    pub eos_token_ids: Arc<[i32]>,
+    pub output_suppressed_token_ids: Arc<[i32]>,
 }
 
 pub(crate) struct MlxcelServerEngineStartRequest {
@@ -1357,6 +1367,7 @@ fn validate_generate_driver_input(
 ) -> Result<(), NativeRuntimeError> {
     match prompt {
         super::NativePromptInput::TokenIds(_) => Ok(()),
+        super::NativePromptInput::Rendered(_) => Ok(()),
         super::NativePromptInput::Prepared(_) => Err(NativeRuntimeError::new(
             NativeRuntimeErrorKind::UnsupportedCapability,
             "owned prepared-prefill requires a prepared-media worker profile",
@@ -1377,6 +1388,33 @@ fn validate_cache_driver(context: &super::NativeCacheContext) -> Result<(), Nati
     } else {
         Ok(())
     }
+}
+
+pub(crate) fn stable_union_token_ids(inputs: &[&[i32]]) -> Result<Vec<i32>, NativeRuntimeError> {
+    let capacity = inputs
+        .iter()
+        .fold(0usize, |total, input| total.saturating_add(input.len()))
+        .min(super::MAX_NATIVE_STOP_TOKEN_IDS);
+    let mut seen = HashSet::with_capacity(capacity);
+    let mut output = Vec::with_capacity(capacity);
+    for id in inputs.iter().flat_map(|input| input.iter().copied()) {
+        if id < 0 {
+            return Err(NativeRuntimeError::new(
+                NativeRuntimeErrorKind::Tokenizer,
+                "worker token policy contains a negative token ID",
+            ));
+        }
+        if seen.insert(id) {
+            if output.len() == super::MAX_NATIVE_STOP_TOKEN_IDS {
+                return Err(NativeRuntimeError::new(
+                    NativeRuntimeErrorKind::ResourceLimit,
+                    "worker token policy union exceeds the native bound",
+                ));
+            }
+            output.push(id);
+        }
+    }
+    Ok(output)
 }
 
 fn thread_start_error(error: std::io::Error) -> NativeRuntimeError {
@@ -1886,15 +1924,40 @@ impl NativeManagedEngine for NativeManagedEngineClient {
             ));
         }
         let policy = self.profile.policy();
-        if request.logical_prompt_tokens() > policy.max_prompt_tokens as usize
-            || request.limits.max_new_tokens > policy.max_generation_tokens
-        {
+        if request.limits.max_new_tokens > policy.max_generation_tokens {
             return Err(NativeRuntimeError::new(
                 NativeRuntimeErrorKind::ResourceLimit,
                 "generation request exceeds the resident worker profile",
             ));
         }
-        let validated = request.validated()?;
+        request.validate()?;
+        let NativeEngineChannel::Generate(tx) = &self.channel else {
+            return Err(NativeRuntimeError::new(
+                NativeRuntimeErrorKind::Infrastructure,
+                "generation worker channel is unavailable",
+            ));
+        };
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        tx.send(ModelRequest::Native(
+            NativeSchedulerCommand::ResolveGenerate {
+                request: Arc::new(request.shallow_clone()),
+                reply: reply_tx,
+            },
+        ))
+        .map_err(|_| self.note_worker_gone())?;
+        let resolution = reply_rx.recv().map_err(|_| self.note_worker_gone())??;
+        request.validate_resolved_prompt_tokens(resolution.prompt_token_ids.len())?;
+        if resolution.prompt_token_ids.len() > policy.max_prompt_tokens as usize {
+            return Err(NativeRuntimeError::new(
+                NativeRuntimeErrorKind::ResourceLimit,
+                "resolved prompt exceeds the resident worker profile",
+            ));
+        }
+        let validated = request.validated_resolved(
+            resolution.prompt_token_ids,
+            resolution.eos_token_ids,
+            resolution.output_suppressed_token_ids,
+        )?;
         let (reservation_id, release) = self
             .reservations
             .reserve(request.request_id, self.capacity)?;
@@ -2063,6 +2126,181 @@ impl NativeClientMustBeSend for NativeManagedEngineClient {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn admission_test_fixture(request_id: u128) -> (NativeWorkerConfig, NativeGenerateRequest) {
+        use std::collections::BTreeMap;
+        use std::io::Cursor;
+
+        use sha2::{Digest, Sha256};
+
+        struct Source(BTreeMap<String, Vec<u8>>);
+        impl super::super::NativePackageArtifactSource for Source {
+            fn open_artifact(
+                &mut self,
+                label: &str,
+            ) -> Result<Box<dyn std::io::Read + Send>, NativeRuntimeError> {
+                Ok(Box::new(Cursor::new(
+                    self.0.get(label).expect("declared component").clone(),
+                )))
+            }
+        }
+
+        let config = br#"{"model_type":"llama","max_position_embeddings":8}"#.to_vec();
+        let crate::tokenizer::MlxcelTokenizer::HuggingFace(tokenizer) =
+            crate::tokenizer::MlxcelTokenizer::stub_gemma_sequence_byte_fallback()
+        else {
+            unreachable!()
+        };
+        let tokenizer = tokenizer.to_string(false).unwrap().into_bytes();
+        let tokenizer_config = b"{}".to_vec();
+        let bytes = BTreeMap::from([
+            ("config.json".to_string(), config),
+            ("tokenizer.json".to_string(), tokenizer),
+            ("tokenizer_config.json".to_string(), tokenizer_config),
+        ]);
+        let declarations = bytes
+            .iter()
+            .map(|(label, bytes)| {
+                super::super::NativePackageComponent::new(
+                    label,
+                    bytes.len() as u64,
+                    Sha256::digest(bytes).into(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let tokenizer_config_component = declarations
+            .iter()
+            .find(|component| component.label() == "tokenizer_config.json")
+            .unwrap()
+            .clone();
+        let package = super::super::NativeImmutablePackage::acquire(
+            &mut Source(bytes),
+            declarations,
+            super::super::NativePackageLimits::default(),
+        )
+        .unwrap();
+        let report = super::super::model_report::qualify_generation_report_for_orchestration_tests(
+            super::super::model_report::inspect_package(&package).unwrap(),
+        );
+        let profile = NativeWorkerConfig::try_from_report(
+            &report,
+            super::super::NativeWorkerPolicy {
+                operation_driver: NativeOperationDriver::AutoregressiveGenerate,
+                scheduler_topology: super::super::NativeSchedulerTopology::SingleSequence,
+                sequence_state_topology: super::super::NativeSequenceStateTopology::Independent,
+                context: super::super::NativeContextPolicy {
+                    max_context_tokens: 8,
+                    max_position: 8,
+                },
+                batch: super::super::NativeBatchPolicy {
+                    max_active_sequences: 1,
+                    max_queued_operations: 1,
+                    max_batch_tokens: 8,
+                    prefill_chunk_tokens: 1,
+                },
+                cache: super::super::NativeCachePolicy {
+                    topology: super::super::NativeCacheTopology::Dense,
+                    max_resident_bytes: 1,
+                    prefix_reuse: false,
+                },
+                device: super::super::NativeDevicePolicy {
+                    class: super::super::NativeDeviceClass::Cpu,
+                    offload: super::super::NativeOffloadPolicy::HostVisible,
+                    max_device_bytes: 1,
+                },
+                model_owned_state: super::super::NativeModelOwnedStateMode::Disabled,
+                adapter: None,
+                drafter: super::super::NativeDrafterTopology::Disabled,
+                prepared_multimodal: super::super::NativePreparedMultimodalClass::Disabled,
+                max_prompt_tokens: 4,
+                max_generation_tokens: 4,
+                max_embedding_inputs: 1,
+                max_embedding_dimensions: 1,
+                max_accepted_chunk_units: super::super::MAX_NATIVE_ACCEPTED_UNITS as u32,
+                max_constraint_bytes: 1,
+            },
+        )
+        .unwrap();
+        let renderer = super::super::NativePromptRenderer::bind(
+            &package,
+            &report,
+            super::super::NativePromptRendererSpec {
+                kind: super::super::NativePromptRendererKind::LiteralUtf8,
+                template_component: None,
+                tokenizer_config_component,
+                limits: super::super::NativePromptRendererLimits::default(),
+                add_special_tokens: false,
+            },
+        )
+        .unwrap();
+        let prompt = renderer
+            .render(&super::super::NativeTemplateValue::string("ok"))
+            .unwrap();
+        let request = NativeGenerateRequest {
+            request_id,
+            prompt: super::super::NativePromptInput::Rendered(prompt),
+            sampling: super::super::NativeSamplingConfig {
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                min_p: 0.0,
+                repetition_penalty: 1.0,
+                seed: 7,
+            },
+            limits: super::super::NativeGenerationLimits {
+                max_new_tokens: 1,
+                max_total_tokens: 3,
+            },
+            eos_token_ids: Arc::from([7]),
+            output_suppressed_token_ids: Arc::from([17]),
+            scheduling: super::super::NativeSchedulingHints::default(),
+            cache: super::super::NativeCacheContext {
+                namespace: Arc::from("test"),
+                input_identity: [9; 32],
+                allow_read: false,
+                allow_write: false,
+            },
+            constraint: super::super::NativeConstraintPlan::None,
+            speculation: super::super::NativeSpeculationPolicy {
+                preference: super::super::NativeSpeculationPreference::Disabled,
+                minimum_fidelity: super::super::NativeSpeculativeFidelity::ExactTargetDistribution,
+                allow_ordinary_fallback: true,
+            },
+        };
+        (profile, request)
+    }
+
+    fn admission_test_client(
+        profile: NativeWorkerConfig,
+    ) -> (
+        NativeManagedEngineClient,
+        mpsc::Receiver<ModelRequest>,
+        Arc<ReservationBook>,
+    ) {
+        let (tx, rx) = mpsc::channel();
+        let reservations = Arc::new(ReservationBook::default());
+        let descriptor = NativeEngineDescriptor {
+            worker_id: 1,
+            worker_epoch: 2,
+            build_identity: [3; 32],
+            package_identity: profile.package_identity(),
+            profile_identity: profile.identity().unwrap(),
+            health: NativeWorkerHealth::Ready,
+        };
+        (
+            NativeManagedEngineClient {
+                descriptor,
+                profile,
+                capacity: 2,
+                channel: NativeEngineChannel::Generate(tx),
+                reservations: Arc::clone(&reservations),
+                alive: Arc::new(AtomicBool::new(true)),
+            },
+            rx,
+            reservations,
+        )
+    }
 
     #[test]
     fn normal_server_generation_does_not_gate_managed_path_on_tokenizer_inspection() {
@@ -2495,6 +2733,194 @@ mod tests {
                 .kind(),
             NativeRuntimeErrorKind::UnsupportedCapability
         );
+    }
+
+    #[test]
+    fn worker_token_policy_union_is_stable_and_deduplicated() {
+        assert_eq!(
+            stable_union_token_ids(&[&[5, 3, 5][..], &[3, 7][..], &[9, 5, 7, 11][..],])
+                .expect("bounded non-negative union"),
+            vec![5, 3, 7, 9, 11]
+        );
+    }
+
+    #[test]
+    fn worker_token_policy_union_rejects_before_overallocation() {
+        assert_eq!(
+            stable_union_token_ids(&[&[-1]]).unwrap_err().kind(),
+            NativeRuntimeErrorKind::Tokenizer
+        );
+        let over = (0..=super::super::MAX_NATIVE_STOP_TOKEN_IDS as i32).collect::<Vec<_>>();
+        assert_eq!(
+            stable_union_token_ids(&[&over]).unwrap_err().kind(),
+            NativeRuntimeErrorKind::ResourceLimit
+        );
+    }
+
+    #[test]
+    fn rendered_realization_precedes_reservation_in_public_admission() {
+        let source = include_str!("engine.rs");
+        let body = source
+            .split_once("fn admit_generate(")
+            .expect("managed admission")
+            .1
+            .split_once("fn start_generate(")
+            .expect("managed admission end")
+            .0;
+        let resolve = body
+            .find("NativeSchedulerCommand::ResolveGenerate")
+            .expect("worker-owned prompt realization command");
+        let reserve = body
+            .find(".reservations\n            .reserve")
+            .expect("reservation creation");
+        assert!(resolve < reserve);
+    }
+
+    struct CountingGenerateSink {
+        started: Arc<std::sync::atomic::AtomicUsize>,
+        terminal: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl super::super::NativeGenerateSink for CountingGenerateSink {
+        fn started(
+            &mut self,
+            _sequence: super::super::NativeSequenceIdentity,
+        ) -> Result<(), NativeRuntimeError> {
+            self.started.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn accepted(
+            &mut self,
+            _chunk: super::super::NativeAcceptedChunk,
+        ) -> super::super::NativeContinuationDirective {
+            super::super::NativeContinuationDirective::Stop { consumed_units: 0 }
+        }
+
+        fn physical(&mut self, _event: super::super::NativePhysicalEvent) {}
+
+        fn terminal(&mut self, _terminal: super::super::NativePhysicalTerminal) {
+            self.terminal.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn realization_failure_has_no_reservation_start_or_sink_callback() {
+        let (profile, request) = admission_test_fixture(41);
+        let (mut client, commands, reservations) = admission_test_client(profile);
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker_starts = Arc::clone(&starts);
+        let worker = std::thread::spawn(move || {
+            let ModelRequest::Native(NativeSchedulerCommand::ResolveGenerate { reply, .. }) =
+                commands.recv().expect("realization command")
+            else {
+                panic!("reservation/start preceded realization");
+            };
+            reply
+                .send(Err(NativeRuntimeError::new(
+                    NativeRuntimeErrorKind::Tokenizer,
+                    "synthetic realization failure",
+                )))
+                .unwrap();
+            if matches!(
+                commands.recv_timeout(Duration::from_millis(50)),
+                Ok(ModelRequest::Native(
+                    NativeSchedulerCommand::StartGenerate { .. }
+                ))
+            ) {
+                worker_starts.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        let error = match client.admit_generate(&request) {
+            Err(error) => error,
+            Ok(_) => panic!("realization failure unexpectedly reserved"),
+        };
+        assert_eq!(error.kind(), NativeRuntimeErrorKind::Tokenizer);
+        worker.join().unwrap();
+        assert_eq!(starts.load(Ordering::Relaxed), 0);
+        assert!(reservations.inner.lock().unwrap().reservations.is_empty());
+        assert_eq!(reservations.release_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn successful_realization_freezes_tokens_then_reserves_and_starts_once() {
+        let (profile, request) = admission_test_fixture(42);
+        let (mut client, commands, reservations) = admission_test_client(profile);
+        let realizations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink_started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink_terminal = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker_realizations = Arc::clone(&realizations);
+        let worker_starts = Arc::clone(&starts);
+        let worker = std::thread::spawn(move || {
+            let ModelRequest::Native(NativeSchedulerCommand::ResolveGenerate { reply, .. }) =
+                commands.recv().expect("realization command")
+            else {
+                panic!("start preceded realization");
+            };
+            worker_realizations.fetch_add(1, Ordering::Relaxed);
+            reply
+                .send(Ok(NativeGenerateResolution {
+                    prompt_token_ids: Arc::from([21, 22]),
+                    eos_token_ids: Arc::from([5, 7]),
+                    output_suppressed_token_ids: Arc::from([11, 17]),
+                }))
+                .unwrap();
+            let ModelRequest::Native(NativeSchedulerCommand::StartGenerate {
+                reservation_id,
+                request,
+                mut sink,
+                release,
+                started,
+                ..
+            }) = commands.recv().expect("start command")
+            else {
+                panic!("unexpected command after realization");
+            };
+            worker_starts.fetch_add(1, Ordering::Relaxed);
+            assert!(matches!(
+                &request.prompt,
+                super::super::NativePromptInput::TokenIds(ids) if ids.as_ref() == [21, 22]
+            ));
+            assert_eq!(request.eos_token_ids.as_ref(), [5, 7]);
+            assert_eq!(request.output_suppressed_token_ids.as_ref(), [11, 17]);
+            sink.started(super::super::NativeSequenceIdentity {
+                request_id: request.request_id,
+                sequence_id: 1,
+                worker_epoch: 2,
+            })
+            .unwrap();
+            started.send(Ok(())).unwrap();
+            sink.terminal(super::super::NativePhysicalTerminal::Completed {
+                reason: super::super::NativeStopReason::Requested,
+            });
+            release.release(reservation_id);
+        });
+
+        let admission = client.admit_generate(&request).unwrap();
+        assert_eq!(realizations.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            admission.request().logical_prompt_tokens(),
+            Some(2),
+            "admission must freeze realized TokenIds"
+        );
+        client
+            .start_generate(
+                admission,
+                Box::new(CountingGenerateSink {
+                    started: Arc::clone(&sink_started),
+                    terminal: Arc::clone(&sink_terminal),
+                }),
+            )
+            .unwrap();
+        worker.join().unwrap();
+        assert_eq!(realizations.load(Ordering::Relaxed), 1);
+        assert_eq!(starts.load(Ordering::Relaxed), 1);
+        assert_eq!(sink_started.load(Ordering::Relaxed), 1);
+        assert_eq!(sink_terminal.load(Ordering::Relaxed), 1);
+        assert!(reservations.inner.lock().unwrap().reservations.is_empty());
+        assert_eq!(reservations.release_calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]

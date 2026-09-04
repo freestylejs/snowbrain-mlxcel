@@ -156,7 +156,13 @@ impl NativeAcceptedChunk {
                 "accepted output identity disagrees with its request or started sequence",
             ));
         }
-        if self.prefix.adopted_prompt_tokens > request.logical_prompt_tokens() {
+        let prompt_tokens = request.logical_prompt_tokens().ok_or_else(|| {
+            NativeRuntimeError::new(
+                NativeRuntimeErrorKind::InvalidOutput,
+                "native output cannot validate against an unresolved rendered prompt",
+            )
+        })?;
+        if self.prefix.adopted_prompt_tokens > prompt_tokens {
             return Err(invalid_output(
                 "adopted prompt tokens exceed the admitted prompt",
             ));

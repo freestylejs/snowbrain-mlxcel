@@ -44,7 +44,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use minijinja::{Environment, ErrorKind, Value};
+use minijinja::{Environment, Value};
 use serde::{Deserialize, Serialize};
 
 use super::chat_template_kwargs::ChatTemplateKwargs;
@@ -1058,42 +1058,15 @@ fn preprocess_python_conditional_expressions(mut out: String) -> String {
 
 /// Configure a minijinja environment with common settings and Python-compat methods.
 fn configure_environment(env: &mut Environment<'_>) {
-    env.set_keep_trailing_newline(true);
-    env.set_trim_blocks(true);
-    env.set_lstrip_blocks(true);
+    crate::native_runtime::configure_neutral_prompt_environment(
+        env,
+        crate::native_runtime::MAX_NATIVE_PROMPT_RENDER_FUEL,
+        crate::native_runtime::SERVER_PROMPT_JSON_MAX_OUTPUT_BYTES,
+        crate::native_runtime::MAX_NATIVE_PROMPT_CONTEXT_NODES,
+    );
 
-    // Bound rendering cost as defense-in-depth against denial-of-service from a
-    // pathological chat template (e.g. deeply nested or effectively unbounded
-    // `{% for %}` loops). `set_fuel` caps the number of VM instructions a single
-    // render may execute; once the budget is exhausted minijinja returns an
-    // `ErrorKind::OutOfFuel` error rather than spinning on CPU/memory. Both
-    // render call sites propagate that error via `Result` (`apply*`), and the
-    // load-time `supports_tools` probe already degrades to a string heuristic on
-    // render failure, so exhaustion never panics on any path.
-    //
-    // Template source is operator-controlled today (the model the operator loads
-    // at startup, or the `--chat-template` flag), so this is a low-severity
-    // preventive control; it becomes materially important in a multi-tenant
-    // deployment where untrusted parties could cause arbitrary models — and thus
-    // arbitrary templates — to be loaded.
-    //
-    // The budget is deliberately generous. Real templates — including tool-rich
-    // Qwen/Nemotron-style templates rendered over long multi-turn histories —
-    // execute well under ~1M instructions (verified against every locally
-    // available model template via `test_all_local_model_templates_render`),
-    // while an unbounded loop blows past 50M almost immediately, bounding a
-    // malicious render to a fraction of a second of CPU instead of forever. Note
-    // that fuel bounds instruction *count*, not output size, so it does not by
-    // itself cap memory from a single very large emit; that is out of scope.
-    env.set_fuel(Some(50_000_000));
-
-    // A template calls `raise_exception` to refuse a caller-supplied value, not
-    // because mlxcel failed to render it. Attach a `TemplateRejection` sentinel
-    // as the error's source so `template_rejection_message` can recognise that
-    // intent at the type level; without it the only signals are
-    // `ErrorKind::InvalidOperation` (which minijinja also raises for genuine
-    // engine problems) and the message text (which the template author writes).
-    // The `minijinja::Error` keeps the full untruncated message for the log.
+    // These helpers encode server policy. The neutral renderer deliberately
+    // excludes both template-authored request rejection and wall-clock access.
     env.add_function(
         "raise_exception",
         |msg: String| -> std::result::Result<Value, minijinja::Error> {
@@ -1104,305 +1077,8 @@ fn configure_environment(env: &mut Environment<'_>) {
             )
         },
     );
-
     env.add_function("strftime_now", |_format: String| -> String {
         chrono::Utc::now().format("%d %b %Y").to_string()
-    });
-
-    // Shadow minijinja's builtin `tojson` with a CPython `json.dumps` compatible
-    // one. Published chat templates are written against `transformers`, where
-    // `tojson` IS `json.dumps`, so they call it with `json.dumps` keyword
-    // arguments (`ensure_ascii`, `sort_keys`, `separators`) that the builtin
-    // rejects outright, and they expect `json.dumps` spacing (`{"a": 1}`) where
-    // the builtin emits serde_json's compact form (`{"a":1}`). The first failure
-    // mode aborts the render and degrades the request to the generic
-    // `User:/Assistant:` prompt; the second is silent and only shows up as
-    // different token ids than the provider's own tokenization. See
-    // [`super::chat_template_json`] for the exact semantics implemented.
-    env.add_filter("tojson", super::chat_template_json::python_tojson);
-
-    // Handle Python methods not natively supported by minijinja.
-    //
-    // Many HuggingFace chat templates use Python-style string and dict
-    // methods (`.split()`, `.strip()`, `.startswith()`, `.get()`, `.items()`
-    // …) that are standard in Python/Jinja2 but not built into minijinja's
-    // value types. Without these shims, rendering silently falls back to
-    // the `to_prompt()` "User: ... Assistant:" format, and the model echoes
-    // those labels instead of producing a real response.
-    //
-    // Scope: cover every method encountered in the chat templates we ship
-    // against (Gemma 4, Qwen 3, GLM 4/5, Jamba, Exaone 4, olmo 3, …).
-    env.set_unknown_method_callback(|_state, value, method, args| {
-        use minijinja::value::ValueKind;
-
-        // --- String methods ---------------------------------------------
-        if value.kind() == ValueKind::String {
-            let s = value.as_str().unwrap_or_default();
-            let arg_str = || args.first().and_then(|a| a.as_str()).unwrap_or_default();
-
-            // `chars` argument for strip/lstrip/rstrip. `None` → whitespace.
-            let strip_chars = args.first().and_then(|a| a.as_str());
-            let strip_matches = |s: &str| -> String {
-                match strip_chars {
-                    None => s.trim().to_string(),
-                    Some(chars) => s.trim_matches(|c: char| chars.contains(c)).to_string(),
-                }
-            };
-            let lstrip_matches = |s: &str| -> String {
-                match strip_chars {
-                    None => s.trim_start().to_string(),
-                    Some(chars) => s
-                        .trim_start_matches(|c: char| chars.contains(c))
-                        .to_string(),
-                }
-            };
-            let rstrip_matches = |s: &str| -> String {
-                match strip_chars {
-                    None => s.trim_end().to_string(),
-                    Some(chars) => s.trim_end_matches(|c: char| chars.contains(c)).to_string(),
-                }
-            };
-
-            match method {
-                "split" => {
-                    let sep = arg_str();
-                    // Python `s.split()` with no arg splits on any whitespace
-                    // and drops empty strings; `s.split(sep)` splits on sep.
-                    let parts: Vec<Value> = if sep.is_empty() {
-                        s.split_whitespace()
-                            .map(|p| Value::from(p.to_string()))
-                            .collect()
-                    } else {
-                        s.split(sep).map(|p| Value::from(p.to_string())).collect()
-                    };
-                    return Ok(Value::from(parts));
-                }
-                "rsplit" => {
-                    let sep = arg_str();
-                    let parts: Vec<Value> = if sep.is_empty() {
-                        s.split_whitespace()
-                            .map(|p| Value::from(p.to_string()))
-                            .collect()
-                    } else {
-                        s.rsplit(sep).map(|p| Value::from(p.to_string())).collect()
-                    };
-                    return Ok(Value::from(parts));
-                }
-                "strip" => return Ok(Value::from(strip_matches(s))),
-                "lstrip" => return Ok(Value::from(lstrip_matches(s))),
-                "rstrip" => return Ok(Value::from(rstrip_matches(s))),
-                "startswith" => {
-                    let prefix = arg_str();
-                    return Ok(Value::from(s.starts_with(prefix)));
-                }
-                "endswith" => {
-                    let suffix = arg_str();
-                    return Ok(Value::from(s.ends_with(suffix)));
-                }
-                "index" | "find" => {
-                    // Python `str.index(sub)` / `str.find(sub)`: return the
-                    // character index of the first occurrence. `index` raises on
-                    // absence; `find` returns -1. Used by the Granite 4 Vision
-                    // template's image-position dispatcher.
-                    let sub = arg_str();
-                    match s.find(sub) {
-                        Some(byte_idx) => {
-                            let char_idx = s[..byte_idx].chars().count() as i64;
-                            return Ok(Value::from(char_idx));
-                        }
-                        None if method == "find" => return Ok(Value::from(-1i64)),
-                        None => {
-                            return Err(minijinja::Error::new(
-                                ErrorKind::InvalidOperation,
-                                "substring not found",
-                            ));
-                        }
-                    }
-                }
-                "replace" => {
-                    let old = args.first().and_then(|a| a.as_str()).unwrap_or_default();
-                    let new = args.get(1).and_then(|a| a.as_str()).unwrap_or_default();
-                    return Ok(Value::from(s.replace(old, new)));
-                }
-                "upper" => return Ok(Value::from(s.to_uppercase())),
-                "lower" => return Ok(Value::from(s.to_lowercase())),
-                "title" => {
-                    // Simple title-case: uppercase first letter of each word.
-                    let mut result = String::with_capacity(s.len());
-                    let mut prev_alphabetic = false;
-                    for ch in s.chars() {
-                        if ch.is_alphabetic() {
-                            if prev_alphabetic {
-                                result.extend(ch.to_lowercase());
-                            } else {
-                                result.extend(ch.to_uppercase());
-                            }
-                            prev_alphabetic = true;
-                        } else {
-                            result.push(ch);
-                            prev_alphabetic = false;
-                        }
-                    }
-                    return Ok(Value::from(result));
-                }
-                "capitalize" => {
-                    // Python `s.capitalize()` — uppercase first char, lowercase the rest.
-                    let mut chars = s.chars();
-                    let result = match chars.next() {
-                        Some(first) => {
-                            let mut out = String::with_capacity(s.len());
-                            out.extend(first.to_uppercase());
-                            out.extend(chars.flat_map(|c| c.to_lowercase()));
-                            out
-                        }
-                        None => String::new(),
-                    };
-                    return Ok(Value::from(result));
-                }
-                "casefold" => {
-                    // Python `s.casefold()` — approximation via lowercase.
-                    return Ok(Value::from(s.to_lowercase()));
-                }
-                "swapcase" => {
-                    let result: String = s
-                        .chars()
-                        .flat_map(|c| {
-                            if c.is_uppercase() {
-                                c.to_lowercase().collect::<Vec<_>>()
-                            } else if c.is_lowercase() {
-                                c.to_uppercase().collect::<Vec<_>>()
-                            } else {
-                                vec![c]
-                            }
-                        })
-                        .collect();
-                    return Ok(Value::from(result));
-                }
-                "join" => {
-                    // Python `sep.join(iterable)` — called as method on the
-                    // separator string, with the iterable as the argument.
-                    let Some(iter_arg) = args.first() else {
-                        return Err(minijinja::Error::new(
-                            ErrorKind::InvalidOperation,
-                            "str.join() requires an iterable argument",
-                        ));
-                    };
-                    let iter = iter_arg.try_iter().map_err(|_| {
-                        minijinja::Error::new(
-                            ErrorKind::InvalidOperation,
-                            "str.join() argument is not iterable",
-                        )
-                    })?;
-                    let parts: Vec<String> = iter
-                        .map(|v| {
-                            v.as_str()
-                                .map(String::from)
-                                .unwrap_or_else(|| v.to_string())
-                        })
-                        .collect();
-                    return Ok(Value::from(parts.join(s)));
-                }
-                "isdigit" => {
-                    return Ok(Value::from(
-                        !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()),
-                    ));
-                }
-                "isalpha" => {
-                    return Ok(Value::from(
-                        !s.is_empty() && s.chars().all(|c| c.is_alphabetic()),
-                    ));
-                }
-                "isalnum" => {
-                    return Ok(Value::from(
-                        !s.is_empty() && s.chars().all(|c| c.is_alphanumeric()),
-                    ));
-                }
-                "isspace" => {
-                    return Ok(Value::from(
-                        !s.is_empty() && s.chars().all(|c| c.is_whitespace()),
-                    ));
-                }
-                "isupper" => {
-                    return Ok(Value::from(
-                        s.chars().any(|c| c.is_uppercase()) && !s.chars().any(|c| c.is_lowercase()),
-                    ));
-                }
-                "islower" => {
-                    return Ok(Value::from(
-                        s.chars().any(|c| c.is_lowercase()) && !s.chars().any(|c| c.is_uppercase()),
-                    ));
-                }
-                "count" => {
-                    let needle = arg_str();
-                    if needle.is_empty() {
-                        return Ok(Value::from(0_i64));
-                    }
-                    return Ok(Value::from(s.matches(needle).count() as i64));
-                }
-                _ => {}
-            }
-        }
-
-        // --- Map (dict) methods -----------------------------------------
-        if value.kind() == ValueKind::Map {
-            match method {
-                // Python-style `dict.get(key[, default])`: returns the
-                // value at `key` or `default`, or Python `None` when the
-                // key is absent and no explicit default was supplied.
-                // `None` remains falsy, so `m.get('a') or m.get('b')`
-                // chains keep working while `is none` / `is defined`
-                // now match CPython Jinja semantics for missing keys.
-                "get" => {
-                    let Some(key) = args.first() else {
-                        return Err(minijinja::Error::new(
-                            ErrorKind::InvalidOperation,
-                            "dict.get() requires at least one argument",
-                        ));
-                    };
-                    let default = args.get(1).cloned().unwrap_or_else(|| Value::from(()));
-                    return match value.get_item(key) {
-                        Ok(v) if v.is_undefined() => Ok(default),
-                        Ok(v) => Ok(v),
-                        Err(_) => Ok(default),
-                    };
-                }
-                // Python-style `dict.items()` / `keys()` / `values()` —
-                // return flat sequences usable directly in `{% for %}`.
-                "items" => {
-                    let mut pairs: Vec<Value> = Vec::new();
-                    if let Ok(iter) = value.try_iter() {
-                        for k in iter {
-                            let v = value.get_item(&k).unwrap_or(Value::UNDEFINED);
-                            pairs.push(Value::from(vec![k, v]));
-                        }
-                    }
-                    return Ok(Value::from(pairs));
-                }
-                "keys" => {
-                    let mut keys: Vec<Value> = Vec::new();
-                    if let Ok(iter) = value.try_iter() {
-                        for k in iter {
-                            keys.push(k);
-                        }
-                    }
-                    return Ok(Value::from(keys));
-                }
-                "values" => {
-                    let mut vals: Vec<Value> = Vec::new();
-                    if let Ok(iter) = value.try_iter() {
-                        for k in iter {
-                            if let Ok(v) = value.get_item(&k) {
-                                vals.push(v);
-                            }
-                        }
-                    }
-                    return Ok(Value::from(vals));
-                }
-                _ => {}
-            }
-        }
-
-        Err(minijinja::Error::from(ErrorKind::UnknownMethod))
     });
 }
 
@@ -1538,6 +1214,7 @@ impl std::fmt::Debug for ChatTemplateProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use minijinja::ErrorKind;
 
     /// A checkpoint that ships no template at all still has to render the
     /// prompt shape its model was trained on.

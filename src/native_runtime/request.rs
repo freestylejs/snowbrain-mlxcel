@@ -22,6 +22,7 @@ use mlxcel_core::session::{
 
 use super::error::{NativeRuntimeError, NativeRuntimeErrorKind};
 use super::operation_driver::NativeOperationDriver;
+use super::prompt_renderer::NativeRenderedPrompt;
 use super::sink::MAX_NATIVE_EMBEDDING_DIMENSION;
 
 pub const MAX_NATIVE_PROMPT_TOKENS: usize = 1_048_576;
@@ -138,6 +139,7 @@ impl NativePreparedPrefill {
 /// Prompt input ownership accepted by a native generation admission.
 pub enum NativePromptInput {
     TokenIds(Arc<[i32]>),
+    Rendered(NativeRenderedPrompt),
     Prepared(NativePreparedPrefill),
     ModelSpecific(NativeOwnedPreparedInput),
 }
@@ -152,6 +154,13 @@ impl NativePromptInput {
                     ));
                 }
                 validate_nonnegative_token_ids("prompt", ids)?;
+            }
+            Self::Rendered(rendered) => {
+                if rendered.rendered_utf8().len() > super::MAX_NATIVE_RENDERED_PROMPT_BYTES {
+                    return Err(invalid_request(
+                        "rendered prompt exceeds the native byte bound",
+                    ));
+                }
             }
             Self::Prepared(_) => {}
             Self::ModelSpecific(input) => {
@@ -172,17 +181,19 @@ impl NativePromptInput {
         Ok(())
     }
 
-    fn logical_token_len(&self) -> usize {
+    fn logical_token_len(&self) -> Option<usize> {
         match self {
-            Self::TokenIds(ids) => ids.len(),
-            Self::Prepared(prepared) => prepared.sequence_len(),
-            Self::ModelSpecific(prepared) => prepared.logical_token_len(),
+            Self::TokenIds(ids) => Some(ids.len()),
+            Self::Rendered(_) => None,
+            Self::Prepared(prepared) => Some(prepared.sequence_len()),
+            Self::ModelSpecific(prepared) => Some(prepared.logical_token_len()),
         }
     }
 
-    fn shallow_clone(&self) -> Self {
+    pub(crate) fn shallow_clone(&self) -> Self {
         match self {
             Self::TokenIds(value) => Self::TokenIds(Arc::clone(value)),
+            Self::Rendered(value) => Self::Rendered(value.shallow_clone()),
             Self::Prepared(value) => Self::Prepared(value.clone()),
             Self::ModelSpecific(value) => Self::ModelSpecific(value.clone()),
         }
@@ -523,6 +534,14 @@ pub struct NativeGenerateRequest {
 
 impl NativeGenerateRequest {
     pub fn validate(&self) -> Result<(), NativeRuntimeError> {
+        self.validate_shape()?;
+        if let Some(prompt_tokens) = self.prompt.logical_token_len() {
+            self.validate_resolved_prompt_tokens_after_shape(prompt_tokens)?;
+        }
+        Ok(())
+    }
+
+    fn validate_shape(&self) -> Result<(), NativeRuntimeError> {
         self.prompt.validate()?;
         self.sampling.validate()?;
         self.cache.validate()?;
@@ -546,7 +565,37 @@ impl NativeGenerateRequest {
             "output-suppression policy",
             &self.output_suppressed_token_ids,
         )?;
-        let prompt_tokens = u64::try_from(self.prompt.logical_token_len())
+        Ok(())
+    }
+
+    /// Validate actual tokenizer output before the engine creates a
+    /// reservation. Rendered prompts intentionally have no logical token count
+    /// until the package-bound worker tokenizer resolves them.
+    pub fn validate_resolved_prompt_tokens(
+        &self,
+        resolved_prompt_tokens: usize,
+    ) -> Result<(), NativeRuntimeError> {
+        self.validate_shape()?;
+        if let Some(declared) = self.prompt.logical_token_len()
+            && declared != resolved_prompt_tokens
+        {
+            return Err(invalid_request(
+                "resolved prompt token count disagrees with the supplied prompt input",
+            ));
+        }
+        self.validate_resolved_prompt_tokens_after_shape(resolved_prompt_tokens)
+    }
+
+    fn validate_resolved_prompt_tokens_after_shape(
+        &self,
+        resolved_prompt_tokens: usize,
+    ) -> Result<(), NativeRuntimeError> {
+        if resolved_prompt_tokens == 0 || resolved_prompt_tokens > MAX_NATIVE_PROMPT_TOKENS {
+            return Err(invalid_request(
+                "resolved prompt token count is zero or exceeds the native bound",
+            ));
+        }
+        let prompt_tokens = u64::try_from(resolved_prompt_tokens)
             .map_err(|_| invalid_request("prompt token count does not fit generation limits"))?;
         let required_total = prompt_tokens
             .checked_add(u64::from(self.limits.max_new_tokens))
@@ -564,11 +613,32 @@ impl NativeGenerateRequest {
         Ok(ValidatedGenerateRequest(Arc::new(self.shallow_clone())))
     }
 
-    pub(crate) fn logical_prompt_tokens(&self) -> usize {
+    pub(crate) fn logical_prompt_tokens(&self) -> Option<usize> {
         self.prompt.logical_token_len()
     }
 
-    fn shallow_clone(&self) -> Self {
+    pub(crate) fn validated_resolved(
+        &self,
+        prompt_tokens: Arc<[i32]>,
+        eos_token_ids: Arc<[i32]>,
+        output_suppressed_token_ids: Arc<[i32]>,
+    ) -> Result<ValidatedGenerateRequest, NativeRuntimeError> {
+        let resolved = Self {
+            request_id: self.request_id,
+            prompt: NativePromptInput::TokenIds(prompt_tokens),
+            sampling: self.sampling.clone(),
+            limits: self.limits,
+            eos_token_ids,
+            output_suppressed_token_ids,
+            scheduling: self.scheduling,
+            cache: self.cache.clone(),
+            constraint: self.constraint.clone(),
+            speculation: self.speculation,
+        };
+        resolved.validated()
+    }
+
+    pub(crate) fn shallow_clone(&self) -> Self {
         Self {
             request_id: self.request_id,
             prompt: self.prompt.shallow_clone(),
@@ -935,7 +1005,7 @@ mod tests {
     static_assertions::assert_not_impl_any!(NativeExecutionHandle: Clone);
 
     fn valid_generate_request(prompt: NativePromptInput) -> NativeGenerateRequest {
-        let prompt_tokens = prompt.logical_token_len() as u32;
+        let prompt_tokens = prompt.logical_token_len().unwrap() as u32;
         NativeGenerateRequest {
             request_id: 1,
             prompt,
