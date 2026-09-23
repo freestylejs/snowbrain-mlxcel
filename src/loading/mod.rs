@@ -62,6 +62,8 @@ pub(crate) use self::vlm::load_llava_iree_host_preprocessor;
 #[cfg(feature = "xla-iree")]
 pub(crate) use self::vlm::load_qwen2_vl_iree_host_preprocessor;
 pub use self::vlm::load_qwen3_omni_speech;
+#[cfg(test)]
+pub(crate) use self::vlm::native_unified_fixture;
 #[cfg(any(feature = "xla-diagnostics", feature = "xla-diagnostics-cpu"))]
 pub use self::vlm::{
     Molmo2XlaVisionReference, Molmo2XlaVisionReferenceProjection, Molmo2XlaVisionReferenceStage,
@@ -74,7 +76,8 @@ pub(crate) use self::vlm::{
 };
 pub(crate) use self::vlm::{ensure_supported_muse_weight_map, normalize_muse_glimmer_weights};
 pub(crate) use self::vlm::{
-    normalize_gemma4_unified_key, validate_native_gemma4_unified_tensor_metadata,
+    load_gemma4_unified_from_weights, normalize_gemma4_unified_key,
+    validate_native_gemma4_unified_tensor_metadata,
 };
 // Qwen3-VL-Embedding reuses the generative Qwen3-VL stack verbatim (vision
 // tower, DeepStack mergers, M-RoPE text decoder) and only replaces the head
@@ -124,7 +127,9 @@ pub struct GenerationConfigDefaults {
     pub top_k: Option<i32>,
 }
 
-fn parse_generation_config_defaults(config: &serde_json::Value) -> GenerationConfigDefaults {
+pub(crate) fn parse_generation_config_defaults(
+    config: &serde_json::Value,
+) -> GenerationConfigDefaults {
     GenerationConfigDefaults {
         eos_token_ids: parse_eos_token_ids(config),
         temperature: parse_finite_f32_field(config, "temperature"),

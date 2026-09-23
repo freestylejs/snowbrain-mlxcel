@@ -22,6 +22,8 @@ mod constraint;
 mod detokenizer;
 pub(crate) mod engine;
 mod error;
+mod load_binding;
+mod load_residence;
 pub(crate) mod memory;
 mod model_report;
 mod operation_driver;
@@ -32,8 +34,14 @@ mod request;
 pub(crate) mod sequence;
 mod sink;
 mod speculation;
+mod verified_source;
 
-pub(crate) use model_report::{NativeBoundTokenizer, bind_server_tokenizer};
+#[cfg(test)]
+mod verified_load_tests;
+
+pub(crate) use model_report::{
+    NativeBoundTokenizer, bind_server_tokenizer, is_proven_replace_byte_fallback_fuse,
+};
 pub(crate) use prompt_json::{
     SERVER_PROMPT_JSON_MAX_OUTPUT_BYTES, python_tojson_bounded, python_tojson_for_server,
 };
@@ -49,6 +57,7 @@ pub use error::{
     MAX_NATIVE_ERROR_MESSAGE_BYTES, NativeBoundedErrorMessage, NativeErrorMessageTooLong,
     NativeRuntimeError, NativeRuntimeErrorKind, TokenizerError, TokenizerErrorKind,
 };
+pub use load_binding::{NativeTokenizerLoadBinding, NativeWorkerLoadBinding};
 pub use model_report::{
     MAX_NATIVE_INSPECTION_BYTES, MAX_NATIVE_PACKAGE_BYTES, MAX_NATIVE_PACKAGE_COMPONENTS,
     MAX_NATIVE_PACKAGE_LABEL_BYTES, MAX_NATIVE_PACKAGE_LABEL_TOTAL_BYTES, MAX_NATIVE_REPORT_ITEMS,
@@ -97,3 +106,7 @@ pub use sink::{
     NativeSequenceIdentity, NativeStopReason, NativeUsageDelta,
 };
 pub use speculation::NativePhysicalAccounting;
+pub use verified_source::{
+    NativeArtifactBacking, NativeLoadLimits, NativeLoadStatistics, NativeVerifiedArtifactSource,
+    NativeVerifiedComponent, NativeVerifiedSource,
+};

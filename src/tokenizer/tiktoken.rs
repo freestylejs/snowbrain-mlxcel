@@ -70,7 +70,32 @@ impl TiktokenTokenizer {
         enforce_native_bounds: bool,
     ) -> Result<Self> {
         let content = std::fs::read_to_string(tiktoken_path)?;
+        let tokenizer_config = if tokenizer_config_declared {
+            let config_path = model_path.join("tokenizer_config.json");
+            match std::fs::read_to_string(&config_path) {
+                Ok(content) => Some(serde_json::from_str::<serde_json::Value>(&content)?),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            None
+        };
+        Self::from_content_with_config(&content, tokenizer_config.as_ref(), enforce_native_bounds)
+    }
 
+    pub(crate) fn from_bytes_with_declared_config(
+        bytes: &[u8],
+        tokenizer_config: Option<&serde_json::Value>,
+    ) -> Result<Self> {
+        let content = std::str::from_utf8(bytes)?;
+        Self::from_content_with_config(content, tokenizer_config, true)
+    }
+
+    fn from_content_with_config(
+        content: &str,
+        tokenizer_config: Option<&serde_json::Value>,
+        enforce_native_bounds: bool,
+    ) -> Result<Self> {
         let mut encoder = HashMap::new();
         let mut decoder = HashMap::new();
 
@@ -144,14 +169,13 @@ impl TiktokenTokenizer {
             special_decoder.insert(id, name.clone());
         }
 
-        // Override with tokenizer_config.json if available
-        Self::load_special_tokens_from_config(
-            model_path,
+        // Override with tokenizer_config.json when it was declared and supplied.
+        Self::load_special_tokens_from_config_value(
+            tokenizer_config,
             &encoder,
             &decoder,
             &mut special_encoder,
             &mut special_decoder,
-            tokenizer_config_declared,
             enforce_native_bounds,
         )?;
 
@@ -189,26 +213,18 @@ impl TiktokenTokenizer {
     }
 
     /// Load additional special token mappings from tokenizer_config.json.
-    fn load_special_tokens_from_config(
-        model_path: &Path,
+    fn load_special_tokens_from_config_value(
+        config: Option<&serde_json::Value>,
         regular_encoder: &HashMap<Vec<u8>, u32>,
         regular_decoder: &HashMap<u32, Vec<u8>>,
         special_encoder: &mut HashMap<String, u32>,
         special_decoder: &mut HashMap<u32, String>,
-        tokenizer_config_declared: bool,
         enforce_native_bounds: bool,
     ) -> Result<()> {
-        if !tokenizer_config_declared {
+        let Some(config) = config else {
             return Ok(());
-        }
-        let config_path = model_path.join("tokenizer_config.json");
-        let content = match std::fs::read_to_string(&config_path) {
-            Ok(content) => content,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error.into()),
         };
-        let config: serde_json::Value = serde_json::from_str(&content)?;
-        if enforce_native_bounds && !native_added_token_work_is_bounded(&config) {
+        if enforce_native_bounds && !native_added_token_work_is_bounded(config) {
             return Err(anyhow::anyhow!(
                 "tokenizer_config added-token work exceeds the native bound"
             ));

@@ -953,18 +953,25 @@ fn parse_special_tokens_with_native_bounds(
     enforce_native_bounds: bool,
 ) -> Result<(HashMap<String, u32>, HashMap<u32, String>, bool)> {
     let config_path = model_path.join("tokenizer_config.json");
+    let config_value = match std::fs::read_to_string(&config_path) {
+        Ok(content) => Some(serde_json::from_str::<serde_json::Value>(&content)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    parse_special_tokens_from_config(processor, config_value.as_ref(), enforce_native_bounds)
+}
+
+fn parse_special_tokens_from_config(
+    processor: &SentencePieceProcessor,
+    config_value: Option<&serde_json::Value>,
+    enforce_native_bounds: bool,
+) -> Result<(HashMap<String, u32>, HashMap<u32, String>, bool)> {
     let mut special_tokens = HashMap::new();
     let mut added_token_contents = HashMap::new();
     let mut add_bos = false;
 
-    let content = match std::fs::read_to_string(&config_path) {
-        Ok(content) => Some(content),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.into()),
-    };
-    if let Some(content) = content {
-        let config_value: serde_json::Value = serde_json::from_str(&content)?;
-        if enforce_native_bounds && !native_added_token_work_is_bounded(&config_value) {
+    if let Some(config_value) = config_value {
+        if enforce_native_bounds && !native_added_token_work_is_bounded(config_value) {
             return Err(anyhow::anyhow!(
                 "tokenizer_config added-token work exceeds the native bound"
             ));
@@ -1221,12 +1228,19 @@ fn plamo_added_token(id: u32, content: &str) -> serde_json::Value {
 /// Upstream reference:
 /// https://huggingface.co/pfnet/plamo-2-1b/blob/main/tokenization_plamo.py
 fn build_plamo_tokenizer(model_path: &Path) -> Result<tokenizers::Tokenizer> {
+    let jsonl_path = model_path.join("tokenizer.jsonl");
+    let bytes = std::fs::read(&jsonl_path)
+        .map_err(|e| anyhow::anyhow!("Failed to read {:?}: {}", jsonl_path, e))?;
+    build_plamo_tokenizer_from_bytes(&bytes, &jsonl_path)
+}
+
+fn build_plamo_tokenizer_from_bytes(
+    bytes: &[u8],
+    jsonl_path: &Path,
+) -> Result<tokenizers::Tokenizer> {
     use std::io::BufRead;
 
-    let jsonl_path = model_path.join("tokenizer.jsonl");
-    let file = std::fs::File::open(&jsonl_path)
-        .map_err(|e| anyhow::anyhow!("Failed to open {:?}: {}", jsonl_path, e))?;
-    let reader = std::io::BufReader::new(file);
+    let reader = std::io::Cursor::new(bytes);
 
     // The Unigram vocab in token-id order: vocab[i] = [token, score]. Each
     // jsonl line is a `[token, score, type]` array; the line index is the id.
@@ -1347,8 +1361,14 @@ fn is_qwen2_slow_tokenizer_dir(model_path: &Path) -> bool {
     let Ok(config) = serde_json::from_str::<serde_json::Value>(&raw) else {
         return false;
     };
+    is_qwen2_slow_tokenizer_config(Some(&config))
+}
+
+fn is_qwen2_slow_tokenizer_config(config: Option<&serde_json::Value>) -> bool {
     matches!(
-        config.get("tokenizer_class").and_then(|v| v.as_str()),
+        config
+            .and_then(|config| config.get("tokenizer_class"))
+            .and_then(|v| v.as_str()),
         Some("Qwen2Tokenizer") | Some("Qwen2TokenizerFast")
     )
 }
@@ -1403,23 +1423,80 @@ fn build_qwen2_bpe_tokenizer_with_sidecars(
     added_tokens_declared: bool,
     strict_declared_files: bool,
 ) -> Result<tokenizers::Tokenizer> {
+    let vocab_path = model_path.join("vocab.json");
+    let merges_path = model_path.join("merges.txt");
+    let vocab_raw = std::fs::read(&vocab_path)
+        .map_err(|e| anyhow::anyhow!("Failed to read {:?}: {}", vocab_path, e))?;
+    let merges_raw = std::fs::read(&merges_path)
+        .map_err(|e| anyhow::anyhow!("Failed to read {:?}: {}", merges_path, e))?;
+    let tokenizer_config = if tokenizer_config_declared {
+        match std::fs::read_to_string(model_path.join("tokenizer_config.json")) {
+            Ok(raw) => Some(serde_json::from_str::<serde_json::Value>(&raw)?),
+            Err(error)
+                if !strict_declared_files && error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                None
+            }
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        None
+    };
+    let has_decoder = tokenizer_config
+        .as_ref()
+        .and_then(|config| config.get("added_tokens_decoder"))
+        .and_then(serde_json::Value::as_object)
+        .is_some();
+    let added_tokens = if added_tokens_declared && !has_decoder {
+        match std::fs::read_to_string(model_path.join("added_tokens.json")) {
+            Ok(raw) => Some(
+                serde_json::from_str::<serde_json::Value>(&raw)
+                    .map_err(|e| anyhow::anyhow!("Failed to parse added_tokens.json: {}", e))?,
+            ),
+            Err(error)
+                if !strict_declared_files && error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                None
+            }
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        None
+    };
+    build_qwen2_bpe_tokenizer_from_bytes(
+        &vocab_raw,
+        &merges_raw,
+        tokenizer_config.as_ref(),
+        added_tokens.as_ref(),
+        strict_declared_files,
+        &vocab_path,
+        &merges_path,
+        model_path,
+    )
+}
+
+fn build_qwen2_bpe_tokenizer_from_bytes(
+    vocab_raw: &[u8],
+    merges_raw: &[u8],
+    tokenizer_config: Option<&serde_json::Value>,
+    added_tokens: Option<&serde_json::Value>,
+    enforce_native_bounds: bool,
+    vocab_path: &Path,
+    merges_path: &Path,
+    diagnostic_root: &Path,
+) -> Result<tokenizers::Tokenizer> {
     use tokenizers::Tokenizer;
     use tokenizers::models::bpe::BPE;
 
-    let vocab_path = model_path.join("vocab.json");
-    let merges_path = model_path.join("merges.txt");
-
-    let vocab_raw = std::fs::read_to_string(&vocab_path)
-        .map_err(|e| anyhow::anyhow!("Failed to read {:?}: {}", vocab_path, e))?;
-    let vocab: HashMap<String, u32> = serde_json::from_str(&vocab_raw)
+    let vocab: HashMap<String, u32> = serde_json::from_slice(vocab_raw)
         .map_err(|e| anyhow::anyhow!("Failed to parse {:?}: {}", vocab_path, e))?;
     if vocab.is_empty() {
         return Err(anyhow::anyhow!("{:?} contained no entries", vocab_path));
     }
-    validate_dense_vocab_ids(&vocab, &vocab_path)?;
+    validate_dense_vocab_ids(&vocab, vocab_path)?;
 
-    let merges_raw = std::fs::read_to_string(&merges_path)
-        .map_err(|e| anyhow::anyhow!("Failed to read {:?}: {}", merges_path, e))?;
+    let merges_raw = std::str::from_utf8(merges_raw)
+        .map_err(|e| anyhow::anyhow!("Failed to parse {:?}: {}", merges_path, e))?;
     let mut merges: Vec<(String, String)> = Vec::new();
     for line in merges_raw.lines() {
         // The first line is a `#version:` header in every GPT-2-style export.
@@ -1455,22 +1532,10 @@ fn build_qwen2_bpe_tokenizer_with_sidecars(
     let mut tokenizer = Tokenizer::new(model);
     tokenizer.with_normalizer(Some(tokenizers::normalizers::unicode::NFC));
 
-    let add_prefix_space = if tokenizer_config_declared && strict_declared_files {
-        serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(
-            model_path.join("tokenizer_config.json"),
-        )?)?
-        .get("add_prefix_space")
+    let add_prefix_space = tokenizer_config
+        .and_then(|config| config.get("add_prefix_space"))
         .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    } else if tokenizer_config_declared {
-        std::fs::read_to_string(model_path.join("tokenizer_config.json"))
-            .ok()
-            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-            .and_then(|cfg| cfg.get("add_prefix_space").and_then(|v| v.as_bool()))
-            .unwrap_or(false)
-    } else {
-        false
-    };
+        .unwrap_or(false);
 
     let split = tokenizers::pre_tokenizers::split::Split::new(
         tokenizers::pre_tokenizers::split::SplitPattern::Regex(QWEN2_PRETOKENIZE_REGEX.to_string()),
@@ -1492,11 +1557,10 @@ fn build_qwen2_bpe_tokenizer_with_sidecars(
         tokenizers::processors::byte_level::ByteLevel::default().trim_offsets(false),
     ));
 
-    let added = read_added_tokens_sorted_with_sidecars(
-        model_path,
-        tokenizer_config_declared,
-        added_tokens_declared,
-        strict_declared_files,
+    let added = read_added_tokens_sorted_from_values(
+        tokenizer_config,
+        added_tokens,
+        enforce_native_bounds,
     )?;
     for (id, token) in &added {
         if *id < base_vocab_size {
@@ -1547,7 +1611,7 @@ fn build_qwen2_bpe_tokenizer_with_sidecars(
                     token.content,
                     assigned,
                     id,
-                    model_path,
+                    diagnostic_root,
                     base_vocab_size
                 ));
             }
@@ -1652,10 +1716,6 @@ fn read_added_tokens_sorted_with_sidecars(
     added_tokens_declared: bool,
     strict_declared_files: bool,
 ) -> Result<Vec<(u32, tokenizers::AddedToken)>> {
-    use tokenizers::AddedToken;
-
-    let mut out: Vec<(u32, AddedToken)> = Vec::new();
-
     let config = if !tokenizer_config_declared {
         None
     } else {
@@ -1669,17 +1729,50 @@ fn read_added_tokens_sorted_with_sidecars(
             Err(error) => return Err(error.into()),
         }
     };
-    if strict_declared_files
-        && config
-            .as_ref()
-            .is_some_and(|config| !native_added_token_work_is_bounded(config))
+    let has_decoder = config
+        .as_ref()
+        .and_then(|cfg| cfg.get("added_tokens_decoder"))
+        .and_then(|v| v.as_object())
+        .is_some();
+    let added_tokens = if added_tokens_declared && !has_decoder {
+        match std::fs::read_to_string(model_path.join("added_tokens.json")) {
+            Ok(raw) => Some(
+                serde_json::from_str::<serde_json::Value>(&raw)
+                    .map_err(|e| anyhow::anyhow!("Failed to parse added_tokens.json: {}", e))?,
+            ),
+            Err(error)
+                if !strict_declared_files && error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                None
+            }
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        None
+    };
+    read_added_tokens_sorted_from_values(
+        config.as_ref(),
+        added_tokens.as_ref(),
+        strict_declared_files,
+    )
+}
+
+fn read_added_tokens_sorted_from_values(
+    config: Option<&serde_json::Value>,
+    added_tokens: Option<&serde_json::Value>,
+    enforce_native_bounds: bool,
+) -> Result<Vec<(u32, tokenizers::AddedToken)>> {
+    use tokenizers::AddedToken;
+
+    let mut out: Vec<(u32, AddedToken)> = Vec::new();
+    if enforce_native_bounds
+        && config.is_some_and(|config| !native_added_token_work_is_bounded(config))
     {
         return Err(anyhow::anyhow!(
             "tokenizer_config added-token work exceeds the native bound"
         ));
     }
     let decoder = config
-        .as_ref()
         .and_then(|cfg| cfg.get("added_tokens_decoder"))
         .and_then(|v| v.as_object());
 
@@ -1702,20 +1795,10 @@ fn read_added_tokens_sorted_with_sidecars(
                 .normalized(flag("normalized", false));
             out.push((id, token));
         }
-    } else if added_tokens_declared {
-        let raw = match std::fs::read_to_string(model_path.join("added_tokens.json")) {
-            Ok(raw) => raw,
-            Err(error)
-                if !strict_declared_files && error.kind() == std::io::ErrorKind::NotFound =>
-            {
-                out.sort_by_key(|(id, _)| *id);
-                return Ok(out);
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let map: HashMap<String, u32> = serde_json::from_str(&raw)
+    } else if let Some(added_tokens) = added_tokens {
+        let map: HashMap<String, u32> = serde_json::from_value((*added_tokens).clone())
             .map_err(|e| anyhow::anyhow!("Failed to parse added_tokens.json: {}", e))?;
-        if strict_declared_files && map.len() > MAX_NATIVE_ADDED_TOKENS {
+        if enforce_native_bounds && map.len() > MAX_NATIVE_ADDED_TOKENS {
             return Err(anyhow::anyhow!(
                 "added_tokens.json entry count exceeds the native bound"
             ));
@@ -1767,7 +1850,14 @@ fn ensure_bos_post_processor_with_logging(
     let Ok(config) = serde_json::from_str::<serde_json::Value>(&raw) else {
         return;
     };
+    ensure_bos_post_processor_from_config(tokenizer, &config, log_path.then_some(model_path));
+}
 
+fn ensure_bos_post_processor_from_config(
+    tokenizer: &mut tokenizers::Tokenizer,
+    config: &serde_json::Value,
+    log_model_path: Option<&Path>,
+) {
     let add_bos = config.get("add_bos_token").and_then(|v| v.as_bool());
     if add_bos == Some(false) {
         return;
@@ -1817,7 +1907,7 @@ fn ensure_bos_post_processor_with_logging(
     match template {
         Ok(template) => {
             tokenizer.with_post_processor(Some(template));
-            if log_path {
+            if let Some(model_path) = log_model_path {
                 tracing::info!(
                     model_path = %model_path.display(),
                     bos_token,
@@ -1828,7 +1918,7 @@ fn ensure_bos_post_processor_with_logging(
             }
         }
         Err(err) => {
-            if log_path {
+            if let Some(model_path) = log_model_path {
                 tracing::warn!(
                     model_path = %model_path.display(),
                     error = %err,
@@ -2021,9 +2111,18 @@ pub(crate) fn load_tokenizer_local_only(model_path: &Path) -> Result<MlxcelToken
 fn validate_declared_tokenizer_config(model_path: &Path) -> Result<()> {
     let raw = std::fs::read_to_string(model_path.join("tokenizer_config.json"))?;
     let value: serde_json::Value = serde_json::from_str(&raw)?;
+    validate_declared_tokenizer_config_value(&value)
+}
+
+fn validate_declared_tokenizer_config_value(value: &serde_json::Value) -> Result<()> {
     let config = value
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("tokenizer_config root is not an object"))?;
+    if !native_added_token_work_is_bounded(value) {
+        return Err(anyhow::anyhow!(
+            "tokenizer_config added-token work exceeds the native bound"
+        ));
+    }
     for field in ["add_bos_token", "add_prefix_space"] {
         if config.get(field).is_some_and(|value| !value.is_boolean()) {
             return Err(anyhow::anyhow!("tokenizer_config {field} is not a boolean"));
@@ -2068,6 +2167,95 @@ fn validate_declared_tokenizer_config(model_path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+pub(crate) fn load_tokenizer_from_declared_bytes(
+    primary_label: &str,
+    primary: &[u8],
+    tokenizer_config: Option<&serde_json::Value>,
+    model_config: &serde_json::Value,
+    merges: Option<&[u8]>,
+    added_tokens: Option<&serde_json::Value>,
+) -> anyhow::Result<MlxcelTokenizer> {
+    if let Some(tokenizer_config) = tokenizer_config {
+        validate_declared_tokenizer_config_value(tokenizer_config)?;
+    }
+
+    let model_type = model_config
+        .get("model_type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if matches!(model_type, "moondream1" | "moondream2") {
+        return Err(anyhow::anyhow!(
+            "model family {model_type} can require a remote tokenizer override; in-memory native loading accepts only self-contained declared artifacts"
+        ));
+    }
+
+    match primary_label {
+        "tokenizer.json" => {
+            let mut tokenizer = if matches!(model_type, "diffusion_gemma" | "diffusion_gemma_text")
+            {
+                let mut json: serde_json::Value = serde_json::from_slice(primary)?;
+                demote_tool_parser_markers(&mut json);
+                let bytes = serde_json::to_vec(&json)?;
+                tokenizers::Tokenizer::from_bytes(bytes).map_err(|error| anyhow::anyhow!(error))?
+            } else {
+                tokenizers::Tokenizer::from_bytes(primary)
+                    .map_err(|error| anyhow::anyhow!(error))?
+            };
+            if let Some(tokenizer_config) = tokenizer_config {
+                ensure_bos_post_processor_from_config(&mut tokenizer, tokenizer_config, None);
+            }
+            Ok(MlxcelTokenizer::HuggingFace(tokenizer))
+        }
+        "tokenizer.model" => {
+            let processor = SentencePieceProcessor::from_serialized_proto(primary)
+                .map_err(|error| anyhow::anyhow!("Failed to load tokenizer.model: {error}"))?;
+            let bos_id = processor.bos_id();
+            let (special_tokens, added_token_contents, add_bos) =
+                parse_special_tokens_from_config(&processor, tokenizer_config, true)?;
+            Ok(MlxcelTokenizer::SentencePiece(SentencePieceTokenizer::new(
+                processor,
+                special_tokens,
+                added_token_contents,
+                bos_id,
+                add_bos,
+            )))
+        }
+        label if label == "tiktoken.model" || label.ends_with(".tiktoken") => {
+            Ok(MlxcelTokenizer::Tiktoken(
+                TiktokenTokenizer::from_bytes_with_declared_config(primary, tokenizer_config)?,
+            ))
+        }
+        "tokenizer.jsonl" => Ok(MlxcelTokenizer::HuggingFace(
+            build_plamo_tokenizer_from_bytes(primary, Path::new("tokenizer.jsonl"))?,
+        )),
+        "vocab.json" => {
+            if !is_qwen2_slow_tokenizer_config(tokenizer_config) {
+                return Err(anyhow::anyhow!(
+                    "vocab.json + merges.txt is supported only for Qwen2Tokenizer/Qwen2TokenizerFast"
+                ));
+            }
+            let merges = merges.ok_or_else(|| {
+                anyhow::anyhow!("declared Qwen2 slow tokenizer is missing merges.txt bytes")
+            })?;
+            Ok(MlxcelTokenizer::HuggingFace(
+                build_qwen2_bpe_tokenizer_from_bytes(
+                    primary,
+                    merges,
+                    tokenizer_config,
+                    added_tokens,
+                    true,
+                    Path::new("vocab.json"),
+                    Path::new("merges.txt"),
+                    Path::new("declared Qwen2 tokenizer"),
+                )?,
+            ))
+        }
+        _ => Err(anyhow::anyhow!(
+            "declared primary tokenizer artifact is not a supported exact in-memory family"
+        )),
+    }
 }
 
 /// Load one exact primary tokenizer artifact selected by an immutable package
@@ -2237,11 +2425,11 @@ fn load_local_tokenizer(model_path: &Path) -> Result<Option<MlxcelTokenizer>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MlxcelTokenizer, build_qwen2_bpe_tokenizer, is_qwen2_slow_tokenizer_dir,
-        load_tokenizer_local_only, load_tokenizer_local_only_selected,
-        load_tokenizer_local_only_selected_declared, read_added_tokens_sorted,
-        remote_tokenizer_override_for_model, remote_tokenizer_repo_for_model,
-        remote_tokenizer_repo_for_model_type,
+        MAX_NATIVE_ADDED_TOKENS, MlxcelTokenizer, build_plamo_tokenizer, build_qwen2_bpe_tokenizer,
+        is_qwen2_slow_tokenizer_dir, load_tokenizer_from_declared_bytes, load_tokenizer_local_only,
+        load_tokenizer_local_only_selected, load_tokenizer_local_only_selected_declared,
+        read_added_tokens_sorted, remote_tokenizer_override_for_model,
+        remote_tokenizer_repo_for_model, remote_tokenizer_repo_for_model_type,
     };
     use base64::Engine;
     use tokenizers::{AddedToken, Tokenizer, models::bpe::BPE};
@@ -2269,6 +2457,426 @@ mod tests {
 
     fn write_pinned_sentencepiece(root: &std::path::Path) {
         std::fs::write(root.join("tokenizer.model"), pinned_sentencepiece_bytes()).unwrap();
+    }
+
+    #[test]
+    fn declared_bytes_hf_loader_applies_the_existing_bos_config_semantics() {
+        let MlxcelTokenizer::HuggingFace(hf) = MlxcelTokenizer::stub_with_byte_fallback() else {
+            unreachable!()
+        };
+        let tokenizer_json = hf.to_string(false).unwrap();
+        let tokenizer_config = serde_json::json!({
+            "tokenizer_class": "GemmaTokenizerFast",
+            "add_bos_token": true,
+            "bos_token": "<BOS>"
+        });
+        let model_config = serde_json::json!({"model_type": "gemma4"});
+
+        let tokenizer = load_tokenizer_from_declared_bytes(
+            "tokenizer.json",
+            tokenizer_json.as_bytes(),
+            Some(&tokenizer_config),
+            &model_config,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // This decoder fixture has no BPE merges for "Hello". Its single-byte
+        // fallback for 'a' is actually encodable, so prove both payload and BOS.
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("tokenizer.json"), &tokenizer_json).unwrap();
+        std::fs::write(
+            directory.path().join("tokenizer_config.json"),
+            serde_json::to_vec(&tokenizer_config).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("config.json"),
+            serde_json::to_vec(&model_config).unwrap(),
+        )
+        .unwrap();
+        let from_file = load_tokenizer_local_only(directory.path()).unwrap();
+        assert_eq!(tokenizer.encode("a", false).unwrap(), vec![12]);
+        assert_eq!(tokenizer.encode("a", true).unwrap(), vec![0, 12]);
+        assert_eq!(
+            tokenizer.encode("a", true).unwrap(),
+            from_file.encode("a", true).unwrap(),
+        );
+    }
+
+    #[test]
+    fn declared_bytes_sentencepiece_loader_preserves_added_token_semantics() {
+        let tokenizer_config = serde_json::json!({
+            "added_tokens_decoder": {
+                "1000": {"content": "<|native|>", "special": true},
+                "1001": {"content": "<|IMAGE_PLACEHOLDER|>", "special": false}
+            }
+        });
+        let model_config = serde_json::json!({"model_type": "xlm-roberta"});
+        let model = pinned_sentencepiece_bytes();
+
+        let tokenizer = load_tokenizer_from_declared_bytes(
+            "tokenizer.model",
+            &model,
+            Some(&tokenizer_config),
+            &model_config,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(tokenizer.encode("<|native|>", false).unwrap(), vec![1000]);
+        assert_eq!(
+            tokenizer.encode("<|IMAGE_PLACEHOLDER|>", false).unwrap(),
+            vec![1001]
+        );
+        assert_eq!(
+            tokenizer.decode(&[1001], true).unwrap(),
+            "<|IMAGE_PLACEHOLDER|>"
+        );
+    }
+
+    #[test]
+    fn declared_bytes_tiktoken_loader_preserves_special_token_config() {
+        let vocabulary = all_singleton_tiktoken_vocab();
+        let tokenizer_config = serde_json::json!({
+            "added_tokens_decoder": {
+                "500": {"content": "<|native|>", "special": true}
+            }
+        });
+        let model_config = serde_json::json!({"model_type": "gemma4"});
+
+        let tokenizer = load_tokenizer_from_declared_bytes(
+            "tiny.tiktoken",
+            vocabulary.as_bytes(),
+            Some(&tokenizer_config),
+            &model_config,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(tokenizer.encode("<|native|>", false).unwrap(), vec![500]);
+        assert_eq!(tokenizer.decode(&[500], false).unwrap(), "<|native|>");
+    }
+
+    #[test]
+    fn declared_bytes_loader_rejects_invalid_inputs_configs_and_remote_overrides() {
+        let model_config = serde_json::json!({"model_type": "gemma4"});
+        let invalid_config = serde_json::json!({"add_bos_token": "yes"});
+        assert!(
+            load_tokenizer_from_declared_bytes(
+                "tokenizer.json",
+                b"not tokenizer json",
+                None,
+                &model_config,
+                None,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            load_tokenizer_from_declared_bytes(
+                "tokenizer.json",
+                b"{}",
+                Some(&invalid_config),
+                &model_config,
+                None,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            load_tokenizer_from_declared_bytes(
+                "unsupported.tokenizer",
+                b"",
+                None,
+                &model_config,
+                None,
+                None,
+            )
+            .is_err()
+        );
+
+        let mut oversized_decoder = serde_json::Map::new();
+        for index in 0..=MAX_NATIVE_ADDED_TOKENS {
+            oversized_decoder.insert(
+                (10_000 + index).to_string(),
+                serde_json::json!({
+                    "content": format!("<|native_{index}|>"),
+                    "special": true
+                }),
+            );
+        }
+        let oversized_config = serde_json::json!({
+            "added_tokens_decoder": serde_json::Value::Object(oversized_decoder)
+        });
+        let vocabulary = all_singleton_tiktoken_vocab();
+        let error = match load_tokenizer_from_declared_bytes(
+            "tiny.tiktoken",
+            vocabulary.as_bytes(),
+            Some(&oversized_config),
+            &model_config,
+            None,
+            None,
+        ) {
+            Ok(_) => panic!("oversized tokenizer_config must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("added-token work exceeds the native bound")
+        );
+
+        let MlxcelTokenizer::HuggingFace(hf) = MlxcelTokenizer::stub() else {
+            unreachable!()
+        };
+        let hf_json = hf.to_string(false).unwrap();
+        let error = match load_tokenizer_from_declared_bytes(
+            "tokenizer.json",
+            hf_json.as_bytes(),
+            Some(&oversized_config),
+            &model_config,
+            None,
+            None,
+        ) {
+            Ok(_) => panic!("HF byte path must apply the native config bound"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("added-token work exceeds the native bound")
+        );
+
+        let tokenizer_json = hf.to_string(false).unwrap();
+        let remote_override_model = serde_json::json!({"model_type": "moondream2"});
+        assert!(
+            load_tokenizer_from_declared_bytes(
+                "tokenizer.json",
+                tokenizer_json.as_bytes(),
+                None,
+                &remote_override_model,
+                None,
+                None,
+            )
+            .is_err(),
+            "an in-memory load cannot prove a moondream2 tokenizer is self-contained"
+        );
+    }
+
+    #[test]
+    fn declared_bytes_plamo_jsonl_matches_the_existing_file_builder() {
+        let jsonl = concat!(
+            "[\"<|plamo:unk|>\",0.0,\"UNKNOWN\"]\n",
+            "[\"<|plamo:bos|>\",0.0,\"CONTROL\"]\n",
+            "[\"<|plamo:eos|>\",0.0,\"CONTROL\"]\n",
+            "[\"<|plamo:pad|>\",0.0,\"CONTROL\"]\n",
+            "[\"hello\",-1.0,\"NORMAL\"]\n",
+            "[\" world\",-1.0,\"NORMAL\"]\n",
+        );
+        let root = tempfile::TempDir::new().unwrap();
+        std::fs::write(root.path().join("tokenizer.jsonl"), jsonl).unwrap();
+        let file = build_plamo_tokenizer(root.path()).expect("file PLaMo builder");
+        let model_config = serde_json::json!({"model_type": "bert"});
+        let MlxcelTokenizer::HuggingFace(bytes) = load_tokenizer_from_declared_bytes(
+            "tokenizer.jsonl",
+            jsonl.as_bytes(),
+            None,
+            &model_config,
+            None,
+            None,
+        )
+        .expect("byte PLaMo builder") else {
+            panic!("tokenizer.jsonl must build a HuggingFace tokenizer")
+        };
+
+        for text in ["hello", "hello world", "<|plamo:bos|>hello"] {
+            let expected = file.encode(text, false).unwrap();
+            let actual = bytes.encode(text, false).unwrap();
+            assert_eq!(
+                actual.get_ids(),
+                expected.get_ids(),
+                "encode mismatch for {text:?}"
+            );
+            assert_eq!(
+                bytes.decode(actual.get_ids(), false).unwrap(),
+                file.decode(expected.get_ids(), false).unwrap(),
+                "decode mismatch for {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn declared_bytes_plamo_jsonl_rejects_malformed_input() {
+        let model_config = serde_json::json!({"model_type": "bert"});
+        assert!(
+            load_tokenizer_from_declared_bytes(
+                "tokenizer.jsonl",
+                b"{\"not\":\"a row\"}\n",
+                None,
+                &model_config,
+                None,
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn declared_bytes_qwen_slow_pair_matches_the_existing_file_builder() {
+        let root = tempfile::TempDir::new().unwrap();
+        write_qwen2_slow_tokenizer_dir(root.path(), "Qwen2Tokenizer");
+        let file = build_qwen2_bpe_tokenizer(root.path()).expect("file Qwen2 builder");
+        let vocab = std::fs::read(root.path().join("vocab.json")).unwrap();
+        let merges = std::fs::read(root.path().join("merges.txt")).unwrap();
+        let tokenizer_config: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.path().join("tokenizer_config.json")).unwrap(),
+        )
+        .unwrap();
+        let model_config = serde_json::json!({"model_type": "bert"});
+        let MlxcelTokenizer::HuggingFace(bytes) = load_tokenizer_from_declared_bytes(
+            "vocab.json",
+            &vocab,
+            Some(&tokenizer_config),
+            &model_config,
+            Some(&merges),
+            None,
+        )
+        .expect("byte Qwen2 builder") else {
+            panic!("vocab.json + merges.txt must build a HuggingFace tokenizer")
+        };
+
+        for text in [" hi", "<0>hi", "<|im_start|> hi"] {
+            let expected = file.encode(text, false).unwrap();
+            let actual = bytes.encode(text, false).unwrap();
+            assert_eq!(
+                actual.get_ids(),
+                expected.get_ids(),
+                "encode mismatch for {text:?}"
+            );
+            assert_eq!(
+                bytes.decode(actual.get_ids(), false).unwrap(),
+                file.decode(expected.get_ids(), false).unwrap(),
+                "decode mismatch for {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn declared_bytes_qwen_slow_pair_reuses_strict_sidecar_validation() {
+        let vocab = r#"{"Ġ":0,"h":1,"i":2,"!":3,"Ġh":4,"a":5,"b":6}"#.as_bytes();
+        let merges = "#version: 0.2\nĠ h\n".as_bytes();
+        let model_config = serde_json::json!({"model_type": "bert"});
+        let valid_config = serde_json::json!({
+            "tokenizer_class": "Qwen2Tokenizer",
+            "add_prefix_space": false
+        });
+
+        assert!(
+            load_tokenizer_from_declared_bytes(
+                "vocab.json",
+                vocab,
+                Some(&valid_config),
+                &model_config,
+                None,
+                None,
+            )
+            .is_err(),
+            "declared Qwen slow tokenization requires merges bytes"
+        );
+
+        let unsupported_config = serde_json::json!({"tokenizer_class": "GPT2Tokenizer"});
+        assert!(
+            load_tokenizer_from_declared_bytes(
+                "vocab.json",
+                vocab,
+                Some(&unsupported_config),
+                &model_config,
+                Some(merges),
+                None,
+            )
+            .is_err(),
+            "generic GPT-2 slow pairs must not inherit Qwen2 semantics"
+        );
+
+        for (name, bad_vocab, bad_merges) in [
+            ("malformed vocab", &b"not json"[..], merges),
+            (
+                "malformed merges",
+                vocab,
+                &b"#version: 0.2\ninvalid-merge"[..],
+            ),
+            ("sparse vocab", r#"{"Ġ":0,"h":1,"i":3}"#.as_bytes(), merges),
+        ] {
+            assert!(
+                load_tokenizer_from_declared_bytes(
+                    "vocab.json",
+                    bad_vocab,
+                    Some(&valid_config),
+                    &model_config,
+                    Some(bad_merges),
+                    None,
+                )
+                .is_err(),
+                "{name} must be rejected"
+            );
+        }
+
+        let duplicate_added_ids = serde_json::json!({"<a>": 7, "<b>": 7});
+        assert!(
+            load_tokenizer_from_declared_bytes(
+                "vocab.json",
+                vocab,
+                Some(&valid_config),
+                &model_config,
+                Some(merges),
+                Some(&duplicate_added_ids),
+            )
+            .is_err(),
+            "added-token ids must remain a bijection"
+        );
+
+        let single_added = serde_json::json!({"<native>": 7});
+        let with_added = load_tokenizer_from_declared_bytes(
+            "vocab.json",
+            vocab,
+            Some(&valid_config),
+            &model_config,
+            Some(merges),
+            Some(&single_added),
+        )
+        .expect("declared added_tokens.json value");
+        let without_added = load_tokenizer_from_declared_bytes(
+            "vocab.json",
+            vocab,
+            Some(&valid_config),
+            &model_config,
+            Some(merges),
+            None,
+        )
+        .expect("no undeclared added tokens");
+        assert_eq!(with_added.token_to_id("<native>"), Some(7));
+        assert_eq!(without_added.token_to_id("<native>"), None);
+
+        let mut oversized_added = serde_json::Map::new();
+        for index in 0..=MAX_NATIVE_ADDED_TOKENS {
+            oversized_added.insert(format!("<{index}>"), serde_json::json!(7 + index));
+        }
+        assert!(
+            load_tokenizer_from_declared_bytes(
+                "vocab.json",
+                vocab,
+                Some(&valid_config),
+                &model_config,
+                Some(merges),
+                Some(&serde_json::Value::Object(oversized_added)),
+            )
+            .is_err(),
+            "added_tokens.json work must remain bounded"
+        );
     }
 
     #[test]

@@ -21,6 +21,7 @@
 
 use anyhow::Result;
 use mlxcel_core::tensor_metadata::{TensorMetadataLookup, TensorQuantization};
+use mlxcel_core::weights::WeightMap;
 use std::path::Path;
 
 use crate::LoadedModel;
@@ -375,13 +376,35 @@ pub(crate) fn validate_native_tensor_metadata(
 
 /// Load a Gemma 4 Unified (`gemma4_unified`) multimodal model.
 pub(crate) fn load_gemma4_unified(model_path: &Path) -> Result<LoadedModel> {
+    let (config_str, full_config) = read_sanitized_vlm_config(model_path)?;
+    build_gemma4_unified(&config_str, full_config, || {
+        models::load_gemma4_unified_weights_with_backing(model_path)
+            .map_err(|e| anyhow::anyhow!("Failed to load Gemma4 Unified weights: {}", e))
+    })
+}
+
+/// Reuses the exact family constructor with arrays and retained immutable backing
+/// from the managed source loader. No writable mapping or pathname is retained.
+pub(crate) fn load_gemma4_unified_from_weights(
+    full_config: serde_json::Value,
+    weights: WeightMap,
+    backing: models::Gemma4WeightBacking,
+) -> Result<LoadedModel> {
+    let config_str = serde_json::to_string(&full_config)?;
+    build_gemma4_unified(&config_str, full_config, || Ok((weights, backing)))
+}
+
+fn build_gemma4_unified(
+    config_str: &str,
+    full_config: serde_json::Value,
+    load_weights: impl FnOnce() -> Result<(WeightMap, models::Gemma4WeightBacking)>,
+) -> Result<LoadedModel> {
     use crate::vision::encoders::gemma4_unified::Gemma4UnifiedVisionEmbedder;
     use crate::vision::gemma4_multimodal_embedder::Gemma4MultimodalEmbedder;
     use crate::vision::gemma4_unified::Gemma4UnifiedModel;
     use crate::vision::gemma4_unified_config::Gemma4UnifiedConfig;
     use crate::vision::processors::gemma4_unified::Gemma4UnifiedProcessor;
 
-    let (config_str, full_config) = read_sanitized_vlm_config(model_path)?;
     let unified_config: Gemma4UnifiedConfig =
         parse_vlm_config(&config_str, "Gemma4 Unified config")?;
     let has_audio = unified_config.audio_config.is_some();
@@ -392,9 +415,7 @@ pub(crate) fn load_gemma4_unified(model_path: &Path) -> Result<LoadedModel> {
         parse_vlm_config(&config_str, "Gemma4 Unified text config")?;
     let text_config = text_args.text_args();
 
-    let (raw_weights, weight_backing) =
-        models::load_gemma4_unified_weights_with_backing(model_path)
-            .map_err(|e| anyhow::anyhow!("Failed to load Gemma4 Unified weights: {}", e))?;
+    let (raw_weights, weight_backing) = load_weights()?;
     let mut weights = sanitize_gemma4_unified_weights(raw_weights, has_audio);
     models::strip_gemma4_kv_shared_weights(&mut weights, &full_config);
     models::sanitize_tied_embeddings(&mut weights, &full_config);
@@ -485,4 +506,4 @@ pub(crate) fn load_gemma4_unified(model_path: &Path) -> Result<LoadedModel> {
 
 #[cfg(test)]
 #[path = "vlm_gemma_unified_tests.rs"]
-mod tests;
+pub(crate) mod tests;

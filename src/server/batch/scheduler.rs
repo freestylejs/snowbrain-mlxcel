@@ -367,7 +367,8 @@ pub struct BatchScheduler {
 
     // -- Model & tokenizer --
     model: LoadedModel,
-    tokenizer: MlxcelTokenizer,
+    // Shared with the native decoder: one actual tokenizer load, no second source read.
+    tokenizer: Arc<MlxcelTokenizer>,
 
     // -- Generation infrastructure --
     //
@@ -1462,7 +1463,7 @@ impl BatchScheduler {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn with_config(
         model: LoadedModel,
-        tokenizer: MlxcelTokenizer,
+        tokenizer: impl Into<Arc<MlxcelTokenizer>>,
         config_eos: Vec<i32>,
         request_rx: mpsc::Receiver<ModelRequest>,
         max_batch_size: usize,
@@ -1505,7 +1506,7 @@ impl BatchScheduler {
             prefill_queue: PrefillQueue::with_capacity(max_queue_depth),
             active_batch: ActiveBatch::new(max_batch_size),
             model,
-            tokenizer,
+            tokenizer: tokenizer.into(),
             generation_stream,
             request_rx,
             batch_metrics,

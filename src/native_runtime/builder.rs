@@ -14,8 +14,10 @@
 
 //! Builder and managed-engine source contracts.
 
+use super::{NativeLoadStatistics, NativeVerifiedSource, NativeWorkerLoadBinding};
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::error::{NativeRuntimeError, NativeRuntimeErrorKind};
 use super::model_report::{NativeImmutablePackage, NativeModelReport, inspect_package};
@@ -30,49 +32,52 @@ use super::request::{
 };
 use super::sink::{NativeEmbeddingSink, NativeGenerateSink, NativeMemorySnapshot};
 
-/// Owned worker-start request. Package authority moves into the worker factory.
-///
-/// The factory must retain this authority for the complete worker lifetime. A
-/// path-based lazy/mapped model loader may return only after its weights have
-/// been eagerly materialized and a device barrier has detached runtime state
-/// from staging bytes; otherwise the factory must retain proven no-write OS
-/// guards for every backing artifact until worker teardown.
+/// Canonical worker load request. Source authority and its producer binding are
+/// retained independently of path hints. Validation performs no artifact read,
+/// hash or static inspection; actual immutable backing is built by the loader.
 pub struct NativeWorkerStartRequest {
-    pub package: NativeImmutablePackage,
+    pub source: NativeVerifiedSource,
+    pub binding: NativeWorkerLoadBinding,
     pub profile: NativeWorkerConfig,
     pub initial_operation: MlxNativeOperationClass,
+    /// Cancellation is observed before dispatch and between bounded source reads.
+    pub cancellation: Arc<AtomicBool>,
 }
 
 impl NativeWorkerStartRequest {
-    fn validate(&self) -> Result<(), NativeRuntimeError> {
+    pub(super) fn validate(&self, native_build: [u8; 32]) -> Result<(), NativeRuntimeError> {
+        if self.cancellation.load(Ordering::Acquire) {
+            return Err(NativeRuntimeError::new(
+                NativeRuntimeErrorKind::Cancelled,
+                "native worker load was cancelled before dispatch",
+            ));
+        }
         self.profile.validate()?;
-        if self.profile.operation_driver().operation_class() != self.initial_operation {
+        if self.binding.native_build_identity() != native_build {
             return Err(NativeRuntimeError::new(
-                NativeRuntimeErrorKind::UnsupportedOperation,
-                "worker operation driver does not match the requested operation class",
+                NativeRuntimeErrorKind::BuildIdentityMismatch,
+                "native worker load binding targets a different build",
             ));
         }
-        if self.initial_operation == MlxNativeOperationClass::SpeechToText {
-            return Err(NativeRuntimeError::new(
-                NativeRuntimeErrorKind::UnsupportedOperation,
-                "speech-to-text has no managed request/admission/sink lifecycle",
-            ));
-        }
-        if self.package.identity() != self.profile.package_identity() {
-            return Err(NativeRuntimeError::new(
-                NativeRuntimeErrorKind::InvalidPackage,
-                "worker profile is bound to a different immutable package",
-            ));
-        }
-        let report = inspect_package(&self.package)?;
-        if report.report_identity() != self.profile.report_identity()
-            || report.operation_class() != self.initial_operation
-            || report.context_window() != self.profile.model_context_window()
-            || report.tokenizer().incremental_decode() != self.profile.decoder_guarantee()
+        if self.profile.operation_driver().operation_class() != self.initial_operation
+            || self.binding.operation()? != self.initial_operation
         {
             return Err(NativeRuntimeError::new(
-                NativeRuntimeErrorKind::UnsupportedCapability,
-                "worker profile authority disagrees with current immutable inspection",
+                NativeRuntimeErrorKind::UnsupportedOperation,
+                "worker operation driver disagrees with its source binding",
+            ));
+        }
+        if self.source.identity() != self.binding.source_identity()
+            || self.profile.load_binding() != Some(&self.binding)
+            || self.profile.package_identity() != self.binding.source_identity()
+            || self.profile.report_identity() != self.binding.report_identity()
+            || self.profile.model_context_window() != self.binding.max_context_positions()
+            || (self.initial_operation == MlxNativeOperationClass::Embedding
+                && self.profile.embedding_input_ceiling() != self.binding.max_context_positions())
+        {
+            return Err(NativeRuntimeError::new(
+                NativeRuntimeErrorKind::InvalidPackage,
+                "native worker source/static/profile binding is inconsistent",
             ));
         }
         Ok(())
@@ -99,6 +104,10 @@ impl NativeWorkerStartRequest {
 /// global shape validator.
 pub trait NativeManagedEngine: Send {
     fn descriptor(&self) -> NativeEngineDescriptor;
+
+    /// Actual source/load work performed when this resident worker was created.
+    /// Static proof/inspection work is not reclassified as loading by these counters.
+    fn load_statistics(&self) -> NativeLoadStatistics;
 
     fn admit_generate(
         &mut self,
@@ -206,7 +215,7 @@ impl NativeRuntimeBuilder {
         &self,
         request: NativeWorkerStartRequest,
     ) -> Result<Box<dyn NativeManagedEngine>, NativeRuntimeError> {
-        request.validate()?;
+        request.validate(self.build_identity.digest())?;
         self.worker_factory.start_worker(request)
     }
 }

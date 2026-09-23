@@ -617,6 +617,37 @@ pub fn load_safetensors<P: AsRef<Path>>(path: P) -> Result<WeightMap, String> {
     load_safetensors_filtered(path, |_| true)
 }
 
+/// Load safetensors through an owned native reader without reopening a path.
+///
+/// The file must be a read-only regular file. The native reader duplicates its
+/// descriptor and is retained by every lazy MLX array, so dropping `file` or the
+/// returned map does not invalidate arrays moved out of the map. No full-content
+/// hash or package inspection is performed here.
+///
+/// This low-level function does not certify immutable provenance: the caller
+/// must have removed all writable authorities to the backing before using it as
+/// a verified model source. The managed runtime's private backing constructor
+/// supplies that guarantee. Malformed file/header errors cross a fallible CXX
+/// boundary; this is not process/crash containment for arbitrary native code.
+#[cfg(unix)]
+pub fn load_safetensors_file(file: &impl std::os::fd::AsFd) -> Result<WeightMap, String> {
+    use std::os::fd::AsRawFd;
+
+    let mut loaded = ffi::mlx_load_safetensors_fd(file.as_fd().as_raw_fd())
+        .map_err(|_| "Failed to load read-only safetensors backing".to_owned())?;
+    let len = ffi::loaded_weights_len(&loaded);
+    let mut weights = HashMap::new();
+    weights
+        .try_reserve(len)
+        .map_err(|_| "Unable to reserve safetensors weight table".to_owned())?;
+    for index in 0..len {
+        let name = ffi::loaded_weights_name(&loaded, index);
+        let array = ffi::loaded_weights_take(loaded.pin_mut(), index);
+        weights.insert(name, array);
+    }
+    Ok(weights)
+}
+
 /// Load a filtered subset of tensors from a single safetensors file.
 ///
 /// Iterates the tensor table via the MLX FFI and only takes tensors whose

@@ -3,6 +3,16 @@
 // launchers for the mlx_cxx bridge. Split out of mlx_cxx_bridge.cpp.
 
 #include "mlx_cxx_internal.h"
+#include "mlx/io/load.h"
+#include <cerrno>
+#include <cstdint>
+#include <limits>
+#include <stdexcept>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 #include "sparse_v_sdpa.h"          // fused Sparse-V SDPA kernel.
 #include "turbo4_delegated_sdpa.h"  // fused Turbo4Delegated SDPA kernel.
 #include "paged_attention.h"        // fused paged-attention decode kernel (#123).
@@ -345,10 +355,108 @@ bool fused_rope_qk_append_available() {
     return mlxcel::turbo::fused_rope_qk_append_available();
 }
 
-std::unique_ptr<MlxLoadedWeights> mlx_load_safetensors(rust::Str path) {
-    std::string path_str(path.data(), path.size());
-    auto [weights_map, metadata] = mlx::core::load_safetensors(path_str);
+namespace {
 
+#ifndef _WIN32
+// No pathname is retained or reopened. Each MLX Load primitive retains this
+// reader, independently of the Rust file and the temporary weight-map holder.
+class OwnedReadOnlyReader final : public mlx::core::io::Reader {
+ public:
+    explicit OwnedReadOnlyReader(int borrowed_fd) {
+        fd_ = ::fcntl(borrowed_fd, F_DUPFD_CLOEXEC, 0);
+        if (fd_ < 0) {
+            throw std::runtime_error("[verified weights] descriptor duplication failed");
+        }
+        struct stat status {};
+        const int flags = ::fcntl(fd_, F_GETFL);
+        if (flags < 0 || (flags & O_ACCMODE) != O_RDONLY ||
+            ::fstat(fd_, &status) != 0 || !S_ISREG(status.st_mode) ||
+            status.st_size < 0 ||
+            static_cast<uint64_t>(status.st_size) >
+                static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+            ::close(fd_);
+            fd_ = -1;
+            throw std::runtime_error("[verified weights] backing must be a read-only regular file");
+        }
+        length_ = static_cast<uint64_t>(status.st_size);
+    }
+
+    ~OwnedReadOnlyReader() noexcept override {
+        if (fd_ >= 0) {
+            ::close(fd_);
+        }
+    }
+    OwnedReadOnlyReader(const OwnedReadOnlyReader&) = delete;
+    OwnedReadOnlyReader& operator=(const OwnedReadOnlyReader&) = delete;
+
+    bool is_open() const override { return fd_ >= 0; }
+    bool good() const override { return is_open(); }
+    size_t tell() override { return static_cast<size_t>(position_); }
+    std::string label() const override { return "verified immutable backing"; }
+
+    void seek(int64_t offset, std::ios_base::seekdir direction) override {
+        uint64_t base;
+        if (direction == std::ios_base::beg) {
+            base = 0;
+        } else if (direction == std::ios_base::cur) {
+            base = position_;
+        } else if (direction == std::ios_base::end) {
+            base = length_;
+        } else {
+            throw std::runtime_error("[verified weights] invalid seek direction");
+        }
+        if (offset >= 0) {
+            const auto delta = static_cast<uint64_t>(offset);
+            if (delta > length_ - base) {
+                throw std::runtime_error("[verified weights] seek exceeds backing");
+            }
+            position_ = base + delta;
+        } else {
+            // Negating INT64_MIN would overflow; this expression does not.
+            const auto delta = static_cast<uint64_t>(-(offset + 1)) + 1;
+            if (delta > base) {
+                throw std::runtime_error("[verified weights] seek precedes backing");
+            }
+            position_ = base - delta;
+        }
+    }
+
+    void read(char* destination, size_t count) override {
+        read(destination, count, static_cast<size_t>(position_));
+        position_ += count;
+    }
+
+    void read(char* destination, size_t count, size_t offset) override {
+        if (offset > length_ || count > length_ - offset) {
+            throw std::runtime_error("[verified weights] read exceeds backing");
+        }
+        // Positional reads do not share a cursor and are safe for concurrent
+        // lazy MLX loads. Only header parsing uses the sequential cursor.
+        while (count != 0) {
+            const size_t chunk = std::min(count, static_cast<size_t>(1024 * 1024));
+            const ssize_t got = ::pread(fd_, destination, chunk, static_cast<off_t>(offset));
+            if (got < 0 && errno == EINTR) {
+                continue;
+            }
+            if (got <= 0) {
+                throw std::runtime_error("[verified weights] backing read failed or was truncated");
+            }
+            const auto actual = static_cast<size_t>(got);
+            destination += actual;
+            offset += actual;
+            count -= actual;
+        }
+    }
+
+ private:
+    int fd_{-1};
+    uint64_t length_{0};
+    uint64_t position_{0};
+};
+#endif
+
+std::unique_ptr<MlxLoadedWeights> take_loaded_weights(mlx::core::SafetensorsLoad loaded) {
+    auto& weights_map = loaded.first;
     auto result = std::make_unique<MlxLoadedWeights>();
     result->names.reserve(weights_map.size());
     result->arrays.reserve(weights_map.size());
@@ -359,6 +467,22 @@ std::unique_ptr<MlxLoadedWeights> mlx_load_safetensors(rust::Str path) {
     }
 
     return result;
+}
+
+} // namespace
+
+std::unique_ptr<MlxLoadedWeights> mlx_load_safetensors(rust::Str path) {
+    return take_loaded_weights(mlx::core::load_safetensors(std::string(path.data(), path.size())));
+}
+
+std::unique_ptr<MlxLoadedWeights> mlx_load_safetensors_fd(int32_t fd) {
+#ifndef _WIN32
+    return take_loaded_weights(mlx::core::load_safetensors(
+        std::make_shared<OwnedReadOnlyReader>(fd)));
+#else
+    (void)fd;
+    throw std::runtime_error("[verified weights] descriptor loading is unavailable on this platform");
+#endif
 }
 
 size_t loaded_weights_len(const MlxLoadedWeights& w) {

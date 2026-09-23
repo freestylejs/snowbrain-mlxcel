@@ -97,6 +97,8 @@ pub enum NativeRuntimeErrorKind {
     SinkRejected,
     Tokenizer,
     Infrastructure,
+    /// A bounded native load was cancelled before publication.
+    Cancelled,
 }
 
 /// An owned, bounded error that does not expose MLX, server, or frontend types.
@@ -117,6 +119,7 @@ pub enum NativeRuntimeError {
     SinkRejected(NativeBoundedErrorMessage),
     Tokenizer(NativeBoundedErrorMessage),
     Infrastructure(NativeBoundedErrorMessage),
+    Cancelled(NativeBoundedErrorMessage),
 }
 
 impl NativeRuntimeError {
@@ -157,6 +160,7 @@ impl NativeRuntimeError {
             NativeRuntimeErrorKind::SinkRejected => Self::SinkRejected(message),
             NativeRuntimeErrorKind::Tokenizer => Self::Tokenizer(message),
             NativeRuntimeErrorKind::Infrastructure => Self::Infrastructure(message),
+            NativeRuntimeErrorKind::Cancelled => Self::Cancelled(message),
         }
     }
 
@@ -177,6 +181,7 @@ impl NativeRuntimeError {
             Self::SinkRejected(_) => NativeRuntimeErrorKind::SinkRejected,
             Self::Tokenizer(_) => NativeRuntimeErrorKind::Tokenizer,
             Self::Infrastructure(_) => NativeRuntimeErrorKind::Infrastructure,
+            Self::Cancelled(_) => NativeRuntimeErrorKind::Cancelled,
         }
     }
 
@@ -196,7 +201,8 @@ impl NativeRuntimeError {
             | Self::StaleHandle(message)
             | Self::SinkRejected(message)
             | Self::Tokenizer(message)
-            | Self::Infrastructure(message) => message.as_str(),
+            | Self::Infrastructure(message)
+            | Self::Cancelled(message) => message.as_str(),
         }
     }
 }

@@ -52,7 +52,7 @@ fn native_matrix(
     );
 }
 
-fn native_unified_fixture() -> (
+pub(crate) fn native_unified_fixture() -> (
     BTreeMap<String, TensorMetadata>,
     serde_json::Value,
     serde_json::Value,

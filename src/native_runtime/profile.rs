@@ -38,7 +38,7 @@ const _: () = assert!(MAX_STABLE_DELTA_BYTES <= MAX_NATIVE_STABLE_BYTES_PER_UNIT
 const _: () = assert!(MAX_PENDING_DECODE_BYTES <= MAX_NATIVE_STABLE_BYTES_PER_UNIT);
 
 const BUILD_IDENTITY_SCHEMA: &str = "mlxcel.native-build.v3";
-const WORKER_PROFILE_SCHEMA: &str = "mlxcel.native-worker-profile.v1";
+const WORKER_PROFILE_SCHEMA: &str = "mlxcel.native-worker-profile.v2";
 const CANONICAL_MLXCEL_REPOSITORY: &str = "https://github.com/lablup/mlxcel.git";
 const APPROVED_MLXCEL_REPOSITORY: &str = "https://github.com/freestylejs/snowbrain-mlxcel.git";
 pub const MAX_BUILD_ITEMS: usize = 4_096;
@@ -1823,11 +1823,42 @@ pub struct NativeWorkerConfig {
     report_identity: [u8; 32],
     model_context_window: Option<u32>,
     embedding_input_ceiling: Option<u32>,
-    decoder_guarantee: IncrementalDecodeGuarantee,
+    load_binding: Option<super::NativeWorkerLoadBinding>,
+    // None denotes source-bound configuration whose tokenizer has not been loaded yet.
+    // It is never a claim of streaming support; the loader must bind the actual decoder.
+    decoder_guarantee: Option<IncrementalDecodeGuarantee>,
     policy: NativeWorkerPolicy,
 }
 
 impl NativeWorkerConfig {
+    /// Bind only immutable producer facts available before actual model/tokenizer loading.
+    /// An opaque implementation digest is not decoded or substituted for a tokenizer guarantee.
+    pub fn try_from_binding(
+        binding: &super::NativeWorkerLoadBinding,
+        policy: NativeWorkerPolicy,
+    ) -> Result<Self, NativeRuntimeError> {
+        let operation = binding.operation()?;
+        if policy.operation_driver.operation_class() != operation {
+            return Err(NativeRuntimeError::new(
+                NativeRuntimeErrorKind::UnsupportedOperation,
+                "worker policy operation disagrees with its source binding",
+            ));
+        }
+        let config = Self {
+            package_identity: binding.source_identity(),
+            report_identity: binding.report_identity(),
+            model_context_window: binding.max_context_positions(),
+            embedding_input_ceiling: (operation == super::MlxNativeOperationClass::Embedding)
+                .then_some(binding.max_context_positions())
+                .flatten(),
+            load_binding: Some(binding.clone()),
+            decoder_guarantee: None,
+            policy,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
     pub fn try_from_report(
         report: &super::model_report::NativeModelReport,
         policy: NativeWorkerPolicy,
@@ -1925,7 +1956,8 @@ impl NativeWorkerConfig {
             report_identity: report.report_identity(),
             model_context_window: report.context_window(),
             embedding_input_ceiling: report.embedding_input_ceiling(),
-            decoder_guarantee,
+            load_binding: None,
+            decoder_guarantee: Some(decoder_guarantee),
             policy,
         };
         config.validate()?;
@@ -1953,7 +1985,12 @@ impl NativeWorkerConfig {
     }
 
     #[must_use]
-    pub const fn decoder_guarantee(&self) -> IncrementalDecodeGuarantee {
+    pub const fn load_binding(&self) -> Option<&super::NativeWorkerLoadBinding> {
+        self.load_binding.as_ref()
+    }
+
+    #[must_use]
+    pub const fn decoder_guarantee(&self) -> Option<IncrementalDecodeGuarantee> {
         self.decoder_guarantee
     }
 
@@ -2046,7 +2083,7 @@ impl NativeWorkerConfig {
                     "worker context policy exceeds the inspected model context",
                 ));
             }
-            if self.decoder_guarantee == IncrementalDecodeGuarantee::TerminalOnly {
+            if self.decoder_guarantee == Some(IncrementalDecodeGuarantee::TerminalOnly) {
                 return Err(NativeRuntimeError::new(
                     NativeRuntimeErrorKind::UnsupportedGuarantee,
                     "terminal-only tokenizer cannot start a streaming generation worker",
@@ -2084,7 +2121,7 @@ impl NativeWorkerConfig {
                 ));
             }
         }
-        if let IncrementalDecodeGuarantee::ProvenBoundedLookbehind { tokens } =
+        if let Some(IncrementalDecodeGuarantee::ProvenBoundedLookbehind { tokens }) =
             self.decoder_guarantee
             && (tokens == 0 || tokens > MAX_PROVEN_LOOKBEHIND_TOKENS)
         {
@@ -2130,6 +2167,31 @@ impl NativeWorkerConfig {
         encoder.text(WORKER_PROFILE_SCHEMA);
         encoder.bytes(&self.package_identity);
         encoder.bytes(&self.report_identity);
+        match &self.load_binding {
+            Some(binding) => {
+                encoder.byte(1);
+                encoder.bytes(&binding.source_identity());
+                encoder.bytes(&binding.report_identity());
+                encoder.bytes(&binding.native_build_identity());
+                encoder.text(binding.architecture());
+                encoder.boolean(binding.architecture_supported());
+                match binding.max_context_positions() {
+                    Some(value) => {
+                        encoder.byte(1);
+                        encoder.bytes(&value.to_le_bytes());
+                    }
+                    None => encoder.byte(0),
+                }
+                let modalities = binding.modalities();
+                encoder.boolean(modalities.text);
+                encoder.boolean(modalities.image);
+                encoder.boolean(modalities.audio);
+                encoder.boolean(modalities.video);
+                encoder.bytes(&binding.tokenizer().digest());
+                encoder.text(binding.tokenizer().implementation());
+            }
+            None => encoder.byte(0),
+        }
         match self.model_context_window {
             Some(window) => {
                 encoder.byte(1);
@@ -2161,12 +2223,13 @@ impl NativeWorkerConfig {
         encoder.byte(self.policy.device.offload as u8);
         encoder.bytes(&self.policy.device.max_device_bytes.to_le_bytes());
         match self.decoder_guarantee {
-            IncrementalDecodeGuarantee::RawTokenBytes => encoder.byte(0),
-            IncrementalDecodeGuarantee::ProvenBoundedLookbehind { tokens } => {
+            Some(IncrementalDecodeGuarantee::RawTokenBytes) => encoder.byte(0),
+            Some(IncrementalDecodeGuarantee::ProvenBoundedLookbehind { tokens }) => {
                 encoder.byte(1);
                 encoder.bytes(&(tokens as u64).to_le_bytes());
             }
-            IncrementalDecodeGuarantee::TerminalOnly => encoder.byte(2),
+            Some(IncrementalDecodeGuarantee::TerminalOnly) => encoder.byte(2),
+            None => encoder.byte(3),
         }
         encoder.byte(self.policy.model_owned_state as u8);
         match &self.policy.adapter {
@@ -2301,7 +2364,8 @@ mod tests {
             report_identity: [2; 32],
             model_context_window: Some(8),
             embedding_input_ceiling: Some(8),
-            decoder_guarantee: guarantee,
+            load_binding: None,
+            decoder_guarantee: Some(guarantee),
             policy: generation_policy(),
         }
     }

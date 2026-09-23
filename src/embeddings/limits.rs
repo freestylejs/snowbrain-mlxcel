@@ -88,16 +88,33 @@ pub fn derive_max_length(
     is_absolute_position: bool,
     max_length_override: Option<usize>,
 ) -> usize {
+    derive_max_length_from_configs(
+        read_json(&model_dir.join("config.json")).as_ref(),
+        read_json(&model_dir.join("tokenizer_config.json")).as_ref(),
+        read_json(&model_dir.join("sentence_bert_config.json")).as_ref(),
+        is_absolute_position,
+        max_length_override,
+    )
+}
+
+/// The same length policy over already loaded declared metadata; performs no I/O.
+pub(crate) fn derive_max_length_from_configs(
+    config: Option<&Value>,
+    tokenizer_config: Option<&Value>,
+    sentence_config: Option<&Value>,
+    is_absolute_position: bool,
+    max_length_override: Option<usize>,
+) -> usize {
     let mut candidates: Vec<usize> = vec![EMBEDDING_MAX_LENGTH_CAP];
 
-    if let Some(v) = read_json(&model_dir.join("sentence_bert_config.json"))
+    if let Some(v) = sentence_config
         .and_then(|cfg| cfg.get("max_seq_length")?.as_u64())
         .filter(|&v| v > 0)
     {
         candidates.push(v as usize);
     }
 
-    if let Some(v) = read_json(&model_dir.join("tokenizer_config.json"))
+    if let Some(v) = tokenizer_config
         .and_then(|cfg| cfg.get("model_max_length")?.as_u64())
         .filter(|&v| v > 0 && v < MODEL_MAX_LENGTH_UNSET)
     {
@@ -105,7 +122,7 @@ pub fn derive_max_length(
     }
 
     if is_absolute_position
-        && let Some(v) = read_json(&model_dir.join("config.json"))
+        && let Some(v) = config
             .and_then(|cfg| cfg.get("max_position_embeddings")?.as_u64())
             .filter(|&v| v > 0)
     {
@@ -133,9 +150,19 @@ fn token_string(value: &Value) -> Option<&str> {
 /// Resolve the pad token id: `tokenizer_config.json` `pad_token`, falling
 /// back to `eos_token`, then `0`.
 pub fn resolve_pad_token_id(model_dir: &Path, tokenizer: &MlxcelTokenizer) -> u32 {
-    let config = read_json(&model_dir.join("tokenizer_config.json"));
+    resolve_pad_token_id_from_config(
+        read_json(&model_dir.join("tokenizer_config.json")).as_ref(),
+        tokenizer,
+    )
+}
+
+/// Resolve token identities from the declared sidecar using the shared policy.
+pub(crate) fn resolve_pad_token_id_from_config(
+    config: Option<&Value>,
+    tokenizer: &MlxcelTokenizer,
+) -> u32 {
     let lookup = |key: &str| -> Option<u32> {
-        let token = token_string(config.as_ref()?.get(key)?)?;
+        let token = token_string(config?.get(key)?)?;
         tokenizer.hf_tokenizer()?.token_to_id(token)
     };
     lookup("pad_token")

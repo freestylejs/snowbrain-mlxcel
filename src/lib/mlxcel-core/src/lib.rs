@@ -3017,6 +3017,10 @@ mod ffi {
         /// Returns Result so C++ exceptions (bad path, corrupt file) become recoverable errors.
         fn mlx_load_safetensors(path: &str) -> Result<UniquePtr<MlxLoadedWeights>>;
 
+        /// Duplicate a borrowed read-only Unix file descriptor into an owned,
+        /// bounds-checked MLX reader retained by the lazy weight arrays.
+        fn mlx_load_safetensors_fd(fd: i32) -> Result<UniquePtr<MlxLoadedWeights>>;
+
         /// Number of weight entries in the loaded weights
         fn loaded_weights_len(w: &MlxLoadedWeights) -> usize;
 

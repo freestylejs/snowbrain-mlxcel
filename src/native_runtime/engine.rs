@@ -9,7 +9,6 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use super::builder::{NativeManagedEngine, NativeWorkerFactory, NativeWorkerStartRequest};
-use super::model_report::inspect_package;
 use super::operation_driver::NativeOperationDriver;
 use super::profile::{NativeBuildIdentity, NativeEngineDescriptor, NativeWorkerHealth};
 use super::request::{
@@ -1323,7 +1322,7 @@ impl NativeWorkerFactory for NativeEngineFactory {
                 ));
             }
         };
-        ready_rx.recv().map_err(|_| {
+        let loaded = ready_rx.recv().map_err(|_| {
             NativeRuntimeError::new(
                 NativeRuntimeErrorKind::Infrastructure,
                 "native worker exited before its load handshake",
@@ -1336,6 +1335,7 @@ impl NativeWorkerFactory for NativeEngineFactory {
             channel,
             reservations: Arc::new(ReservationBook::default()),
             alive,
+            loaded,
         }))
     }
 }
@@ -1424,11 +1424,17 @@ fn thread_start_error(error: std::io::Error) -> NativeRuntimeError {
     )
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct NativeLoadReady {
+    statistics: super::NativeLoadStatistics,
+    decoder: Option<super::IncrementalDecodeGuarantee>,
+}
+
 fn start_generation_scheduler(
     request: NativeWorkerStartRequest,
     rx: mpsc::Receiver<ModelRequest>,
     worker_epoch: u64,
-    ready: mpsc::SyncSender<Result<(), NativeRuntimeError>>,
+    ready: mpsc::SyncSender<Result<NativeLoadReady, NativeRuntimeError>>,
 ) -> Result<(), NativeRuntimeError> {
     if !matches!(
         request.profile.operation_driver(),
@@ -1442,39 +1448,21 @@ fn start_generation_scheduler(
         let _ = ready.send(Err(error.clone()));
         return Err(error);
     }
-    let report = inspect_package(&request.package)?;
-    let tokenizer_authority = request
-        .package
-        .bind_worker_tokenizer(&report, &request.profile)?;
-    let labels = request
-        .package
-        .labels()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    let label_refs = labels.iter().map(String::as_str).collect::<Vec<_>>();
-    let loaded = request
-        .package
-        .with_verified_staging_root(&label_refs, |root| {
-            let (model, tokenizer) = crate::load_model(root).map_err(|error| {
-                NativeRuntimeError::new(
-                    NativeRuntimeErrorKind::Infrastructure,
-                    format!("native model load failed: {error}"),
-                )
-            })?;
-            Ok((model, tokenizer, crate::read_eos_token_ids(root)))
-        });
-    let (model, tokenizer, eos) = match loaded {
+    let loaded = super::load_residence::load_generation(&request);
+    let (loaded, statistics) = match loaded {
         Ok(value) => value,
         Err(error) => {
             let _ = ready.send(Err(error.clone()));
             return Err(error);
         }
     };
+    let decoder = loaded.tokenizer.guarantee();
+    let tokenizer = loaded.tokenizer.shared_tokenizer();
     let policy = request.profile.policy();
     let mut scheduler = crate::server::batch::BatchScheduler::with_config(
-        model,
+        loaded.model,
         tokenizer,
-        eos,
+        loaded.eos,
         rx,
         policy.batch.max_active_sequences as usize,
         policy.batch.max_queued_operations as usize,
@@ -1486,9 +1474,13 @@ fn start_generation_scheduler(
         policy.batch.max_active_sequences as usize,
         crate::server::DecodeStorageBackend::Dense,
     )
-    .with_native_runtime(tokenizer_authority, worker_epoch);
-    let _package_lifetime = request.package;
-    let _ = ready.send(Ok(()));
+    .with_native_runtime(loaded.tokenizer, worker_epoch);
+    // Loaded arrays own immutable reader backing; tokenizer state owns its bytes.
+    drop(request);
+    let _ = ready.send(Ok(NativeLoadReady {
+        statistics,
+        decoder: Some(decoder),
+    }));
     scheduler.run();
     Ok(())
 }
@@ -1496,27 +1488,12 @@ fn start_generation_scheduler(
 fn start_embedding_worker(
     request: NativeWorkerStartRequest,
     rx: mpsc::Receiver<NativeEmbeddingCommand>,
-    ready: mpsc::SyncSender<Result<(), NativeRuntimeError>>,
+    ready: mpsc::SyncSender<Result<NativeLoadReady, NativeRuntimeError>>,
 ) -> Result<(), NativeRuntimeError> {
     let stream = mlxcel_core::streams::new_thread_local_generation_stream();
     mlxcel_core::streams::install_thread_local_default_stream(stream.as_ref());
-    let labels = request
-        .package
-        .labels()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    let label_refs = labels.iter().map(String::as_str).collect::<Vec<_>>();
-    let loaded = request
-        .package
-        .with_verified_staging_root(&label_refs, |root| {
-            crate::embeddings::load_embedding_model(root).map_err(|error| {
-                NativeRuntimeError::new(
-                    NativeRuntimeErrorKind::Infrastructure,
-                    format!("native embedding model load failed: {error}"),
-                )
-            })
-        });
-    let loaded = match loaded {
+    let loaded = super::load_residence::load_embedding(&request);
+    let (loaded, statistics) = match loaded {
         Ok(loaded) => loaded,
         Err(error) => {
             let _ = ready.send(Err(error.clone()));
@@ -1525,8 +1502,11 @@ fn start_embedding_worker(
     };
     let batch_size = request.profile.policy().batch.max_active_sequences as usize;
     let engine = crate::embeddings::EmbeddingEngine::new(loaded, batch_size);
-    let _package_lifetime = request.package;
-    let _ = ready.send(Ok(()));
+    drop(request);
+    let _ = ready.send(Ok(NativeLoadReady {
+        statistics,
+        decoder: None,
+    }));
     run_embedding_command_loop(&engine, rx, stream.as_ref());
     Ok(())
 }
@@ -1851,6 +1831,7 @@ struct NativeManagedEngineClient {
     channel: NativeEngineChannel,
     reservations: Arc<ReservationBook>,
     alive: Arc<AtomicBool>,
+    loaded: NativeLoadReady,
 }
 
 impl NativeManagedEngineClient {
@@ -1876,6 +1857,10 @@ impl NativeManagedEngineClient {
 }
 
 impl NativeManagedEngine for NativeManagedEngineClient {
+    fn load_statistics(&self) -> super::NativeLoadStatistics {
+        self.loaded.statistics
+    }
+
     fn descriptor(&self) -> NativeEngineDescriptor {
         let mut descriptor = self.descriptor.clone();
         descriptor.health = project_worker_health(self.alive.load(Ordering::Acquire));
@@ -1897,7 +1882,11 @@ impl NativeManagedEngine for NativeManagedEngineClient {
                 "generation was submitted to a non-generation worker",
             ));
         }
-        if self.profile.decoder_guarantee() == super::IncrementalDecodeGuarantee::TerminalOnly {
+        if self
+            .loaded
+            .decoder
+            .is_none_or(|guarantee| guarantee == super::IncrementalDecodeGuarantee::TerminalOnly)
+        {
             return Err(NativeRuntimeError::new(
                 NativeRuntimeErrorKind::UnsupportedGuarantee,
                 "terminal-only tokenizer profiles cannot admit managed streaming generation",
@@ -2291,6 +2280,10 @@ mod tests {
         (
             NativeManagedEngineClient {
                 descriptor,
+                loaded: NativeLoadReady {
+                    statistics: super::super::NativeLoadStatistics::default(),
+                    decoder: profile.decoder_guarantee(),
+                },
                 profile,
                 capacity: 2,
                 channel: NativeEngineChannel::Generate(tx),

@@ -1228,15 +1228,40 @@ where
         );
     }
 
+    append_selected_tensors(
+        &tensors,
+        selected_names,
+        weights,
+        mode,
+        owned_buffers.as_deref_mut(),
+        debug_gemma4,
+    )?;
+
+    drop(tensors);
+    if let Some(backing_mmaps) = backing_mmaps {
+        backing_mmaps.push(mmap);
+    }
+
+    Ok(())
+}
+
+fn append_selected_tensors(
+    tensors: &SafeTensors<'_>,
+    selected_names: Vec<String>,
+    weights: &mut mlxcel_core::weights::WeightMap,
+    mode: SelectiveLoadMode,
+    mut owned_buffers: Option<&mut Vec<Vec<u8>>>,
+    debug: bool,
+) -> Result<(), String> {
     for name in selected_names {
         let tensor = tensors
             .tensor(&name)
-            .map_err(|e| format!("Failed to read tensor {name} from {}: {e}", path.display()))?;
-        if debug_gemma4 {
+            .map_err(|_| "Selected tensor is unavailable".to_owned())?;
+        if debug {
             eprintln!("  loading {name} {:?} {:?}", tensor.dtype(), tensor.shape());
         }
         let array = tensor_view_to_array(&name, &tensor, mode, owned_buffers.as_deref_mut())?;
-        if debug_gemma4 {
+        if debug {
             eprintln!(
                 "  loaded {name} mlx_dtype={}",
                 mlxcel_core::array_dtype(&array)
@@ -1244,12 +1269,6 @@ where
         }
         weights.insert(name, array);
     }
-
-    drop(tensors);
-    if let Some(backing_mmaps) = backing_mmaps {
-        backing_mmaps.push(mmap);
-    }
-
     Ok(())
 }
 
@@ -1485,6 +1504,66 @@ where
         unsafe { mlxcel_core::detach_all(&ptrs) };
     }
 
+    Ok((weights, backing))
+}
+
+/// Reuse the Gemma 4 family tensor conversion on immutable, already acquired
+/// mappings. No directory discovery, pathname reopen or package proof occurs.
+/// The caller obtains these mappings from read-only unlinked native backing.
+pub(crate) fn load_gemma4_unified_weights_from_mmaps(
+    mappings: Vec<memmap2::Mmap>,
+) -> Result<(mlxcel_core::weights::WeightMap, Gemma4WeightBacking), String> {
+    // Declare the lifetime owner first: on every error, arrays are dropped before
+    // their mappings. Retain each mapping before producing any borrowing array.
+    let mut backing = Gemma4WeightBacking::default();
+    backing
+        .mmaps
+        .try_reserve_exact(mappings.len())
+        .map_err(|_| "Gemma backing allocation failed".to_owned())?;
+    let mut weights = mlxcel_core::weights::WeightMap::new();
+    for mapping in mappings {
+        backing.mmaps.push(mapping);
+        let tensors =
+            SafeTensors::deserialize(backing.mmaps.last().expect("retained current mapping"))
+                .map_err(|_| "Invalid immutable Gemma weight shard".to_owned())?;
+        let names = tensors
+            .names()
+            .into_iter()
+            .filter(|name| is_gemma4_unified_weight(name))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if names.iter().any(|name| weights.contains_key(name)) {
+            return Err("Duplicate tensor across immutable Gemma weight shards".to_owned());
+        }
+        weights
+            .try_reserve(names.len())
+            .map_err(|_| "Gemma weight table allocation failed".to_owned())?;
+        append_selected_tensors(
+            &tensors,
+            names,
+            &mut weights,
+            SelectiveLoadMode::DeferredMaterialize,
+            Some(&mut backing.owned_buffers),
+            false,
+        )?;
+        drop(tensors);
+    }
+    // Preserve the existing family loader's joint evaluation/detachment boundary.
+    // The ownership bundle remains attached to the model even after detachment.
+    let ptrs = weights
+        .values()
+        .filter_map(|value| {
+            value
+                .as_ref()
+                .map(|array| array as *const mlxcel_core::MlxArray)
+        })
+        .collect::<Vec<_>>();
+    if !ptrs.is_empty() {
+        unsafe {
+            mlxcel_core::eval_all(&ptrs);
+            mlxcel_core::detach_all(&ptrs);
+        }
+    }
     Ok((weights, backing))
 }
 

@@ -2311,6 +2311,7 @@ struct MlxLoadedWeights {
 
 // Load safetensors file using MLX's native loader (lazy arrays, MLX-managed mmap)
 std::unique_ptr<MlxLoadedWeights> mlx_load_safetensors(rust::Str path);
+std::unique_ptr<MlxLoadedWeights> mlx_load_safetensors_fd(int32_t fd);
 
 // Access loaded weights
 size_t loaded_weights_len(const MlxLoadedWeights& w);

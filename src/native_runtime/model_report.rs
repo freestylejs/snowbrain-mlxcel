@@ -564,7 +564,7 @@ fn package_changed(message: impl AsRef<str>) -> NativeRuntimeError {
     NativeRuntimeError::new(NativeRuntimeErrorKind::PackageChanged, message)
 }
 
-fn validate_component_label(label: &str) -> Result<(), NativeRuntimeError> {
+pub(super) fn validate_component_label(label: &str) -> Result<(), NativeRuntimeError> {
     if label.is_empty() || label.len() > MAX_NATIVE_PACKAGE_LABEL_BYTES || label.contains('\\') {
         return Err(invalid_package(
             "package component label is empty, too large, or not slash-normalized",
@@ -1259,6 +1259,49 @@ pub(crate) struct NativeBoundTokenizer {
 }
 
 impl NativeBoundTokenizer {
+    /// Binds a tokenizer already loaded from the retained verified source. The
+    /// guarantee is produced by the native tokenizer loader, never a caller digest.
+    pub(crate) fn from_loaded(
+        tokenizer: crate::tokenizer::MlxcelTokenizer,
+        guarantee: IncrementalDecodeGuarantee,
+        binding: &super::NativeWorkerLoadBinding,
+        profile: &super::NativeWorkerConfig,
+    ) -> Result<Self, NativeRuntimeError> {
+        if profile.package_identity() != binding.source_identity()
+            || profile.report_identity() != binding.report_identity()
+            || profile
+                .decoder_guarantee()
+                .is_some_and(|expected| expected != guarantee)
+        {
+            return Err(NativeRuntimeError::new(
+                NativeRuntimeErrorKind::InvalidPackage,
+                "loaded tokenizer disagrees with the immutable source/profile binding",
+            ));
+        }
+        if matches!(
+            profile.operation_driver(),
+            super::NativeOperationDriver::AutoregressiveGenerate
+                | super::NativeOperationDriver::EncoderDecoderGenerate
+        ) && guarantee == IncrementalDecodeGuarantee::TerminalOnly
+        {
+            return Err(NativeRuntimeError::new(
+                NativeRuntimeErrorKind::UnsupportedGuarantee,
+                "loaded tokenizer has no supported incremental decoder",
+            ));
+        }
+        Ok(Self {
+            tokenizer: Arc::new(tokenizer),
+            guarantee,
+            package_identity: binding.source_identity(),
+            report_identity: binding.report_identity(),
+            tokenizer_identity: binding.tokenizer().digest(),
+        })
+    }
+
+    pub(crate) fn shared_tokenizer(&self) -> Arc<crate::tokenizer::MlxcelTokenizer> {
+        Arc::clone(&self.tokenizer)
+    }
+
     pub(crate) const fn guarantee(&self) -> IncrementalDecodeGuarantee {
         self.guarantee
     }
@@ -1476,7 +1519,7 @@ impl NativeImmutablePackage {
             || report.report_identity() != model_report_identity(report)
             || config.package_identity() != report.package_identity()
             || config.report_identity() != report.report_identity()
-            || config.decoder_guarantee() != report.tokenizer().incremental_decode()
+            || config.decoder_guarantee() != Some(report.tokenizer().incremental_decode())
         {
             return Err(NativeRuntimeError::new(
                 NativeRuntimeErrorKind::InvalidRequest,
@@ -2193,15 +2236,24 @@ fn mlx_safetensors_dtype_supported(dtype: safetensors::Dtype) -> bool {
 fn declared_tokenizer_primary(
     package: &NativeImmutablePackage,
 ) -> Result<Option<Arc<str>>, NativeRuntimeError> {
-    let primary = if package.component("tokenizer.json").is_some() {
+    select_declared_tokenizer_primary(&package.labels().collect::<Vec<_>>())
+}
+
+/// Exact primary selection shared by cold inspection and source-driven loading.
+/// This function reads declarations only; it never opens or hashes an artifact.
+pub(crate) fn select_declared_tokenizer_primary(
+    labels: &[&str],
+) -> Result<Option<Arc<str>>, NativeRuntimeError> {
+    let primary = if labels.contains(&"tokenizer.json") {
         Some(Arc::<str>::from("tokenizer.json"))
-    } else if package.component("tokenizer.model").is_some() {
+    } else if labels.contains(&"tokenizer.model") {
         Some(Arc::<str>::from("tokenizer.model"))
-    } else if package.component("tiktoken.model").is_some() {
+    } else if labels.contains(&"tiktoken.model") {
         Some(Arc::<str>::from("tiktoken.model"))
     } else {
-        let mut tiktoken = package
-            .labels()
+        let mut tiktoken = labels
+            .iter()
+            .copied()
             .filter(|label| label.ends_with(".tiktoken"))
             .collect::<Vec<_>>();
         tiktoken.sort_unstable();
@@ -2214,14 +2266,13 @@ fn declared_tokenizer_primary(
             .first()
             .map(|label| Arc::<str>::from(*label))
             .or_else(|| {
-                package
-                    .component("tokenizer.jsonl")
-                    .map(|_| Arc::<str>::from("tokenizer.jsonl"))
+                labels
+                    .contains(&"tokenizer.jsonl")
+                    .then(|| Arc::<str>::from("tokenizer.jsonl"))
             })
             .or_else(|| {
-                (package.component("vocab.json").is_some()
-                    && package.component("merges.txt").is_some())
-                .then(|| Arc::<str>::from("vocab.json"))
+                (labels.contains(&"vocab.json") && labels.contains(&"merges.txt"))
+                    .then(|| Arc::<str>::from("vocab.json"))
             })
     };
     Ok(primary)
@@ -2333,7 +2384,7 @@ fn inspect_tokenizer(
 /// BPE + `Replace("▁", " ")` + `ByteFallback` + `Fuse`. Each transform is
 /// compositional and UTF-8 completion needs at most four byte pieces. Any
 /// different or unparsed decoder remains terminal-only.
-fn is_proven_replace_byte_fallback_fuse(tokenizer: &serde_json::Value) -> bool {
+pub(crate) fn is_proven_replace_byte_fallback_fuse(tokenizer: &serde_json::Value) -> bool {
     if tokenizer
         .pointer("/model/type")
         .and_then(serde_json::Value::as_str)
