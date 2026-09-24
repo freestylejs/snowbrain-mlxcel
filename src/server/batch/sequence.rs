@@ -337,6 +337,12 @@ impl SequenceInfo {
             .is_some_and(crate::native_runtime::sequence::NativeSequencePort::is_terminal)
     }
 
+    pub(crate) fn native_physical_stopped(&mut self) {
+        if let Some(port) = self.physical.native.as_mut() {
+            port.physical_stopped();
+        }
+    }
+
     pub(crate) fn native_mark_dependent_sample(&mut self) {
         if let Some(port) = self.physical.native.as_mut() {
             port.mark_dependent_sample();

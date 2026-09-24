@@ -46,7 +46,7 @@ pub(crate) use prompt_json::{
     SERVER_PROMPT_JSON_MAX_OUTPUT_BYTES, python_tojson_bounded, python_tojson_for_server,
 };
 pub(crate) use prompt_renderer::configure_neutral_prompt_environment;
-pub(crate) use request::NativeReservationRelease;
+pub(crate) use request::{NativeReservationGuard, NativeReservationRelease};
 pub(crate) use sequence::PhysicalSequence;
 
 pub use builder::{NativeManagedEngine, NativeRuntimeBuilder, NativeWorkerStartRequest};
@@ -92,9 +92,10 @@ pub use request::{
     MAX_NATIVE_TEXT_BYTES, NativeCacheContext, NativeConstraintPlan, NativeEmbedAdmission,
     NativeEmbedRequest, NativeEmbeddingInput, NativeEmbeddingLimits, NativeEmbeddingNormalization,
     NativeExecutionHandle, NativeExecutionKind, NativeGenerateAdmission, NativeGenerateRequest,
-    NativeGenerationLimits, NativeOwnedPreparedInput, NativePreparedPrefill, NativePromptInput,
-    NativeReclaimRequest, NativeReclaimResult, NativeSamplingConfig, NativeSchedulingHints,
-    NativeSpeculationPolicy, NativeSpeculationPreference, NativeSpeculativeFidelity,
+    NativeGenerationLimits, NativeOwnedPreparedInput, NativePreparedGenerate,
+    NativePreparedPrefill, NativePromptInput, NativeReclaimRequest, NativeReclaimResult,
+    NativeSamplingConfig, NativeSchedulingHints, NativeSpeculationPolicy,
+    NativeSpeculationPreference, NativeSpeculativeFidelity,
 };
 pub use sink::{
     MAX_NATIVE_ACCEPTED_UNITS, MAX_NATIVE_EMBEDDING_DIMENSION, MAX_NATIVE_STABLE_BYTES_PER_CHUNK,

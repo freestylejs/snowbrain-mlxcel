@@ -2303,7 +2303,7 @@ pub struct NativeEngineDescriptor {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn source(label: &str, byte: u8) -> NativeBuildSource {
@@ -2653,6 +2653,11 @@ mod tests {
             emitted_link_directives: &["consumer-link-plan=fixture"],
         })
         .unwrap()
+    }
+
+    pub(crate) fn current_native_test_identity() -> NativeBuildIdentity {
+        let outer = &embedded_outer_record::GENERATED_OUTER_BUILD_RECORD;
+        embedded_native_build_identity(embedded_consumer(outer.outer_source_revision)).unwrap()
     }
 
     #[test]

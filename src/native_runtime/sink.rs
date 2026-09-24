@@ -450,6 +450,10 @@ pub trait NativeGenerateSink: Send {
     fn physical(&mut self, event: NativePhysicalEvent);
 
     fn terminal(&mut self, terminal: NativePhysicalTerminal);
+
+    /// Reports physical quiescence after scheduler/model/cache references have
+    /// been removed and the worker generation stream has been synchronized.
+    fn physical_stopped(&mut self) {}
 }
 
 pub trait NativeEmbeddingSink: Send {

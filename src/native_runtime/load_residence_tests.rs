@@ -5,6 +5,9 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+#[path = "generation_prepare_tests.rs"]
+mod generation_prepare;
+
 struct Source {
     bytes: BTreeMap<String, Vec<u8>>,
     reads: Mutex<BTreeMap<String, u64>>,

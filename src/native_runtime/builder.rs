@@ -28,7 +28,7 @@ use super::profile::{
 };
 use super::request::{
     NativeEmbedAdmission, NativeEmbedRequest, NativeExecutionHandle, NativeGenerateAdmission,
-    NativeGenerateRequest, NativeReclaimRequest, NativeReclaimResult,
+    NativeGenerateRequest, NativePreparedGenerate, NativeReclaimRequest, NativeReclaimResult,
 };
 use super::sink::{NativeEmbeddingSink, NativeGenerateSink, NativeMemorySnapshot};
 
@@ -93,7 +93,9 @@ impl NativeWorkerStartRequest {
 /// returned non-cloneable capability owns its reservation; dropping it before
 /// a successful start releases that reservation.
 ///
-/// `start_*` keeps that release guard armed until the corresponding
+/// Generation preparation allocates one real scheduler sequence without
+/// dispatching model work. Dropping the prepared capability releases that
+/// unstarted physical state. Start keeps the reservation armed until the corresponding
 /// `sink.started(...)` callback succeeds. It may return `Err` only before that
 /// handshake, in which case the reservation is released. After the handshake,
 /// it returns a non-cloneable handle and reports every later failure exactly
@@ -114,9 +116,14 @@ pub trait NativeManagedEngine: Send {
         request: &NativeGenerateRequest,
     ) -> Result<NativeGenerateAdmission, NativeRuntimeError>;
 
-    fn start_generate(
+    fn prepare_generate(
         &mut self,
         admission: NativeGenerateAdmission,
+    ) -> Result<NativePreparedGenerate, NativeRuntimeError>;
+
+    fn start_generate(
+        &mut self,
+        prepared: NativePreparedGenerate,
         sink: Box<dyn NativeGenerateSink + Send>,
     ) -> Result<NativeExecutionHandle, NativeRuntimeError>;
 

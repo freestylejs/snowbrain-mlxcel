@@ -25,7 +25,7 @@
 //! decode steps are interleaved between chunks so active sequences are not
 //! starved during prefill of large prompts.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,6 +49,7 @@ use mlxcel_core::sampling::{
 };
 use mlxcel_core::streams::{
     install_thread_local_default_stream, new_thread_local_generation_stream,
+    synchronize_thread_local_stream,
 };
 use mlxcel_core::utils::{align_to_na_tile, create_padded_prefill_mask};
 use mlxcel_core::{MlxThreadLocalStream, UniquePtr};
@@ -74,6 +75,12 @@ struct ServerNativeStart {
     request_id: u128,
     release: Arc<dyn crate::native_runtime::NativeReservationRelease>,
     started: ServerStartedHandshake,
+}
+
+struct NativePreparedSequence {
+    request: Arc<crate::native_runtime::NativeGenerateRequest>,
+    sequence: SequenceInfo,
+    guard: crate::native_runtime::NativeReservationGuard,
 }
 
 struct ServerStartedHandshake {
@@ -740,6 +747,7 @@ pub struct BatchScheduler {
     /// Present only on the dedicated neutral managed-runtime worker.
     native_tokenizer: Option<crate::native_runtime::NativeBoundTokenizer>,
     native_worker_epoch: Option<u64>,
+    native_prepared: HashMap<u128, NativePreparedSequence>,
 }
 
 /// One prebuilt decode step held across ticks by the lookahead pipeline.
@@ -938,6 +946,31 @@ impl BatchScheduler {
         self.cache_pool.release(seq_id);
     }
 
+    fn release_prepared_native_sequence(&mut self, prepared: NativePreparedSequence) {
+        let NativePreparedSequence {
+            sequence,
+            guard,
+            request: _,
+        } = prepared;
+        self.release_sequence_caches(sequence.seq_id);
+        synchronize_thread_local_stream(self.generation_stream.as_ref());
+        drop(sequence);
+        drop(guard);
+    }
+
+    fn finish_native_physical_cleanup(&mut self, seq: &mut SequenceInfo) {
+        self.release_sequence_caches(seq.seq_id);
+        synchronize_thread_local_stream(self.generation_stream.as_ref());
+        seq.native_physical_stopped();
+    }
+
+    fn drain_native_prepared(&mut self) {
+        let prepared = std::mem::take(&mut self.native_prepared);
+        for entry in prepared.into_values() {
+            self.release_prepared_native_sequence(entry);
+        }
+    }
+
     /// #822: note a successful MLX eval at the decode/prefill boundary, clearing
     /// the consecutive-failure run. Cheap single-field write on the hot path.
     #[inline]
@@ -1008,10 +1041,14 @@ impl BatchScheduler {
     /// reclaimed, not re-notified, so it never receives a duplicate error event.
     fn drain_all_inflight_with_error(&mut self, err: &str) {
         for seq_id in self.active_batch.sequence_ids() {
-            if let Some(seq) = self.active_batch.remove(seq_id) {
+            if let Some(mut seq) = self.active_batch.remove(seq_id) {
                 if seq.state.is_finished() {
                     self.prompt_cache_seq_ctx.remove(&seq.seq_id);
-                    self.release_sequence_caches(seq.seq_id);
+                    if seq.has_native_port() {
+                        self.finish_native_physical_cleanup(&mut seq);
+                    } else {
+                        self.release_sequence_caches(seq.seq_id);
+                    }
                 } else {
                     self.abort_sequence(seq, err);
                 }
@@ -1582,6 +1619,7 @@ impl BatchScheduler {
             lookahead_force_sync: std::env::var("MLXCEL_FORCE_SYNC").is_ok(),
             native_tokenizer: None,
             native_worker_epoch: None,
+            native_prepared: HashMap::new(),
         }
     }
 
@@ -3545,6 +3583,7 @@ impl BatchScheduler {
             // 4. Clean up completed sequences
             self.finalize_completed();
         }
+        self.drain_native_prepared();
     }
 
     fn publish_metrics(&self) {
@@ -3921,46 +3960,113 @@ impl BatchScheduler {
             NativeSchedulerCommand::ResolveGenerate { request, reply } => {
                 let _ = reply.send(self.resolve_native_generate_request(&request));
             }
-            NativeSchedulerCommand::StartGenerate {
+            NativeSchedulerCommand::PrepareGenerate {
                 reservation_id,
                 request,
-                mut sink,
-                release,
                 cancelled,
-                started,
+                guard,
+                prepared,
             } => {
                 let result = self.enqueue_native_request(Arc::clone(&request), cancelled);
                 match result {
-                    Ok((identity, seq)) => {
-                        if let Err(error) = sink.started(identity) {
-                            self.release_sequence_caches(seq.seq_id);
-                            let _ = started.send(Err(error));
-                            return;
+                    Ok((identity, sequence)) => {
+                        let entry = NativePreparedSequence {
+                            request,
+                            sequence,
+                            guard,
+                        };
+                        if self.native_prepared.insert(reservation_id, entry).is_some() {
+                            unreachable!("native reservation ids are unique while live");
                         }
-                        let mut seq = seq;
-                        seq.native =
-                            Some(crate::native_runtime::sequence::NativeSequencePort::new(
-                                Arc::clone(&request),
-                                identity,
-                                sink,
-                                reservation_id,
-                                release,
-                            ));
-                        if let Err(mut rejected) = self.prefill_queue.enqueue(seq) {
-                            rejected.native_terminal(crate::native_runtime::NativePhysicalTerminal::Failed(
-                                crate::native_runtime::NativeRuntimeError::new(
-                                    crate::native_runtime::NativeRuntimeErrorKind::ResourceLimit,
-                                    "native prefill queue is full",
-                                ),
-                            ));
-                            self.release_sequence_caches(rejected.seq_id);
+                        if prepared.send(Ok(identity)).is_err()
+                            && let Some(entry) = self.native_prepared.remove(&reservation_id)
+                        {
+                            self.release_prepared_native_sequence(entry);
                         }
-                        let _ = started.send(Ok(()));
                     }
                     Err(error) => {
-                        let _ = started.send(Err(error));
+                        let _ = prepared.send(Err(error));
+                        drop(guard);
                     }
                 }
+            }
+            NativeSchedulerCommand::StartGenerate {
+                reservation_id,
+                sequence,
+                mut sink,
+                started,
+            } => {
+                let Some(prepared) = self.native_prepared.remove(&reservation_id) else {
+                    let _ = started.send(Err(crate::native_runtime::NativeRuntimeError::new(
+                        crate::native_runtime::NativeRuntimeErrorKind::StaleHandle,
+                        "prepared native sequence is no longer available",
+                    )));
+                    return;
+                };
+                let NativePreparedSequence {
+                    request,
+                    sequence: mut seq,
+                    guard,
+                } = prepared;
+                if seq.seq_id.as_u64() != sequence.sequence_id
+                    || request.request_id != sequence.request_id
+                    || self.native_worker_epoch.unwrap_or(0) != sequence.worker_epoch
+                {
+                    self.release_sequence_caches(seq.seq_id);
+                    synchronize_thread_local_stream(self.generation_stream.as_ref());
+                    drop(seq);
+                    drop(guard);
+                    let _ = started.send(Err(crate::native_runtime::NativeRuntimeError::new(
+                        crate::native_runtime::NativeRuntimeErrorKind::StaleHandle,
+                        "prepared native sequence identity is stale",
+                    )));
+                    return;
+                }
+                if let Err(error) = sink.started(sequence) {
+                    self.release_sequence_caches(seq.seq_id);
+                    synchronize_thread_local_stream(self.generation_stream.as_ref());
+                    drop(seq);
+                    sink.physical_stopped();
+                    drop(guard);
+                    let _ = started.send(Err(error));
+                    return;
+                }
+                let release = guard.into_release();
+                seq.native = Some(crate::native_runtime::sequence::NativeSequencePort::new(
+                    Arc::clone(&request),
+                    sequence,
+                    sink,
+                    reservation_id,
+                    release,
+                ));
+                if let Err(mut rejected) = self.prefill_queue.enqueue(seq) {
+                    rejected.native_terminal(
+                        crate::native_runtime::NativePhysicalTerminal::Failed(
+                            crate::native_runtime::NativeRuntimeError::new(
+                                crate::native_runtime::NativeRuntimeErrorKind::ResourceLimit,
+                                "native prefill queue is full",
+                            ),
+                        ),
+                    );
+                    self.finish_native_physical_cleanup(&mut rejected);
+                }
+                let _ = started.send(Ok(()));
+            }
+            NativeSchedulerCommand::ReleasePrepared {
+                reservation_id,
+                sequence,
+            } => {
+                let Some(prepared) = self.native_prepared.remove(&reservation_id) else {
+                    return;
+                };
+                if prepared.sequence.seq_id.as_u64() != sequence.sequence_id
+                    || prepared.request.request_id != sequence.request_id
+                    || self.native_worker_epoch.unwrap_or(0) != sequence.worker_epoch
+                {
+                    self.native_prepared.insert(reservation_id, prepared);
+                    return;
+                }
+                self.release_prepared_native_sequence(prepared);
             }
             NativeSchedulerCommand::StartServerGenerate {
                 reservation_id,
@@ -4001,15 +4107,21 @@ impl BatchScheduler {
             NativeSchedulerCommand::MemorySnapshot(reply) => {
                 let _ = reply.send(crate::native_runtime::engine::capture_memory_snapshot(
                     self.active_batch.len() as u32,
-                    self.prefill_queue.len() as u32,
+                    self.prefill_queue
+                        .len()
+                        .saturating_add(self.native_prepared.len()) as u32,
                 ));
             }
             NativeSchedulerCommand::Reclaim(request, reply) => {
                 let retained_active_sequences =
-                    self.active_batch.len() as u32 + u32::from(self.chunked_prefill_seq.is_some());
+                    self.active_batch
+                        .len()
+                        .saturating_add(self.native_prepared.len()) as u32
+                        + u32::from(self.chunked_prefill_seq.is_some());
                 let result = if self.active_batch.is_empty()
                     && self.prefill_queue.is_empty()
                     && self.chunked_prefill_seq.is_none()
+                    && self.native_prepared.is_empty()
                 {
                     crate::native_runtime::engine::reclaim_idle_allocator(request, 0)
                 } else {
@@ -4038,6 +4150,9 @@ impl BatchScheduler {
         })?;
         let prompt_token_ids = match &request.prompt {
             crate::native_runtime::NativePromptInput::TokenIds(ids) => Arc::clone(ids),
+            crate::native_runtime::NativePromptInput::Text(text) => {
+                tokenizer.resolve_plain_text(text)?.into()
+            }
             crate::native_runtime::NativePromptInput::Rendered(prompt) => {
                 tokenizer.resolve_rendered_prompt(prompt)?.into()
             }
@@ -4095,10 +4210,11 @@ impl BatchScheduler {
         }
         let prompt_tokens = match &request.prompt {
             crate::native_runtime::NativePromptInput::TokenIds(ids) => ids.to_vec(),
-            crate::native_runtime::NativePromptInput::Rendered(_) => {
+            crate::native_runtime::NativePromptInput::Text(_)
+            | crate::native_runtime::NativePromptInput::Rendered(_) => {
                 return Err(crate::native_runtime::NativeRuntimeError::new(
                     crate::native_runtime::NativeRuntimeErrorKind::InvalidRequest,
-                    "rendered prompt was not resolved before generation start",
+                    "text prompt was not resolved before generation preparation",
                 ));
             }
             crate::native_runtime::NativePromptInput::Prepared(_) => {
@@ -4710,7 +4826,6 @@ impl BatchScheduler {
 
         if let Err(mut rejected) = self.prefill_queue.enqueue(seq) {
             self.prompt_cache_seq_ctx.remove(&rejected.seq_id);
-            self.release_sequence_caches(rejected.seq_id);
             if rejected.has_native_port() {
                 rejected.native_terminal(crate::native_runtime::NativePhysicalTerminal::Failed(
                     crate::native_runtime::NativeRuntimeError::new(
@@ -4718,7 +4833,9 @@ impl BatchScheduler {
                         "Server busy: prefill queue full",
                     ),
                 ));
+                self.finish_native_physical_cleanup(&mut rejected);
             } else {
+                self.release_sequence_caches(rejected.seq_id);
                 let _ = rejected.response_tx.send(GenerateEvent::Error(
                     "Server busy: prefill queue full".to_string(),
                 ));
@@ -4921,8 +5038,12 @@ impl BatchScheduler {
         // blocks as their sequences finish; this request retries then.
         if let Err(mut rejected) = self.prefill_queue.enqueue(seq) {
             self.prompt_cache_seq_ctx.remove(&rejected.seq_id);
-            self.release_sequence_caches(rejected.seq_id);
             rejected.emit_terminal_error("Server busy: prefill queue full");
+            if rejected.has_native_port() {
+                self.finish_native_physical_cleanup(&mut rejected);
+            } else {
+                self.release_sequence_caches(rejected.seq_id);
+            }
         }
         None
     }
@@ -7218,7 +7339,11 @@ impl BatchScheduler {
                         tracing::error!("State transition error: {err}");
                     }
                     self.prompt_cache_seq_ctx.remove(&seq.seq_id);
-                    self.release_sequence_caches(seq.seq_id);
+                    if seq.has_native_port() {
+                        self.finish_native_physical_cleanup(&mut seq);
+                    } else {
+                        self.release_sequence_caches(seq.seq_id);
+                    }
                     return;
                 }
             }
@@ -7341,7 +7466,11 @@ impl BatchScheduler {
             // prefix. `generated_tokens` is empty here by construction.
             self.donate_finished_sequence_cache(seq.seq_id, &seq.prompt_tokens, &[], true);
             self.prompt_cache_seq_ctx.remove(&seq.seq_id);
-            self.release_sequence_caches(seq.seq_id);
+            if seq.has_native_port() {
+                self.finish_native_physical_cleanup(&mut seq);
+            } else {
+                self.release_sequence_caches(seq.seq_id);
+            }
             return;
         }
 
@@ -7389,7 +7518,7 @@ impl BatchScheduler {
             Err(error) => {
                 seq.fail_server_native_projection(error);
                 self.prompt_cache_seq_ctx.remove(&seq.seq_id);
-                self.release_sequence_caches(seq.seq_id);
+                self.finish_native_physical_cleanup(&mut seq);
                 return;
             }
         };
@@ -7451,7 +7580,11 @@ impl BatchScheduler {
                 true,
             );
             self.prompt_cache_seq_ctx.remove(&seq.seq_id);
-            self.release_sequence_caches(seq.seq_id);
+            if seq.has_native_port() {
+                self.finish_native_physical_cleanup(&mut seq);
+            } else {
+                self.release_sequence_caches(seq.seq_id);
+            }
             return;
         }
 
@@ -7507,7 +7640,7 @@ impl BatchScheduler {
             seq.native_terminal(crate::native_runtime::NativePhysicalTerminal::Completed {
                 reason: crate::native_runtime::NativeStopReason::Eos,
             });
-            self.release_sequence_caches(seq.seq_id);
+            self.finish_native_physical_cleanup(&mut seq);
             return;
         }
         let usage = crate::native_runtime::NativeUsageDelta {
@@ -7534,7 +7667,7 @@ impl BatchScheduler {
                         error.to_string(),
                     )));
                 seq.native_terminal(crate::native_runtime::NativePhysicalTerminal::Failed(error));
-                self.release_sequence_caches(seq.seq_id);
+                self.finish_native_physical_cleanup(&mut seq);
                 return;
             }
         };
@@ -7558,7 +7691,7 @@ impl BatchScheduler {
                     ),
                 )
             }));
-            self.release_sequence_caches(seq.seq_id);
+            self.finish_native_physical_cleanup(&mut seq);
             return;
         }
         if outcome.discarded_units != 0 || outcome.committed_units != 1 {
@@ -7572,7 +7705,7 @@ impl BatchScheduler {
                     error.to_string(),
                 )));
             seq.native_terminal(crate::native_runtime::NativePhysicalTerminal::Failed(error));
-            self.release_sequence_caches(seq.seq_id);
+            self.finish_native_physical_cleanup(&mut seq);
             return;
         }
         if seq.generated_tokens.len() >= seq.max_tokens {
@@ -7583,7 +7716,7 @@ impl BatchScheduler {
                 .state
                 .transition_to(SequenceState::Finished(FinishReason::Length));
             seq.native_terminal(terminal);
-            self.release_sequence_caches(seq.seq_id);
+            self.finish_native_physical_cleanup(&mut seq);
             return;
         }
         self.prepare_turbo4_delegated_for_sequence_decode(seq.seq_id);
@@ -9159,7 +9292,11 @@ impl BatchScheduler {
             // partially populated; skip donate-back and just release. The
             // context map still needs cleanup so no dangling entries leak.
             self.prompt_cache_seq_ctx.remove(&seq.seq_id);
-            self.release_sequence_caches(seq.seq_id);
+            if seq.has_native_port() {
+                self.finish_native_physical_cleanup(&mut seq);
+            } else {
+                self.release_sequence_caches(seq.seq_id);
+            }
             self.batch_observability.record_sequence_completed();
         }
 
@@ -9225,7 +9362,7 @@ impl BatchScheduler {
                         );
                     }
                     self.prompt_cache_seq_ctx.remove(&id);
-                    self.release_sequence_caches(id);
+                    self.finish_native_physical_cleanup(&mut seq);
                     self.batch_metrics
                         .record_sequence_completed(tokens_generated);
                     self.batch_observability.record_sequence_completed();
@@ -9326,7 +9463,11 @@ impl BatchScheduler {
             // No prefill ran → no valid cache to donate. Clear the
             // context entry so it cannot linger.
             self.prompt_cache_seq_ctx.remove(&seq.seq_id);
-            self.release_sequence_caches(seq.seq_id);
+            if seq.has_native_port() {
+                self.finish_native_physical_cleanup(&mut seq);
+            } else {
+                self.release_sequence_caches(seq.seq_id);
+            }
             self.batch_observability.record_sequence_completed();
         }
     }
@@ -9363,7 +9504,11 @@ impl BatchScheduler {
         // donated back. Dropping the context entry prevents a future
         // finalize pass from trying.
         self.prompt_cache_seq_ctx.remove(&seq.seq_id);
-        self.release_sequence_caches(seq.seq_id);
+        if seq.has_native_port() {
+            self.finish_native_physical_cleanup(&mut seq);
+        } else {
+            self.release_sequence_caches(seq.seq_id);
+        }
     }
 }
 

@@ -13,8 +13,8 @@ use super::operation_driver::NativeOperationDriver;
 use super::profile::{NativeBuildIdentity, NativeEngineDescriptor, NativeWorkerHealth};
 use super::request::{
     NativeEmbedAdmission, NativeEmbedRequest, NativeExecutionHandle, NativeExecutionKind,
-    NativeGenerateAdmission, NativeGenerateRequest, NativeReclaimRequest, NativeReclaimResult,
-    NativeReservationGuard, NativeReservationRelease,
+    NativeGenerateAdmission, NativeGenerateRequest, NativePreparedGenerate, NativePreparedRelease,
+    NativeReclaimRequest, NativeReclaimResult, NativeReservationGuard, NativeReservationRelease,
 };
 use super::sink::{NativeEmbeddingSink, NativeGenerateSink, NativeMemorySnapshot};
 use super::{NativeRuntimeError, NativeRuntimeErrorKind, NativeWorkerConfig};
@@ -131,13 +131,22 @@ pub(crate) enum NativeSchedulerCommand {
         request: Arc<NativeGenerateRequest>,
         reply: mpsc::SyncSender<Result<NativeGenerateResolution, NativeRuntimeError>>,
     },
-    StartGenerate {
+    PrepareGenerate {
         reservation_id: u128,
         request: Arc<NativeGenerateRequest>,
-        sink: Box<dyn NativeGenerateSink + Send>,
-        release: Arc<dyn NativeReservationRelease>,
         cancelled: Arc<std::sync::atomic::AtomicBool>,
+        guard: NativeReservationGuard,
+        prepared: mpsc::SyncSender<Result<super::NativeSequenceIdentity, NativeRuntimeError>>,
+    },
+    StartGenerate {
+        reservation_id: u128,
+        sequence: super::NativeSequenceIdentity,
+        sink: Box<dyn NativeGenerateSink + Send>,
         started: mpsc::SyncSender<Result<(), NativeRuntimeError>>,
+    },
+    ReleasePrepared {
+        reservation_id: u128,
+        sequence: super::NativeSequenceIdentity,
     },
     StartServerGenerate {
         reservation_id: u128,
@@ -1366,7 +1375,7 @@ fn validate_generate_driver_input(
     prompt: &super::NativePromptInput,
 ) -> Result<(), NativeRuntimeError> {
     match prompt {
-        super::NativePromptInput::TokenIds(_) => Ok(()),
+        super::NativePromptInput::TokenIds(_) | super::NativePromptInput::Text(_) => Ok(()),
         super::NativePromptInput::Rendered(_) => Ok(()),
         super::NativePromptInput::Prepared(_) => Err(NativeRuntimeError::new(
             NativeRuntimeErrorKind::UnsupportedCapability,
@@ -1834,6 +1843,21 @@ struct NativeManagedEngineClient {
     loaded: NativeLoadReady,
 }
 
+struct NativePreparedReleaseRoute {
+    tx: mpsc::Sender<ModelRequest>,
+}
+
+impl NativePreparedRelease for NativePreparedReleaseRoute {
+    fn release_prepared(&self, reservation_id: u128, sequence: super::NativeSequenceIdentity) {
+        let _ = self.tx.send(ModelRequest::Native(
+            NativeSchedulerCommand::ReleasePrepared {
+                reservation_id,
+                sequence,
+            },
+        ));
+    }
+}
+
 impl NativeManagedEngineClient {
     fn worker_gone() -> NativeRuntimeError {
         NativeRuntimeError::new(
@@ -1958,17 +1982,65 @@ impl NativeManagedEngine for NativeManagedEngineClient {
         ))
     }
 
-    fn start_generate(
+    fn prepare_generate(
         &mut self,
         admission: NativeGenerateAdmission,
-        sink: Box<dyn NativeGenerateSink + Send>,
-    ) -> Result<NativeExecutionHandle, NativeRuntimeError> {
+    ) -> Result<NativePreparedGenerate, NativeRuntimeError> {
+        self.ensure_alive()?;
         let (reservation_id, _, request, guard) = admission.into_parts();
-        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let owner: Arc<dyn NativeReservationRelease> = self.reservations.clone();
+        if !guard.belongs_to(&owner) {
+            return Err(NativeRuntimeError::new(
+                NativeRuntimeErrorKind::StaleHandle,
+                "generation admission belongs to another native worker",
+            ));
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
         self.reservations
             .bind_cancellation(reservation_id, Arc::clone(&cancelled));
+        let NativeEngineChannel::Generate(tx) = &self.channel else {
+            return Err(NativeRuntimeError::new(
+                NativeRuntimeErrorKind::UnsupportedOperation,
+                "generation was submitted to an embedding worker",
+            ));
+        };
+        let (prepared_tx, prepared_rx) = mpsc::sync_channel(1);
+        tx.send(ModelRequest::Native(
+            NativeSchedulerCommand::PrepareGenerate {
+                reservation_id,
+                request: Arc::clone(&request),
+                cancelled,
+                guard,
+                prepared: prepared_tx,
+            },
+        ))
+        .map_err(|_| self.note_worker_gone())?;
+        let sequence = prepared_rx.recv().map_err(|_| self.note_worker_gone())??;
+        let release: Arc<dyn NativePreparedRelease> =
+            Arc::new(NativePreparedReleaseRoute { tx: tx.clone() });
+        Ok(NativePreparedGenerate::new(
+            reservation_id,
+            request,
+            sequence,
+            release,
+        ))
+    }
+
+    fn start_generate(
+        &mut self,
+        prepared: NativePreparedGenerate,
+        sink: Box<dyn NativeGenerateSink + Send>,
+    ) -> Result<NativeExecutionHandle, NativeRuntimeError> {
+        self.ensure_alive()?;
+        if prepared.sequence().worker_epoch != self.descriptor.worker_epoch {
+            return Err(NativeRuntimeError::new(
+                NativeRuntimeErrorKind::StaleHandle,
+                "prepared generation belongs to a different worker epoch",
+            ));
+        }
+        let reservation_id = prepared.reservation_id();
+        let sequence = prepared.sequence();
         let (started_tx, started_rx) = mpsc::sync_channel(1);
-        let release: Arc<dyn NativeReservationRelease> = self.reservations.clone();
         let NativeEngineChannel::Generate(tx) = &self.channel else {
             return Err(NativeRuntimeError::new(
                 NativeRuntimeErrorKind::UnsupportedOperation,
@@ -1978,16 +2050,14 @@ impl NativeManagedEngine for NativeManagedEngineClient {
         tx.send(ModelRequest::Native(
             NativeSchedulerCommand::StartGenerate {
                 reservation_id,
-                request,
+                sequence,
                 sink,
-                release,
-                cancelled,
                 started: started_tx,
             },
         ))
         .map_err(|_| self.note_worker_gone())?;
+        prepared.commit_start();
         started_rx.recv().map_err(|_| self.note_worker_gone())??;
-        guard.commit_started();
         Ok(NativeExecutionHandle::new(
             self.descriptor.worker_epoch,
             reservation_id,
@@ -2772,6 +2842,7 @@ mod tests {
     struct CountingGenerateSink {
         started: Arc<std::sync::atomic::AtomicUsize>,
         terminal: Arc<std::sync::atomic::AtomicUsize>,
+        physical_stopped: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl super::super::NativeGenerateSink for CountingGenerateSink {
@@ -2794,6 +2865,10 @@ mod tests {
 
         fn terminal(&mut self, _terminal: super::super::NativePhysicalTerminal) {
             self.terminal.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn physical_stopped(&mut self) {
+            self.physical_stopped.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -2844,6 +2919,7 @@ mod tests {
         let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let sink_started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let sink_terminal = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink_physical_stopped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let worker_realizations = Arc::clone(&realizations);
         let worker_starts = Arc::clone(&starts);
         let worker = std::thread::spawn(move || {
@@ -2860,35 +2936,49 @@ mod tests {
                     output_suppressed_token_ids: Arc::from([11, 17]),
                 }))
                 .unwrap();
-            let ModelRequest::Native(NativeSchedulerCommand::StartGenerate {
+            let ModelRequest::Native(NativeSchedulerCommand::PrepareGenerate {
                 reservation_id,
                 request,
-                mut sink,
-                release,
-                started,
+                prepared,
+                guard,
                 ..
-            }) = commands.recv().expect("start command")
+            }) = commands.recv().expect("prepare command")
             else {
                 panic!("unexpected command after realization");
             };
-            worker_starts.fetch_add(1, Ordering::Relaxed);
             assert!(matches!(
                 &request.prompt,
                 super::super::NativePromptInput::TokenIds(ids) if ids.as_ref() == [21, 22]
             ));
             assert_eq!(request.eos_token_ids.as_ref(), [5, 7]);
             assert_eq!(request.output_suppressed_token_ids.as_ref(), [11, 17]);
-            sink.started(super::super::NativeSequenceIdentity {
+            let identity = super::super::NativeSequenceIdentity {
                 request_id: request.request_id,
                 sequence_id: 1,
                 worker_epoch: 2,
-            })
-            .unwrap();
+            };
+            prepared.send(Ok(identity)).unwrap();
+
+            let ModelRequest::Native(NativeSchedulerCommand::StartGenerate {
+                reservation_id: started_reservation,
+                sequence,
+                mut sink,
+                started,
+            }) = commands.recv().expect("start command")
+            else {
+                panic!("unexpected command after prepare");
+            };
+            worker_starts.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(started_reservation, reservation_id);
+            assert_eq!(sequence, identity);
+            sink.started(identity).unwrap();
             started.send(Ok(())).unwrap();
             sink.terminal(super::super::NativePhysicalTerminal::Completed {
                 reason: super::super::NativeStopReason::Requested,
             });
-            release.release(reservation_id);
+            assert_eq!(worker_starts.load(Ordering::Relaxed), 1);
+            sink.physical_stopped();
+            drop(guard);
         });
 
         let admission = client.admit_generate(&request).unwrap();
@@ -2898,12 +2988,17 @@ mod tests {
             Some(2),
             "admission must freeze realized TokenIds"
         );
+        let prepared = client.prepare_generate(admission).unwrap();
+        assert_eq!(prepared.sequence().worker_epoch, 2);
+        assert_eq!(prepared.request().logical_prompt_tokens(), Some(2));
+        assert_eq!(sink_started.load(Ordering::Relaxed), 0);
         client
             .start_generate(
-                admission,
+                prepared,
                 Box::new(CountingGenerateSink {
                     started: Arc::clone(&sink_started),
                     terminal: Arc::clone(&sink_terminal),
+                    physical_stopped: Arc::clone(&sink_physical_stopped),
                 }),
             )
             .unwrap();
@@ -2912,6 +3007,7 @@ mod tests {
         assert_eq!(starts.load(Ordering::Relaxed), 1);
         assert_eq!(sink_started.load(Ordering::Relaxed), 1);
         assert_eq!(sink_terminal.load(Ordering::Relaxed), 1);
+        assert_eq!(sink_physical_stopped.load(Ordering::Relaxed), 1);
         assert!(reservations.inner.lock().unwrap().reservations.is_empty());
         assert_eq!(reservations.release_calls.load(Ordering::Relaxed), 1);
     }

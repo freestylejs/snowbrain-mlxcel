@@ -158,6 +158,7 @@ pub(crate) struct NativeSequencePort {
     accounting: NativePhysicalAccounting,
     release: Option<(u128, Arc<dyn NativeReservationRelease>)>,
     terminal: bool,
+    physical_stopped: bool,
 }
 
 #[derive(Debug)]
@@ -184,6 +185,7 @@ impl NativeSequencePort {
             accounting: NativePhysicalAccounting::default(),
             release: Some((reservation_id, release)),
             terminal: false,
+            physical_stopped: false,
         }
     }
 
@@ -305,13 +307,27 @@ impl NativeSequencePort {
         }
         self.terminal = true;
         self.sink.terminal(terminal);
+    }
+
+    pub(crate) fn physical_stopped(&mut self) {
+        if self.physical_stopped {
+            return;
+        }
+        if !self.terminal {
+            self.terminal(NativePhysicalTerminal::Failed(NativeRuntimeError::new(
+                NativeRuntimeErrorKind::Infrastructure,
+                "native physical cleanup completed before a terminal outcome",
+            )));
+        }
+        self.physical_stopped = true;
+        self.sink.physical_stopped();
         self.release_reservation();
     }
 
     /// Finalize only after the scheduler has discarded any uncommitted suffix
     /// and made the sequence ineligible for cache donation. Decoder flush is
-    /// therefore checked before the sole terminal callback and reservation
-    /// release. A caller-supplied failure remains the primary terminal error;
+    /// therefore checked before the sole terminal callback. Reservation
+    /// release is deferred until `physical_stopped`. A caller-supplied failure remains the primary terminal error;
     /// all other terminal kinds become a typed decoder failure when a tail
     /// cannot be attributed to an accepted unit.
     pub(crate) fn terminal_after_decoder(
@@ -364,7 +380,10 @@ impl Drop for NativeSequencePort {
                     "native sequence dropped before a terminal outcome",
                 )));
         }
-        self.release_reservation();
+        // Drop is not a device-quiescence proof. Without explicit scheduler
+        // cleanup, leave this bounded reservation charged to the worker's book.
+        // Worker teardown owns the book's remaining lifetime; a surviving
+        // worker must not reuse possibly-live capacity just because a port died.
     }
 }
 
@@ -458,6 +477,7 @@ mod tests {
     struct SinkRecord {
         chunks: Vec<NativeAcceptedChunk>,
         terminals: Vec<NativePhysicalTerminal>,
+        physical_stops: usize,
     }
 
     struct TestSink {
@@ -480,6 +500,10 @@ mod tests {
         fn terminal(&mut self, terminal: NativePhysicalTerminal) {
             self.record.lock().unwrap().terminals.push(terminal);
         }
+
+        fn physical_stopped(&mut self) {
+            self.record.lock().unwrap().physical_stops += 1;
+        }
     }
 
     struct TestRelease {
@@ -493,6 +517,11 @@ mod tests {
                 self.record.lock().unwrap().terminals.len(),
                 1,
                 "reservation released before the sole terminal callback"
+            );
+            assert_eq!(
+                self.record.lock().unwrap().physical_stops,
+                1,
+                "reservation released before physical-stop observation"
             );
             self.count.fetch_add(1, Ordering::Relaxed);
         }
@@ -603,6 +632,9 @@ mod tests {
         );
         port.terminal_after_decoder(&mut decoder, NativePhysicalTerminal::Cancelled);
         assert_eq!(record.lock().unwrap().terminals.len(), 1);
+        assert_eq!(release.count.load(Ordering::Relaxed), 0);
+        port.physical_stopped();
+        assert_eq!(record.lock().unwrap().physical_stops, 1);
         assert_eq!(release.count.load(Ordering::Relaxed), 1);
     }
 
@@ -620,9 +652,14 @@ mod tests {
             ));
             port.terminal(terminal.clone());
             port.terminal(terminal);
-            let record = record.lock().unwrap();
-            assert!(record.chunks.is_empty(), "{message}");
-            assert_eq!(record.terminals.len(), 1, "{message}");
+            {
+                let record = record.lock().unwrap();
+                assert!(record.chunks.is_empty(), "{message}");
+                assert_eq!(record.terminals.len(), 1, "{message}");
+                assert_eq!(record.physical_stops, 0, "{message}");
+            }
+            assert_eq!(release.count.load(Ordering::Relaxed), 0, "{message}");
+            port.physical_stopped();
             assert_eq!(release.count.load(Ordering::Relaxed), 1, "{message}");
         }
     }
@@ -654,12 +691,14 @@ mod tests {
         port.terminal_after_decoder(&mut decoder, NativePhysicalTerminal::Failed(error));
         assert_eq!(record.lock().unwrap().chunks.len(), 1);
         assert_eq!(record.lock().unwrap().terminals.len(), 1);
+        assert_eq!(release.count.load(Ordering::Relaxed), 0);
+        port.physical_stopped();
         assert_eq!(release.count.load(Ordering::Relaxed), 1);
     }
 
     #[test]
     fn unsupported_any_prefix_declines_before_decode_or_sink() {
-        let (mut port, record, _release) = make_port(Vec::new());
+        let (mut port, record, release) = make_port(Vec::new());
         let pushes = Rc::new(Cell::new(0));
         let mut decoder = NonSendDecoder {
             pushes: Rc::clone(&pushes),
@@ -679,6 +718,19 @@ mod tests {
         assert_eq!(error.kind(), NativeRuntimeErrorKind::UnsupportedGuarantee);
         assert_eq!(pushes.get(), 0);
         assert!(record.lock().unwrap().chunks.is_empty());
+        drop(port);
+        assert_eq!(record.lock().unwrap().physical_stops, 0);
+        assert_eq!(release.count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn dropping_a_terminal_port_does_not_invent_cleanup_or_release_capacity() {
+        let (mut port, record, release) = make_port(Vec::new());
+        port.terminal(NativePhysicalTerminal::Cancelled);
+        drop(port);
+        assert_eq!(record.lock().unwrap().terminals.len(), 1);
+        assert_eq!(record.lock().unwrap().physical_stops, 0);
+        assert_eq!(release.count.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -713,13 +765,17 @@ mod tests {
         assert!(record.lock().unwrap().terminals.is_empty());
         assert_eq!(release.count.load(Ordering::Relaxed), 0);
         port.terminal_after_decoder(&mut decoder, outcome.terminal.unwrap());
-        let terminals = &record.lock().unwrap().terminals;
-        assert_eq!(terminals.len(), 1);
-        assert!(matches!(
-            &terminals[0],
-            NativePhysicalTerminal::Failed(error)
-                if error.kind() == NativeRuntimeErrorKind::UnsupportedGuarantee
-        ));
+        {
+            let record = record.lock().unwrap();
+            assert_eq!(record.terminals.len(), 1);
+            assert!(matches!(
+                &record.terminals[0],
+                NativePhysicalTerminal::Failed(error)
+                    if error.kind() == NativeRuntimeErrorKind::UnsupportedGuarantee
+            ));
+        }
+        assert_eq!(release.count.load(Ordering::Relaxed), 0);
+        port.physical_stopped();
         assert_eq!(release.count.load(Ordering::Relaxed), 1);
     }
 
@@ -753,6 +809,8 @@ mod tests {
             &record.lock().unwrap().terminals[0],
             NativePhysicalTerminal::Failed(error) if error == &caller_error
         ));
+        assert_eq!(release.count.load(Ordering::Relaxed), 0);
+        port.physical_stopped();
         assert_eq!(release.count.load(Ordering::Relaxed), 1);
 
         let (mut port, record, release) = make_port(Vec::new());
@@ -762,6 +820,8 @@ mod tests {
             record.lock().unwrap().terminals,
             vec![NativePhysicalTerminal::Cancelled]
         );
+        assert_eq!(release.count.load(Ordering::Relaxed), 0);
+        port.physical_stopped();
         assert_eq!(release.count.load(Ordering::Relaxed), 1);
     }
 }

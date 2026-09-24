@@ -23,7 +23,7 @@ use mlxcel_core::session::{
 use super::error::{NativeRuntimeError, NativeRuntimeErrorKind};
 use super::operation_driver::NativeOperationDriver;
 use super::prompt_renderer::NativeRenderedPrompt;
-use super::sink::MAX_NATIVE_EMBEDDING_DIMENSION;
+use super::sink::{MAX_NATIVE_EMBEDDING_DIMENSION, NativeSequenceIdentity};
 
 pub const MAX_NATIVE_PROMPT_TOKENS: usize = 1_048_576;
 pub const MAX_NATIVE_STOP_TOKEN_IDS: usize = 4_096;
@@ -139,6 +139,7 @@ impl NativePreparedPrefill {
 /// Prompt input ownership accepted by a native generation admission.
 pub enum NativePromptInput {
     TokenIds(Arc<[i32]>),
+    Text(Arc<str>),
     Rendered(NativeRenderedPrompt),
     Prepared(NativePreparedPrefill),
     ModelSpecific(NativeOwnedPreparedInput),
@@ -154,6 +155,13 @@ impl NativePromptInput {
                     ));
                 }
                 validate_nonnegative_token_ids("prompt", ids)?;
+            }
+            Self::Text(text) => {
+                if text.is_empty() || text.len() > MAX_NATIVE_TEXT_BYTES {
+                    return Err(invalid_request(
+                        "prompt text is empty or exceeds the native byte bound",
+                    ));
+                }
             }
             Self::Rendered(rendered) => {
                 if rendered.rendered_utf8().len() > super::MAX_NATIVE_RENDERED_PROMPT_BYTES {
@@ -184,7 +192,7 @@ impl NativePromptInput {
     fn logical_token_len(&self) -> Option<usize> {
         match self {
             Self::TokenIds(ids) => Some(ids.len()),
-            Self::Rendered(_) => None,
+            Self::Text(_) | Self::Rendered(_) => None,
             Self::Prepared(prepared) => Some(prepared.sequence_len()),
             Self::ModelSpecific(prepared) => Some(prepared.logical_token_len()),
         }
@@ -193,6 +201,7 @@ impl NativePromptInput {
     pub(crate) fn shallow_clone(&self) -> Self {
         match self {
             Self::TokenIds(value) => Self::TokenIds(Arc::clone(value)),
+            Self::Text(value) => Self::Text(Arc::clone(value)),
             Self::Rendered(value) => Self::Rendered(value.shallow_clone()),
             Self::Prepared(value) => Self::Prepared(value.clone()),
             Self::ModelSpecific(value) => Self::ModelSpecific(value.clone()),
@@ -831,12 +840,22 @@ pub(crate) trait NativeReservationRelease: Send + Sync {
     fn release(&self, reservation_id: u128);
 }
 
+pub(crate) trait NativePreparedRelease: Send + Sync {
+    fn release_prepared(&self, reservation_id: u128, sequence: NativeSequenceIdentity);
+}
+
 pub(crate) struct NativeReservationGuard {
     reservation_id: u128,
     release: Option<Arc<dyn NativeReservationRelease>>,
 }
 
 impl NativeReservationGuard {
+    pub(crate) fn belongs_to(&self, owner: &Arc<dyn NativeReservationRelease>) -> bool {
+        self.release
+            .as_ref()
+            .is_some_and(|release| Arc::ptr_eq(release, owner))
+    }
+
     pub(crate) fn new(reservation_id: u128, release: Arc<dyn NativeReservationRelease>) -> Self {
         Self {
             reservation_id,
@@ -848,6 +867,12 @@ impl NativeReservationGuard {
     /// every error path drops this guard and releases the reservation.
     pub(crate) fn commit_started(mut self) {
         self.release = None;
+    }
+
+    pub(crate) fn into_release(mut self) -> Arc<dyn NativeReservationRelease> {
+        self.release
+            .take()
+            .expect("native reservation guard owns a release authority")
     }
 }
 
@@ -898,6 +923,58 @@ impl NativeGenerateAdmission {
         NativeReservationGuard,
     ) {
         (self.reservation_id, self.driver, self.request, self.guard)
+    }
+}
+
+/// Non-cloneable capability for one real scheduler-allocated sequence that has
+/// not entered prefill or decode yet.
+pub struct NativePreparedGenerate {
+    reservation_id: u128,
+    request: Arc<NativeGenerateRequest>,
+    sequence: NativeSequenceIdentity,
+    release: Option<Arc<dyn NativePreparedRelease>>,
+}
+
+impl NativePreparedGenerate {
+    pub(crate) fn new(
+        reservation_id: u128,
+        request: Arc<NativeGenerateRequest>,
+        sequence: NativeSequenceIdentity,
+        release: Arc<dyn NativePreparedRelease>,
+    ) -> Self {
+        Self {
+            reservation_id,
+            request,
+            sequence,
+            release: Some(release),
+        }
+    }
+
+    #[must_use]
+    pub const fn reservation_id(&self) -> u128 {
+        self.reservation_id
+    }
+
+    #[must_use]
+    pub const fn sequence(&self) -> NativeSequenceIdentity {
+        self.sequence
+    }
+
+    #[must_use]
+    pub fn request(&self) -> &NativeGenerateRequest {
+        &self.request
+    }
+
+    pub(crate) fn commit_start(mut self) {
+        self.release = None;
+    }
+}
+
+impl Drop for NativePreparedGenerate {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            release.release_prepared(self.reservation_id, self.sequence);
+        }
     }
 }
 
@@ -1001,6 +1078,7 @@ mod tests {
     use super::*;
 
     static_assertions::assert_not_impl_any!(NativeGenerateAdmission: Clone);
+    static_assertions::assert_not_impl_any!(NativePreparedGenerate: Clone);
     static_assertions::assert_not_impl_any!(NativeEmbedAdmission: Clone);
     static_assertions::assert_not_impl_any!(NativeExecutionHandle: Clone);
 
@@ -1167,6 +1245,17 @@ mod tests {
                 .validate()
                 .is_err()
         );
+    }
+
+    #[test]
+    fn plain_text_prompt_is_bounded_and_defers_token_count_to_worker_resolution() {
+        let text = NativePromptInput::Text(Arc::from("literal caller text"));
+        assert!(text.validate().is_ok());
+        assert_eq!(text.logical_token_len(), None);
+
+        assert!(NativePromptInput::Text(Arc::from("")).validate().is_err());
+        let oversized: Arc<str> = "x".repeat(MAX_NATIVE_TEXT_BYTES + 1).into();
+        assert!(NativePromptInput::Text(oversized).validate().is_err());
     }
 
     #[test]

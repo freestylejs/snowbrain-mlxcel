@@ -1331,12 +1331,29 @@ impl NativeBoundTokenizer {
                 "rendered prompt binding disagrees with the worker tokenizer",
             ));
         }
+        self.encode_prompt_ids(
+            prompt.rendered_utf8(),
+            prompt.add_special_tokens(),
+            "rendered",
+        )
+    }
+
+    pub(crate) fn resolve_plain_text(&self, text: &str) -> Result<Vec<i32>, NativeRuntimeError> {
+        self.encode_prompt_ids(text, false, "plain-text")
+    }
+
+    fn encode_prompt_ids(
+        &self,
+        text: &str,
+        add_special_tokens: bool,
+        label: &str,
+    ) -> Result<Vec<i32>, NativeRuntimeError> {
         self.tokenizer
-            .encode(prompt.rendered_utf8(), prompt.add_special_tokens())
+            .encode(text, add_special_tokens)
             .map_err(|error| {
                 NativeRuntimeError::new(
                     NativeRuntimeErrorKind::Tokenizer,
-                    format!("rendered prompt tokenization failed: {error}"),
+                    format!("{label} prompt tokenization failed: {error}"),
                 )
             })?
             .into_iter()
